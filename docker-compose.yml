@@ -1,0 +1,38 @@
+version: '3.8'
+
+services:
+  backend:
+    build: ./backend
+    restart: unless-stopped
+    volumes:
+      # ── EDIT THIS LINE ──────────────────────────────────────────────────────
+      # Replace /volume1/3dprints with the path to your 3D print folder on your
+      # Synology NAS. This is the folder that contains your creator subfolders.
+      #
+      # Examples:
+      #   Synology NAS (SMB mount):  /volume1/3dprints:/library:ro
+      #   Windows local:             C:/Users/You/3dprints:/library:ro
+      #   Mac/Linux local:           /home/you/3dprints:/library:ro
+      # ────────────────────────────────────────────────────────────────────────
+      - /volume1/3dprints:/library:ro
+
+      # This stores the database and extracted images — keep this as-is
+      - vault_data:/data
+
+    environment:
+      - LIBRARY_PATH=/library
+      - DB_PATH=/data/vault.db
+      - IMAGES_DIR=/data/images
+
+  frontend:
+    build: ./frontend
+    restart: unless-stopped
+    ports:
+      # Access the app at http://your-nas-ip:8484
+      # Change 8484 to any port you prefer
+      - "8484:80"
+    depends_on:
+      - backend
+
+volumes:
+  vault_data:
