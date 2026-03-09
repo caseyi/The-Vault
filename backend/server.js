@@ -57,15 +57,21 @@ app.get('/api/scan/stream', (req, res) => {
 app.post('/api/scan', async (req, res) => {
   if (scanInProgress) return res.status(409).json({ error: 'Scan already in progress' });
   const libPath = req.body.path || LIBRARY_PATH;
+  const force = req.body.force === true;
   if (!fs.existsSync(libPath)) return res.status(400).json({ error: `Path not found: ${libPath}` });
+
+  // Force full rescan: clear all folder hashes so nothing is skipped
+  if (force) {
+    db.prepare('UPDATE models SET folder_hash = NULL').run();
+  }
 
   scanInProgress = true;
   scanLog = [];
   scanSummary = null;
 
-  res.json({ message: 'Scan started', path: libPath });
+  res.json({ message: 'Scan started', path: libPath, force });
 
-  pushLog('info', `Starting scan: ${libPath}`);
+  pushLog('info', `Starting ${force ? 'FULL ' : ''}scan: ${libPath}`);
 
   try {
     const result = await scanLibrary(libPath, (p) => {

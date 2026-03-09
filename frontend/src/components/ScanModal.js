@@ -3,6 +3,7 @@ import TaskLog from './TaskLog';
 
 export default function ScanModal({ onClose, onScanComplete }) {
   const [path, setPath] = useState('/library');
+  const [force, setForce] = useState(false);
   const [running, setRunning] = useState(false);
   const [done, setDone] = useState(false);
   const [summary, setSummary] = useState(null);
@@ -20,7 +21,7 @@ export default function ScanModal({ onClose, onScanComplete }) {
       await fetch('/api/scan', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ path }),
+        body: JSON.stringify({ path, force }),
       });
     } catch (e) {
       setLines(l => [...l, { level: 'error', msg: e.message, ts: new Date().toISOString() }]);
@@ -73,6 +74,21 @@ export default function ScanModal({ onClose, onScanComplete }) {
         <div className="modal-hint">
           Default: <code>/library</code> — mapped to your NAS folder via Docker Compose.
         </div>
+
+        <label style={{
+          display: 'flex', alignItems: 'center', gap: 8, marginTop: 12,
+          fontSize: 12, color: 'var(--text-muted)', cursor: 'pointer',
+          fontFamily: 'var(--font-mono)',
+        }}>
+          <input
+            type="checkbox"
+            checked={force}
+            onChange={e => setForce(e.target.checked)}
+            disabled={running}
+            style={{ accentColor: 'var(--accent)' }}
+          />
+          Force full rescan (re-index all models, even unchanged ones)
+        </label>
 
         <div style={{ marginTop: 14 }}>
           <TaskLog lines={lines} running={running} title="SCAN LOG" height={240} />
