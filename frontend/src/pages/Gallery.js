@@ -12,15 +12,28 @@ const STATUS_COLORS = {
 
 function ModelCard({ model, onClick, bulkMode, selected, onToggle }) {
   const imgs = model.images || [];
-  const thumb = model.thumbnail_path || imgs[0];
+  const [imgIdx, setImgIdx] = useState(0);
+  const [hovered, setHovered] = useState(false);
+  const currentImg = imgs[imgIdx] || model.thumbnail_path || imgs[0];
 
-  const handleClick = () => {
+  const handleClick = (e) => {
     if (bulkMode) { onToggle(model.id); return; }
     onClick(model);
   };
 
+  const cycleImg = (e, dir) => {
+    e.stopPropagation();
+    setImgIdx(prev => {
+      const next = prev + dir;
+      if (next < 0) return imgs.length - 1;
+      if (next >= imgs.length) return 0;
+      return next;
+    });
+  };
+
   return (
     <div className="model-card" onClick={handleClick}
+      onMouseEnter={() => setHovered(true)} onMouseLeave={() => setHovered(false)}
       style={selected ? { borderColor: '#c17f3a', boxShadow: '0 0 0 2px rgba(193,127,58,0.4)' } : {}}>
       {bulkMode && (
         <div style={{
@@ -34,11 +47,34 @@ function ModelCard({ model, onClick, bulkMode, selected, onToggle }) {
           {selected ? '✓' : ''}
         </div>
       )}
-      {thumb ? (
-        <img className="model-card-img" src={thumb} alt={model.name} loading="lazy"
+      {currentImg ? (
+        <img className="model-card-img" src={currentImg} alt={model.name} loading="lazy"
           onError={e => { e.target.style.display = 'none'; e.target.nextSibling.style.display = 'flex'; }} />
       ) : null}
-      <div className="model-card-no-img" style={{ display: thumb ? 'none' : 'flex' }}>🧩</div>
+      <div className="model-card-no-img" style={{ display: currentImg ? 'none' : 'flex' }}>🧩</div>
+      {/* Image cycle arrows */}
+      {hovered && imgs.length > 1 && !bulkMode && (
+        <>
+          <button onClick={e => cycleImg(e, -1)} style={{
+            position: 'absolute', top: '30%', left: 4, transform: 'translateY(-50%)',
+            background: 'rgba(13,13,15,0.75)', border: 'none', borderRadius: 4,
+            color: '#e8e8f0', cursor: 'pointer', fontSize: 14, padding: '4px 6px',
+            zIndex: 3, lineHeight: 1, backdropFilter: 'blur(4px)'
+          }}>‹</button>
+          <button onClick={e => cycleImg(e, 1)} style={{
+            position: 'absolute', top: '30%', right: 4, transform: 'translateY(-50%)',
+            background: 'rgba(13,13,15,0.75)', border: 'none', borderRadius: 4,
+            color: '#e8e8f0', cursor: 'pointer', fontSize: 14, padding: '4px 6px',
+            zIndex: 3, lineHeight: 1, backdropFilter: 'blur(4px)'
+          }}>›</button>
+          <div style={{
+            position: 'absolute', top: 8, right: 8, zIndex: 3,
+            background: 'rgba(13,13,15,0.7)', borderRadius: 10,
+            padding: '2px 7px', fontSize: 10, color: '#8899aa',
+            fontFamily: 'var(--font-mono)', backdropFilter: 'blur(4px)'
+          }}>{imgIdx + 1}/{imgs.length}</div>
+        </>
+      )}
       <div className="model-card-body">
         <div className="model-card-name" title={model.name}>{model.name}</div>
         <div className="model-card-creator">{model.creator_name || 'Unknown'}</div>

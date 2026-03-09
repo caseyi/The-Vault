@@ -154,7 +154,7 @@ app.get('/api/models/:id', (req, res) => {
 });
 
 app.patch('/api/models/:id', (req, res) => {
-  const { print_status, tags, notes, source_url, name } = req.body;
+  const { print_status, tags, notes, source_url, name, thumbnail_path } = req.body;
   const model = db.prepare('SELECT id FROM models WHERE id = ?').get(req.params.id);
   if (!model) return res.status(404).json({ error: 'Not found' });
 
@@ -165,6 +165,7 @@ app.patch('/api/models/:id', (req, res) => {
   if (notes !== undefined) { updates.push('notes = ?'); params.push(notes); }
   if (source_url !== undefined) { updates.push('source_url = ?'); params.push(source_url); }
   if (name !== undefined) { updates.push('name = ?'); params.push(name); }
+  if (thumbnail_path !== undefined) { updates.push('thumbnail_path = ?'); params.push(thumbnail_path); }
 
   if (updates.length === 0) return res.status(400).json({ error: 'Nothing to update' });
   updates.push("updated_at = datetime('now')");
@@ -219,6 +220,7 @@ app.post('/api/creators/:id/reextract', async (req, res) => {
   const send = (level, msg) => res.write(`data: ${JSON.stringify({ level, msg, ts: new Date().toISOString() })}\n\n`);
   const done = (data) => { res.write(`data: ${JSON.stringify({ type: 'done', ...data })}\n\n`); res.end(); };
 
+  const AdmZip = require('adm-zip');
   const hint = creator.render_zip_hint || null;
   send('info', `Creator: ${creator.name}`);
   send('info', `Render ZIP hint: ${hint || '(auto-detect by keyword)'}`);

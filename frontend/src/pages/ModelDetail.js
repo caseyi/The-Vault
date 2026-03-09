@@ -212,7 +212,34 @@ export default function ModelDetail({ modelId, onBack, onSaved }) {
                     {images.length > 1 && (
                       <div className="detail-thumbs">
                         {images.map((img, i) => (
-                          <img key={i} className={`detail-thumb ${activeImg === i ? 'active' : ''}`} src={img} alt="" onClick={() => setActiveImg(i)} />
+                          <div key={i} style={{ position: 'relative', display: 'inline-block' }}>
+                            <img className={`detail-thumb ${activeImg === i ? 'active' : ''}`} src={img} alt="" onClick={() => setActiveImg(i)} />
+                            <button
+                              title={model.thumbnail_path === img ? 'Current thumbnail' : 'Set as gallery thumbnail'}
+                              onClick={async (e) => {
+                                e.stopPropagation();
+                                await fetch(`/api/models/${modelId}`, {
+                                  method: 'PATCH',
+                                  headers: { 'Content-Type': 'application/json' },
+                                  body: JSON.stringify({ thumbnail_path: img })
+                                });
+                                loadModel();
+                                if (onSaved) onSaved();
+                              }}
+                              style={{
+                                position: 'absolute', top: 2, right: 2,
+                                background: model.thumbnail_path === img ? 'var(--accent)' : 'rgba(13,13,15,0.7)',
+                                border: 'none', borderRadius: 3, cursor: 'pointer',
+                                padding: '1px 4px', fontSize: 11, lineHeight: 1,
+                                color: model.thumbnail_path === img ? '#0d0d0f' : '#8899aa',
+                                backdropFilter: 'blur(4px)',
+                                opacity: model.thumbnail_path === img ? 1 : 0.7,
+                                transition: 'opacity 0.15s',
+                              }}
+                              onMouseEnter={e => e.target.style.opacity = 1}
+                              onMouseLeave={e => { if (model.thumbnail_path !== img) e.target.style.opacity = 0.7; }}
+                            >★</button>
+                          </div>
                         ))}
                       </div>
                     )}

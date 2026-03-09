@@ -86,6 +86,7 @@ db.exec(`
 `);
 
 // Migrations for existing databases
+try { db.exec(`ALTER TABLE models ADD COLUMN folder_hash TEXT`); } catch {}
 try { db.exec(`ALTER TABLE model_files ADD COLUMN release_name TEXT`); } catch {}
 try { db.exec(`CREATE INDEX IF NOT EXISTS idx_files_release ON model_files(release_name)`); } catch {}
 try { db.exec(`ALTER TABLE models ADD COLUMN render_zip_hint TEXT`); } catch {}

@@ -16,6 +16,15 @@ const SLICE_EXTS  = new Set(['.chitubox', '.ctb', '.photon', '.lys', '.lychee'])
 const PLATE_EXTS  = new Set(['.gcode', '.gco', '.nc']);
 const RENDER_KW   = ['render', 'preview', 'thumb', 'photo', 'pic', 'image', 'renders', 'previews', 'photos'];
 
+// Synology system / junk folders to skip during scanning
+const IGNORED_FOLDERS = new Set([
+  '@eaDir', '@tmp', '@appstore', '@autoupdate', '@database', '@S2S',
+  '#recycle', '#snapshot',
+  '.DS_Store', '.Spotlight-V100', '.Trashes', '.fseventsd',
+  '__MACOSX', 'Thumbs.db', '.synology_cache',
+  '$RECYCLE.BIN', 'System Volume Information',
+]);
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 function isRenderZip(filename) {
@@ -184,6 +193,7 @@ function analyzeFolder(folderPath, creatorName) {
   catch { return result; }
 
   for (const entry of topEntries) {
+    if (IGNORED_FOLDERS.has(entry.name)) continue;
     const full = path.join(folderPath, entry.name);
 
     if (entry.isDirectory()) {
@@ -278,8 +288,10 @@ async function scanLibrary(libraryPath, progressCallback, logger) {
   let modelsFound = 0, modelsAdded = 0, modelsUpdated = 0, modelsSkipped = 0;
 
   try {
-    const creatorDirs = fs.readdirSync(libraryPath, { withFileTypes: true }).filter(d => d.isDirectory());
-    log('info', `Found ${creatorDirs.length} creator folder(s)`);
+    const allCreatorDirs = fs.readdirSync(libraryPath, { withFileTypes: true }).filter(d => d.isDirectory());
+    const creatorDirs = allCreatorDirs.filter(d => !IGNORED_FOLDERS.has(d.name));
+    const ignoredCount = allCreatorDirs.length - creatorDirs.length;
+    log('info', `Found ${creatorDirs.length} creator folder(s)${ignoredCount ? ` (${ignoredCount} system folder${ignoredCount > 1 ? 's' : ''} ignored)` : ''}`);
 
     for (const creatorDir of creatorDirs) {
       const creatorPath = path.join(libraryPath, creatorDir.name);
@@ -290,7 +302,7 @@ async function scanLibrary(libraryPath, progressCallback, logger) {
 
       if (progressCallback) progressCallback({ stage: 'scanning', creator: creatorName });
 
-      const modelDirs  = fs.readdirSync(creatorPath, { withFileTypes: true }).filter(d => d.isDirectory());
+      const modelDirs  = fs.readdirSync(creatorPath, { withFileTypes: true }).filter(d => d.isDirectory() && !IGNORED_FOLDERS.has(d.name));
       const directFiles = fs.readdirSync(creatorPath, { withFileTypes: true }).filter(d => !d.isDirectory());
       const hasDirectFiles = directFiles.some(f => { const e = path.extname(f.name).toLowerCase(); return STL_EXTS.has(e) || e === '.zip'; });
 
