@@ -14,16 +14,17 @@ services:
     # build: ./backend       # ← uncomment to build locally
     restart: unless-stopped
     volumes:
-      # ── EDIT THIS LINE ──────────────────────────────────────────────────────
-      # Replace /volume1/3dprints with the path to your 3D print folder.
-      # Examples:
-      #   Synology NAS:   /volume1/3dprints:/library:ro
-      #   Windows:        C:/Users/You/3dprints:/library:ro
-      #   Mac/Linux:      /home/you/3dprints:/library:ro
+      # ── Library paths ────────────────────────────────────────────────────────
+      # Add one line per library root. Each path maps to a sub-path under
+      # /library inside the container, e.g.:
+      #   /volume1/STL Archive  →  /library/STL Archive
+      #
+      # To add more paths later, just add another line:
+      #   - /volume1/More Prints:/library/More Prints:ro
       # ────────────────────────────────────────────────────────────────────────
-      - /volume1/3dprints:/library:ro
+      - /volume1/STL Archive:/library/STL Archive:ro
 
-      # Stores the database and extracted images — keep this as-is
+      # Database and extracted images — never remove this line
       - vault_data:/data
 
     environment:
@@ -37,10 +38,12 @@ services:
     restart: unless-stopped
     ports:
       # Access the app at http://your-nas-ip:8484
-      # Change 8484 to any port you prefer
       - "8484:80"
     depends_on:
       - backend
 
 volumes:
+  # vault_data is a named Docker volume — it persists across container
+  # restarts, image updates, and docker-compose down/up.
+  # Your database and images live here and are NEVER wiped by updates.
   vault_data:
