@@ -1,22 +1,29 @@
 version: '3.8'
 
+# ── Image source ──────────────────────────────────────────────────────────────
+# Images are built automatically by GitHub Actions and published to GHCR.
+# Run ./update.sh on your NAS to pull the latest build.
+#
+# To build locally instead (e.g. for development), comment out the `image:`
+# lines and uncomment the `build:` lines.
+# ─────────────────────────────────────────────────────────────────────────────
+
 services:
   backend:
-    build: ./backend
+    image: ghcr.io/caseyi/stlvault-backend:latest
+    # build: ./backend       # ← uncomment to build locally
     restart: unless-stopped
     volumes:
       # ── EDIT THIS LINE ──────────────────────────────────────────────────────
-      # Replace /volume1/3dprints with the path to your 3D print folder on your
-      # Synology NAS. This is the folder that contains your creator subfolders.
-      #
+      # Replace /volume1/3dprints with the path to your 3D print folder.
       # Examples:
-      #   Synology NAS (SMB mount):  /volume1/3dprints:/library:ro
-      #   Windows local:             C:/Users/You/3dprints:/library:ro
-      #   Mac/Linux local:           /home/you/3dprints:/library:ro
+      #   Synology NAS:   /volume1/3dprints:/library:ro
+      #   Windows:        C:/Users/You/3dprints:/library:ro
+      #   Mac/Linux:      /home/you/3dprints:/library:ro
       # ────────────────────────────────────────────────────────────────────────
       - /volume1/3dprints:/library:ro
 
-      # This stores the database and extracted images — keep this as-is
+      # Stores the database and extracted images — keep this as-is
       - vault_data:/data
 
     environment:
@@ -25,7 +32,8 @@ services:
       - IMAGES_DIR=/data/images
 
   frontend:
-    build: ./frontend
+    image: ghcr.io/caseyi/stlvault-frontend:latest
+    # build: ./frontend      # ← uncomment to build locally
     restart: unless-stopped
     ports:
       # Access the app at http://your-nas-ip:8484

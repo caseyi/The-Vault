@@ -1,121 +1,100 @@
-# 🗄️ The Vault — 3D Print Library Manager
+# The Vault 🗃️
 
-A self-hosted web app for indexing and browsing your 3D print collection on a Synology NAS (or any Docker host).
-
----
-
-## ✨ Features
-
-- **Gallery view** — browse all your models with thumbnails
-- **Auto image extraction** — pulls preview images from render ZIPs automatically
-- **Creator organization** — mirrors your `Creator Name / Model Name` folder structure
-- **Print status tracking** — mark models as Unprinted → Sliced → Printed → Painted
-- **Search & filter** — search by name, creator, tags; filter by print status
-- **Tagging & notes** — add custom tags and print notes to any model
-- **File type detection** — identifies STL, Chitubox, Lychee, GCode files
+Self-hosted 3D print library manager for your NAS. Indexes STL/ZIP/slicer files,
+extracts render images, tracks print status, and lets you ask Claude AI to help
+organise your collection.
 
 ---
 
-## 🚀 Setup (Synology NAS)
+## Quick start (first time)
 
-### Step 1 — Install Docker
-1. Open **Package Center** on your Synology
-2. Search for **Container Manager** and install it
+```sh
+# 1. Clone the repo
+git clone https://github.com/caseyi/stlvault.git
+cd stlvault
 
-### Step 2 — Copy files to your NAS
-Copy the entire `the-vault` folder to your NAS (e.g., `/volume1/docker/the-vault`)
+# 2. Edit docker-compose.yml — change the library path to your 3D print folder
+#    Find the line:  - /volume1/3dprints:/library:ro
+#    Replace /volume1/3dprints with your actual path
 
-### Step 3 — Edit docker-compose.yml
-Open `docker-compose.yml` in a text editor and change this line:
-```
-- /volume1/3dprints:/library:ro
-```
-Replace `/volume1/3dprints` with the actual path to your 3D print folder on your NAS.
+# 3. Start
+docker-compose up -d
 
-**To find your path:**
-- Open File Station on your Synology
-- Navigate to your 3D prints folder
-- Right-click → Properties — the path is shown there
-
-### Step 4 — Start the app
-Open a terminal/SSH on your NAS and run:
-```bash
-cd /volume1/docker/the-vault
-docker compose up -d --build
-```
-
-The first build takes 3–5 minutes. After that, open your browser:
-```
+# 4. Open in browser
 http://YOUR-NAS-IP:8484
 ```
 
-### Step 5 — Scan your library
-1. Click **"⟳ SCAN LIBRARY"** in the sidebar
-2. The path `/library` is pre-filled — this maps to your NAS folder
-3. Click **Start Scan** and wait for it to finish
-4. Your models will appear in the gallery!
+Images are pulled automatically from GitHub Container Registry — no local build needed.
 
 ---
 
-## 📁 Expected Folder Structure
+## Updating
 
-The app works best with this structure:
-```
-/volume1/3dprints/
-├── CreatorName1/
-│   ├── Cool Dragon/
-│   │   ├── renders.zip          ← images extracted from here
-│   │   ├── dragon_body.stl
-│   │   └── dragon_wings.stl
-│   └── Space Marine/
-│       ├── previews/
-│       │   ├── front.jpg
-│       │   └── back.jpg
-│       └── marine.stl
-├── AnotherCreator/
-│   └── ...
+Whenever a new version is released, just run:
+
+```sh
+cd /path/to/stlvault
+./update.sh
 ```
 
-- **Top-level folders** = creators
-- **Subfolders** = individual models
-- **ZIPs with "render", "preview", "photo" in the name** = images extracted automatically
-- **Loose JPG/PNG files** in the model folder are also picked up
+That's it. `update.sh` pulls the latest pre-built images, restarts the containers,
+and prints the URL when it's done.
 
 ---
 
-## 🔄 Re-scanning
+## Folder structure expected
 
-Run a scan any time you add new files. The scanner will:
-- Add new models it hasn't seen before
-- Update existing models if new files were added
-- Never delete anything from your actual files (the library is mounted read-only)
-
----
-
-## 🛠️ Troubleshooting
-
-**App won't start:**
-- Make sure Docker/Container Manager is installed
-- Check the path in `docker-compose.yml` exists on your NAS
-
-**No images showing:**
-- Your ZIPs need to contain image files (JPG/PNG)
-- The ZIP filename should include words like "render", "preview", or "photo"
-- Loose JPG/PNG files directly in the model folder also work
-
-**Scan is slow:**
-- Normal — it's opening every ZIP to extract images
-- A large library (1000+ models) may take 10–20 minutes on first scan
-- Subsequent scans are much faster (skips already-indexed models)
-
----
-
-## 🔧 Updating
-
-```bash
-cd /volume1/docker/the-vault
-docker compose down
-docker compose up -d --build
+```
+/volume1/3dprints/           ← your library root (mapped to /library in Docker)
+  CreatorName/               ← one folder per creator
+    ReleaseName/             ← release = subfolder name  (e.g. "FDM", "Resin v2")
+      model.stl
+      renders.zip
+    AnotherRelease.zip       ← or a ZIP at creator level
 ```
 
-Your database and extracted images are stored in a Docker volume and are preserved across updates.
+Files inside each release folder are grouped by release name in the UI.
+ZIPs named with "render/preview/photo" keywords are auto-extracted for images.
+
+---
+
+## Development (local build)
+
+To build images locally instead of pulling from GHCR, edit `docker-compose.yml`:
+
+```yaml
+services:
+  backend:
+    # image: ghcr.io/caseyi/stlvault-backend:latest  ← comment this out
+    build: ./backend                                   ← uncomment this
+  frontend:
+    # image: ghcr.io/caseyi/stlvault-frontend:latest ← comment this out
+    build: ./frontend                                  ← uncomment this
+```
+
+Then: `docker-compose up -d --build`
+
+---
+
+## CI / CD
+
+Pushing to `main` (or pushing a `v*` tag) triggers the GitHub Actions workflow
+at `.github/workflows/docker-publish.yml`, which:
+
+1. Builds `stlvault-backend` and `stlvault-frontend` Docker images
+2. Pushes them to `ghcr.io/caseyi/stlvault-{backend,frontend}:latest`
+3. Also tags each image with `sha-<commit>` for rollback
+
+The images are public and require no authentication to pull.
+
+---
+
+## Environment variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `LIBRARY_PATH` | `/library` | Path to your 3D print folder inside the container |
+| `DB_PATH` | `/data/vault.db` | SQLite database location |
+| `IMAGES_DIR` | `/data/images` | Where extracted images are stored |
+| `PORT` | `3001` | Backend port (internal) |
+

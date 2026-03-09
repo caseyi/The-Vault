@@ -1,5 +1,6 @@
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const AdmZip = require('adm-zip');
 const { v4: uuidv4 } = require('uuid');
 const db = require('./db');
@@ -9,256 +10,380 @@ const LIBRARY_PATH = process.env.LIBRARY_PATH || '/library';
 
 if (!fs.existsSync(IMAGES_DIR)) fs.mkdirSync(IMAGES_DIR, { recursive: true });
 
-const IMAGE_EXTS = new Set(['.jpg', '.jpeg', '.png', '.webp', '.gif']);
-const STL_EXTS = new Set(['.stl', '.obj', '.3mf']);
-const SLICE_EXTS = new Set(['.chitubox', '.ctb', '.photon', '.lys', '.lychee']);
-const PLATE_EXTS = new Set(['.gcode', '.gco', '.nc']);
-const RENDER_KEYWORDS = ['render', 'preview', 'thumb', 'photo', 'pic', 'image', 'renders', 'previews', 'photos'];
+const IMAGE_EXTS  = new Set(['.jpg', '.jpeg', '.png', '.webp', '.gif']);
+const STL_EXTS    = new Set(['.stl', '.obj', '.3mf']);
+const SLICE_EXTS  = new Set(['.chitubox', '.ctb', '.photon', '.lys', '.lychee']);
+const PLATE_EXTS  = new Set(['.gcode', '.gco', '.nc']);
+const RENDER_KW   = ['render', 'preview', 'thumb', 'photo', 'pic', 'image', 'renders', 'previews', 'photos'];
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
 function isRenderZip(filename) {
   const lower = filename.toLowerCase();
-  return RENDER_KEYWORDS.some(k => lower.includes(k));
+  return RENDER_KW.some(k => lower.includes(k));
+}
+
+/**
+ * Check if a filename matches a hint string.
+ * Hint can be an exact filename ("renders.zip"), a glob-style wildcard ("*render*"),
+ * or a comma-separated list of either ("renders.zip, *preview*").
+ */
+function matchesHint(filename, hint) {
+  if (!hint) return false;
+  const lower = filename.toLowerCase();
+  return hint.split(',').map(s => s.trim().toLowerCase()).some(pattern => {
+    if (pattern.includes('*')) {
+      // Simple glob: convert * to regex .*
+      const re = new RegExp('^' + pattern.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*') + '$');
+      return re.test(lower);
+    }
+    return lower === pattern;
+  });
+}
+
+function pickRenderZips(analysis, hint) {
+  if (hint) {
+    // Use only the explicitly hinted ZIP(s); fall back to auto-detect if none match
+    const hinted = analysis.files.filter(f => f.ext === '.zip' && matchesHint(f.filename, hint)).map(f => f.filepath);
+    if (hinted.length > 0) return hinted;
+  }
+  return analysis.renderZips; // auto-detected by keyword
 }
 
 function isRenderImage(filename) {
-  const lower = path.basename(filename).toLowerCase();
-  return IMAGE_EXTS.has(path.extname(lower));
+  return IMAGE_EXTS.has(path.extname(filename).toLowerCase());
 }
 
-function detectSourceSite(folderPath) {
-  const lower = folderPath.toLowerCase();
-  if (lower.includes('printables')) return 'printables';
-  if (lower.includes('thingiverse')) return 'thingiverse';
-  if (lower.includes('myminifactory') || lower.includes('mmf')) return 'myminifactory';
-  if (lower.includes('patreon')) return 'patreon';
-  if (lower.includes('cults')) return 'cults3d';
-  if (lower.includes('gumroad')) return 'gumroad';
+function detectSourceSite(s) {
+  const l = s.toLowerCase();
+  if (l.includes('printables'))                 return 'printables';
+  if (l.includes('thingiverse'))                return 'thingiverse';
+  if (l.includes('myminifactory') || l.includes('mmf')) return 'myminifactory';
+  if (l.includes('patreon'))                    return 'patreon';
+  if (l.includes('cults'))                      return 'cults3d';
+  if (l.includes('gumroad'))                    return 'gumroad';
   return null;
 }
 
+/**
+ * Cheap content hash: folder mtime + sorted list of "filename:size" entries.
+ * Much faster than hashing file bytes; catches additions, deletions, renames.
+ */
+function folderHash(folderPath) {
+  const entries = [];
+  function walk(dir) {
+    let list;
+    try { list = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of list) {
+      const full = path.join(dir, e.name);
+      if (e.isDirectory()) {
+        walk(full);
+      } else {
+        try {
+          const stat = fs.statSync(full);
+          entries.push(`${e.name}:${stat.size}:${stat.mtimeMs}`);
+        } catch {}
+      }
+    }
+  }
+  walk(folderPath);
+  entries.sort();
+  return crypto.createHash('sha1').update(entries.join('|')).digest('hex').slice(0, 16);
+}
+
+function fileType(filename) {
+  const ext = path.extname(filename).toLowerCase();
+  if (STL_EXTS.has(ext))   return 'stl';
+  if (ext === '.zip')       return 'zip';
+  if (SLICE_EXTS.has(ext)) return 'slicer';
+  if (PLATE_EXTS.has(ext)) return 'plate';
+  if (IMAGE_EXTS.has(ext)) return 'image';
+  return 'other';
+}
+
+function inferModelName(folderPath) {
+  return path.basename(folderPath).replace(/[_-]/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+// ── Image extraction ──────────────────────────────────────────────────────────
+
 function extractImagesFromZip(zipPath, modelUuid) {
-  const extractedPaths = [];
+  const extracted = [];
   try {
     const zip = new AdmZip(zipPath);
-    const entries = zip.getEntries();
     const modelImgDir = path.join(IMAGES_DIR, modelUuid);
     if (!fs.existsSync(modelImgDir)) fs.mkdirSync(modelImgDir, { recursive: true });
-
-    for (const entry of entries) {
+    for (const entry of zip.getEntries()) {
       if (!entry.isDirectory && isRenderImage(entry.entryName)) {
         const safeName = path.basename(entry.entryName).replace(/[^a-zA-Z0-9._-]/g, '_');
         const outPath = path.join(modelImgDir, safeName);
-        if (!fs.existsSync(outPath)) {
-          zip.extractEntryTo(entry, modelImgDir, false, true, false, safeName);
-        }
-        extractedPaths.push(`/images/${modelUuid}/${safeName}`);
+        if (!fs.existsSync(outPath)) zip.extractEntryTo(entry, modelImgDir, false, true, false, safeName);
+        extracted.push(`/images/${modelUuid}/${safeName}`);
       }
     }
   } catch (e) {
     console.warn(`Could not extract zip ${zipPath}: ${e.message}`);
   }
-  return extractedPaths;
+  return extracted;
 }
 
 function extractImagesFromFolder(folderPath, modelUuid) {
-  const extractedPaths = [];
+  const extracted = [];
   try {
     const modelImgDir = path.join(IMAGES_DIR, modelUuid);
-    const files = fs.readdirSync(folderPath);
-    for (const file of files) {
+    for (const file of fs.readdirSync(folderPath)) {
       if (isRenderImage(file)) {
         const src = path.join(folderPath, file);
         if (!fs.existsSync(modelImgDir)) fs.mkdirSync(modelImgDir, { recursive: true });
         const safeName = file.replace(/[^a-zA-Z0-9._-]/g, '_');
         const dest = path.join(modelImgDir, safeName);
         if (!fs.existsSync(dest)) fs.copyFileSync(src, dest);
-        extractedPaths.push(`/images/${modelUuid}/${safeName}`);
+        extracted.push(`/images/${modelUuid}/${safeName}`);
       }
     }
   } catch (e) {
     console.warn(`Could not scan folder images ${folderPath}: ${e.message}`);
   }
-  return extractedPaths;
+  return extracted;
 }
 
-function analyzeFolder(folderPath) {
+// ── analyzeFolder ─────────────────────────────────────────────────────────────
+
+/**
+ * Derive a clean release name from a ZIP stem or subfolder name.
+ * e.g.  "CreatorName_CoolPack_v1.2_STLs" → "CoolPack v1.2 STLs"
+ *        "FDM"                             → "FDM"
+ *        "[GroupTag] Some Release (Renders)" → "Some Release (Renders)"
+ */
+function inferReleaseName(raw, creatorName) {
+  let name = path.basename(raw, path.extname(raw)); // strip .zip if present
+  name = name.replace(/^\[.*?\]\s*/g, '');           // strip [bracket tags]
+  if (creatorName) {
+    const esc = creatorName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    name = name.replace(new RegExp(`^${esc}[\\s_\\-]+`, 'i'), '');
+  }
+  name = name.replace(/[_]+/g, ' ').trim();
+  return name || path.basename(raw, path.extname(raw));
+}
+
+/**
+ * Walk a model folder, tagging every file with the release it belongs to.
+ *
+ *   subfolder/  → all files inside get release_name = cleaned subfolder name
+ *   file.zip    → release_name = cleaned zip stem
+ *   loose file  → release_name = null  (ungrouped)
+ */
+function analyzeFolder(folderPath, creatorName) {
   const result = {
-    files: [],
-    hasStl: false,
-    hasChitubox: false,
-    hasLychee: false,
-    hasPlate: false,
-    images: [],
-    renderZips: []
+    files: [], hasStl: false, hasChitubox: false, hasLychee: false, hasPlate: false,
+    images: [], renderZips: [], releases: new Set(),
   };
 
-  function walk(dir) {
-    let entries;
-    try { entries = fs.readdirSync(dir, { withFileTypes: true }); }
-    catch (e) { return; }
+  let topEntries;
+  try { topEntries = fs.readdirSync(folderPath, { withFileTypes: true }); }
+  catch { return result; }
 
-    for (const entry of entries) {
-      const fullPath = path.join(dir, entry.name);
-      if (entry.isDirectory()) {
-        walk(fullPath);
-      } else {
-        const ext = path.extname(entry.name).toLowerCase();
-        const size = (() => { try { return fs.statSync(fullPath).size; } catch { return 0; } })();
-        result.files.push({ filename: entry.name, filepath: fullPath, ext, size });
+  for (const entry of topEntries) {
+    const full = path.join(folderPath, entry.name);
 
-        if (STL_EXTS.has(ext)) result.hasStl = true;
-        if (ext === '.chitubox' || ext === '.ctb' || ext === '.photon') result.hasChitubox = true;
-        if (ext === '.lys' || ext === '.lychee') result.hasLychee = true;
-        if (PLATE_EXTS.has(ext)) result.hasPlate = true;
-        if (IMAGE_EXTS.has(ext)) result.images.push(fullPath);
-        if (ext === '.zip' && isRenderZip(entry.name)) result.renderZips.push(fullPath);
+    if (entry.isDirectory()) {
+      const releaseName = inferReleaseName(entry.name, creatorName);
+      result.releases.add(releaseName);
+
+      function walkSub(dir) {
+        let list; try { list = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+        for (const e of list) {
+          const fp = path.join(dir, e.name);
+          if (e.isDirectory()) { walkSub(fp); continue; }
+          const ext = path.extname(e.name).toLowerCase();
+          let size = 0; try { size = fs.statSync(fp).size; } catch {}
+          result.files.push({ filename: e.name, filepath: fp, ext, size, release_name: releaseName });
+          if (STL_EXTS.has(ext))                                       result.hasStl = true;
+          if (ext==='.chitubox'||ext==='.ctb'||ext==='.photon')        result.hasChitubox = true;
+          if (ext==='.lys'||ext==='.lychee')                           result.hasLychee = true;
+          if (PLATE_EXTS.has(ext))                                     result.hasPlate = true;
+          if (IMAGE_EXTS.has(ext))                                     result.images.push(fp);
+          if (ext==='.zip' && isRenderZip(e.name))                     result.renderZips.push(fp);
+        }
       }
+      walkSub(full);
+
+    } else {
+      const ext = path.extname(entry.name).toLowerCase();
+      let size = 0; try { size = fs.statSync(full).size; } catch {}
+      const releaseName = ext === '.zip' ? inferReleaseName(entry.name, creatorName) : null;
+      if (releaseName) result.releases.add(releaseName);
+      result.files.push({ filename: entry.name, filepath: full, ext, size, release_name: releaseName });
+      if (STL_EXTS.has(ext))                                     result.hasStl = true;
+      if (ext==='.chitubox'||ext==='.ctb'||ext==='.photon')      result.hasChitubox = true;
+      if (ext==='.lys'||ext==='.lychee')                         result.hasLychee = true;
+      if (PLATE_EXTS.has(ext))                                   result.hasPlate = true;
+      if (IMAGE_EXTS.has(ext))                                   result.images.push(full);
+      if (ext==='.zip' && isRenderZip(entry.name))               result.renderZips.push(full);
     }
   }
 
-  walk(folderPath);
   return result;
 }
 
-function getOrCreateCreator(creatorName, folderPath) {
-  const existing = db.prepare('SELECT id FROM creators WHERE name = ?').get(creatorName);
+// ── Prepared statements (compiled once, reused thousands of times) ────────────
+
+const stmts = {
+  getCreator:    db.prepare('SELECT id, render_zip_hint FROM creators WHERE name = ?'),
+  addCreator:    db.prepare('INSERT INTO creators (name, folder_path) VALUES (?, ?)'),
+
+  getModel:      db.prepare('SELECT id, uuid, folder_hash, images, render_zip_hint FROM models WHERE folder_path = ?'),
+  insertModel:   db.prepare(`
+    INSERT INTO models (uuid, name, creator_id, folder_path, source_site,
+      file_count, has_stl, has_chitubox, has_lychee, has_plate,
+      thumbnail_path, images, folder_hash, last_scanned)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'))
+  `),
+  updateModel:   db.prepare(`
+    UPDATE models SET
+      name=?, creator_id=?, source_site=?,
+      file_count=?, has_stl=?, has_chitubox=?, has_lychee=?, has_plate=?,
+      thumbnail_path=?, images=?, folder_hash=?,
+      last_scanned=datetime('now'), updated_at=datetime('now')
+    WHERE id=?
+  `),
+  touchModel:    db.prepare(`UPDATE models SET last_scanned=datetime('now') WHERE id=?`),
+
+  deleteFiles:   db.prepare('DELETE FROM model_files WHERE model_id = ?'),
+  insertFile:    db.prepare(`
+    INSERT OR IGNORE INTO model_files (model_id, filename, filepath, filetype, filesize, release_name)
+    VALUES (?,?,?,?,?,?)
+  `),
+
+  finishLog:     db.prepare(`
+    UPDATE scan_log
+    SET status=?, models_found=?, models_added=?, models_updated=?, models_skipped=?, finished_at=datetime('now')
+    WHERE id=?
+  `),
+  errorLog:      db.prepare(`UPDATE scan_log SET status=?, error=?, finished_at=datetime('now') WHERE id=?`),
+};
+
+function getOrCreateCreator(name, folderPath) {
+  const existing = stmts.getCreator.get(name);
   if (existing) return existing.id;
-  const result = db.prepare('INSERT INTO creators (name, folder_path) VALUES (?, ?)').run(creatorName, folderPath);
-  return result.lastInsertRowid;
+  return stmts.addCreator.run(name, folderPath).lastInsertRowid;
 }
 
-function inferModelName(folderPath) {
-  return path.basename(folderPath)
-    .replace(/[_-]/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-}
+// ── Main scan ─────────────────────────────────────────────────────────────────
 
-async function scanLibrary(libraryPath, progressCallback) {
-  const logEntry = db.prepare(
-    'INSERT INTO scan_log (scan_path, status) VALUES (?, ?)'
-  ).run(libraryPath, 'running');
-  const logId = logEntry.lastInsertRowid;
+async function scanLibrary(libraryPath, progressCallback, logger) {
+  const log = logger || (() => {});
+  const logId = db.prepare('INSERT INTO scan_log (scan_path, status) VALUES (?, ?)').run(libraryPath, 'running').lastInsertRowid;
 
-  let modelsFound = 0, modelsAdded = 0, modelsUpdated = 0;
+  let modelsFound = 0, modelsAdded = 0, modelsUpdated = 0, modelsSkipped = 0;
 
   try {
-    const creatorDirs = fs.readdirSync(libraryPath, { withFileTypes: true })
-      .filter(d => d.isDirectory());
+    const creatorDirs = fs.readdirSync(libraryPath, { withFileTypes: true }).filter(d => d.isDirectory());
+    log('info', `Found ${creatorDirs.length} creator folder(s)`);
 
     for (const creatorDir of creatorDirs) {
       const creatorPath = path.join(libraryPath, creatorDir.name);
       const creatorName = creatorDir.name;
       const creatorId = getOrCreateCreator(creatorName, creatorPath);
+      const creatorRow = stmts.getCreator.get(creatorName);
+      const creatorHint = creatorRow?.render_zip_hint || null;
 
-      // Each subfolder under creator = one model
-      const modelDirs = fs.readdirSync(creatorPath, { withFileTypes: true })
-        .filter(d => d.isDirectory());
+      if (progressCallback) progressCallback({ stage: 'scanning', creator: creatorName });
 
-      // If creator folder itself has STL/zip files, treat the whole folder as a model too
-      const creatorFiles = fs.readdirSync(creatorPath, { withFileTypes: true })
-        .filter(d => !d.isDirectory());
-      const hasDirectFiles = creatorFiles.some(f => {
-        const ext = path.extname(f.name).toLowerCase();
-        return STL_EXTS.has(ext) || ext === '.zip';
-      });
+      const modelDirs  = fs.readdirSync(creatorPath, { withFileTypes: true }).filter(d => d.isDirectory());
+      const directFiles = fs.readdirSync(creatorPath, { withFileTypes: true }).filter(d => !d.isDirectory());
+      const hasDirectFiles = directFiles.some(f => { const e = path.extname(f.name).toLowerCase(); return STL_EXTS.has(e) || e === '.zip'; });
 
-      const foldersToProcess = [...modelDirs.map(d => ({
-        name: d.name,
-        fullPath: path.join(creatorPath, d.name),
-        creatorId,
-        creatorName
-      }))];
-
+      const foldersToProcess = modelDirs.map(d => ({
+        name: d.name, fullPath: path.join(creatorPath, d.name), creatorId, creatorName
+      }));
       if (hasDirectFiles && modelDirs.length === 0) {
         foldersToProcess.push({ name: creatorName, fullPath: creatorPath, creatorId, creatorName });
       }
 
-      for (const model of foldersToProcess) {
-        modelsFound++;
-        if (progressCallback) progressCallback({ stage: 'scanning', creator: creatorName, model: model.name, found: modelsFound });
+      log('creator', `▸ ${creatorName} (${foldersToProcess.length} model${foldersToProcess.length !== 1 ? 's' : ''})`);
 
-        const analysis = analyzeFolder(model.fullPath);
-        const sourceSite = detectSourceSite(model.fullPath) || detectSourceSite(model.name);
+      // Process all models for this creator in one transaction
+      db.transaction(() => {
+        for (const model of foldersToProcess) {
+          modelsFound++;
+          if (progressCallback) progressCallback({ stage: 'scanning', creator: creatorName, model: model.name, found: modelsFound });
 
-        // Check if model already exists
-        const existing = db.prepare('SELECT id, uuid FROM models WHERE folder_path = ?').get(model.fullPath);
+          const existing = stmts.getModel.get(model.fullPath);
+          const hash = folderHash(model.fullPath);
 
-        let modelUuid = existing ? existing.uuid : uuidv4();
-        let allImages = [];
-
-        // Extract images from render zips
-        for (const zipPath of analysis.renderZips) {
-          const imgs = extractImagesFromZip(zipPath, modelUuid);
-          allImages = allImages.concat(imgs);
-        }
-        // Copy loose images from folder
-        if (allImages.length === 0 && analysis.images.length > 0) {
-          const imgs = extractImagesFromFolder(model.fullPath, modelUuid);
-          allImages = allImages.concat(imgs);
-        }
-
-        const thumbnail = allImages.length > 0 ? allImages[0] : null;
-        const fileType = (filename) => {
-          const ext = path.extname(filename).toLowerCase();
-          if (STL_EXTS.has(ext)) return 'stl';
-          if (ext === '.zip') return 'zip';
-          if (SLICE_EXTS.has(ext)) return 'slicer';
-          if (PLATE_EXTS.has(ext)) return 'plate';
-          if (IMAGE_EXTS.has(ext)) return 'image';
-          return 'other';
-        };
-
-        if (existing) {
-          db.prepare(`
-            UPDATE models SET
-              name = ?, creator_id = ?, source_site = ?,
-              file_count = ?, has_stl = ?, has_chitubox = ?, has_lychee = ?, has_plate = ?,
-              thumbnail_path = ?, images = ?, last_scanned = datetime('now'), updated_at = datetime('now')
-            WHERE id = ?
-          `).run(
-            inferModelName(model.fullPath), creatorId, sourceSite,
-            analysis.files.length, analysis.hasStl ? 1 : 0,
-            analysis.hasChitubox ? 1 : 0, analysis.hasLychee ? 1 : 0, analysis.hasPlate ? 1 : 0,
-            thumbnail, JSON.stringify(allImages), existing.id
-          );
-          // Refresh files
-          db.prepare('DELETE FROM model_files WHERE model_id = ?').run(existing.id);
-          const insertFile = db.prepare('INSERT INTO model_files (model_id, filename, filepath, filetype, filesize) VALUES (?,?,?,?,?)');
-          for (const f of analysis.files) {
-            insertFile.run(existing.id, f.filename, f.filepath, fileType(f.filename), f.size);
+          // ── Skip if unchanged ─────────────────────────────────────────────
+          if (existing && existing.folder_hash === hash) {
+            stmts.touchModel.run(existing.id);
+            modelsSkipped++;
+            log('skip', `  ⟳ Unchanged: ${model.name}`);
+            continue;
           }
-          modelsUpdated++;
-        } else {
-          const ins = db.prepare(`
-            INSERT INTO models (uuid, name, creator_id, folder_path, source_site,
-              file_count, has_stl, has_chitubox, has_lychee, has_plate,
-              thumbnail_path, images, last_scanned)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'))
-          `).run(
-            modelUuid, inferModelName(model.fullPath), creatorId, model.fullPath, sourceSite,
-            analysis.files.length, analysis.hasStl ? 1 : 0,
-            analysis.hasChitubox ? 1 : 0, analysis.hasLychee ? 1 : 0, analysis.hasPlate ? 1 : 0,
-            thumbnail, JSON.stringify(allImages)
-          );
-          const insertFile = db.prepare('INSERT INTO model_files (model_id, filename, filepath, filetype, filesize) VALUES (?,?,?,?,?)');
-          for (const f of analysis.files) {
-            insertFile.run(ins.lastInsertRowid, f.filename, f.filepath, fileType(f.filename), f.size);
+
+          // ── Analyze folder ────────────────────────────────────────────────
+          const analysis = analyzeFolder(model.fullPath, creatorName);
+          const sourceSite = detectSourceSite(model.fullPath) || detectSourceSite(model.name);
+          const modelUuid = existing ? existing.uuid : uuidv4();
+          // Model-level hint overrides creator-level hint
+          const hint = existing?.render_zip_hint || creatorHint || null;
+
+          let allImages = existing ? JSON.parse(existing.images || '[]') : [];
+
+          // Only re-extract images if folder changed
+          const freshImages = [];
+          const renderZips = pickRenderZips(analysis, hint);
+          for (const zipPath of renderZips) {
+            log('zip', `    📦 ${path.basename(zipPath)}`);
+            const imgs = extractImagesFromZip(zipPath, modelUuid);
+            freshImages.push(...imgs);
+            if (imgs.length) log('img', `       → ${imgs.length} image(s)`);
           }
-          modelsAdded++;
+          if (freshImages.length === 0 && analysis.images.length > 0) {
+            freshImages.push(...extractImagesFromFolder(model.fullPath, modelUuid));
+          }
+          // Merge: keep manually-added images, add newly found ones
+          if (freshImages.length > 0) {
+            allImages = [...new Set([...freshImages, ...allImages])];
+          }
+
+          const thumbnail = allImages[0] || null;
+
+          if (existing) {
+            stmts.updateModel.run(
+              inferModelName(model.fullPath), creatorId, sourceSite,
+              analysis.files.length, analysis.hasStl ? 1 : 0,
+              analysis.hasChitubox ? 1 : 0, analysis.hasLychee ? 1 : 0, analysis.hasPlate ? 1 : 0,
+              thumbnail, JSON.stringify(allImages), hash, existing.id
+            );
+            stmts.deleteFiles.run(existing.id);
+            for (const f of analysis.files) stmts.insertFile.run(existing.id, f.filename, f.filepath, fileType(f.filename), f.size, f.release_name || null);
+            const releaseList = [...analysis.releases];
+            log('update', `    ↻ ${model.name} (${analysis.files.length} files${releaseList.length ? `, ${releaseList.length} release${releaseList.length>1?'s':''}` : ''})`);
+            modelsUpdated++;
+          } else {
+            const ins = stmts.insertModel.run(
+              modelUuid, inferModelName(model.fullPath), creatorId, model.fullPath, sourceSite,
+              analysis.files.length, analysis.hasStl ? 1 : 0,
+              analysis.hasChitubox ? 1 : 0, analysis.hasLychee ? 1 : 0, analysis.hasPlate ? 1 : 0,
+              thumbnail, JSON.stringify(allImages), hash
+            );
+            for (const f of analysis.files) stmts.insertFile.run(ins.lastInsertRowid, f.filename, f.filepath, fileType(f.filename), f.size, f.release_name || null);
+            const releaseList = [...analysis.releases];
+            log('add', `    + ${model.name} (${analysis.files.length} files${releaseList.length ? `, ${releaseList.length} release${releaseList.length>1?'s':''}` : ''}${allImages.length ? `, ${allImages.length} img` : ''})`);
+            modelsAdded++;
+          }
         }
-      }
+      })(); // end transaction
     }
 
-    db.prepare('UPDATE scan_log SET status=?, models_found=?, models_added=?, models_updated=?, finished_at=datetime(\'now\') WHERE id=?')
-      .run('complete', modelsFound, modelsAdded, modelsUpdated, logId);
+    stmts.finishLog.run('complete', modelsFound, modelsAdded, modelsUpdated, modelsSkipped, logId);
+    log('info', `Skipped ${modelsSkipped} unchanged model(s)`);
+    return { success: true, modelsFound, modelsAdded, modelsUpdated, modelsSkipped };
 
-    return { success: true, modelsFound, modelsAdded, modelsUpdated };
   } catch (err) {
-    db.prepare('UPDATE scan_log SET status=?, error=?, finished_at=datetime(\'now\') WHERE id=?')
-      .run('error', err.message, logId);
+    stmts.errorLog.run('error', err.message, logId);
     throw err;
   }
 }
 
-module.exports = { scanLibrary, LIBRARY_PATH };
+module.exports = { scanLibrary, LIBRARY_PATH, matchesHint, pickRenderZips, analyzeFolder, inferReleaseName };

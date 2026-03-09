@@ -1,21 +1,30 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
+import StlViewer from '../components/StlViewer';
+import ZipImagePicker from '../components/ZipImagePicker';
+import ClaudeAssistant from '../components/ClaudeAssistant';
+import TaskLog from '../components/TaskLog';
+import ReleaseFileList from '../components/ReleaseFileList';
+import RenderHintPanel from '../components/RenderHintPanel';
 
 const STATUS_OPTIONS = ['unprinted', 'sliced', 'printing', 'printed', 'painted', 'failed'];
-
 const SOURCE_LABELS = {
-  printables: 'Printables',
-  thingiverse: 'Thingiverse',
-  myminifactory: 'MyMiniFactory',
-  patreon: 'Patreon',
-  gumroad: 'Gumroad',
-  cults3d: 'Cults3D'
+  printables: 'Printables', thingiverse: 'Thingiverse',
+  myminifactory: 'MyMiniFactory', patreon: 'Patreon',
+  gumroad: 'Gumroad', cults3d: 'Cults3D'
 };
 
 function formatBytes(bytes) {
   if (!bytes) return '';
-  if (bytes < 1024) return `${bytes}B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`;
   return `${(bytes / 1024 / 1024).toFixed(1)}MB`;
+}
+
+// Persist API key in localStorage
+function getStoredApiKey() {
+  try { return localStorage.getItem('vault_claude_key') || ''; } catch { return ''; }
+}
+function setStoredApiKey(key) {
+  try { localStorage.setItem('vault_claude_key', key); } catch {}
 }
 
 export default function ModelDetail({ modelId, onBack, onSaved }) {
@@ -23,8 +32,18 @@ export default function ModelDetail({ modelId, onBack, onSaved }) {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  const [scraping, setScraping] = useState(false);
+  const [scrapeLog, setScrapeLog] = useState([]);
+  const [scrapeError, setScrapeError] = useState(null);
+  const scrapeEsRef = useRef(null);
+  const [scrapeUrl, setScrapeUrl] = useState('');
+  const [showScrapeInput, setShowScrapeInput] = useState(false);
+  const [showZipPicker, setShowZipPicker] = useState(false);
+  const [showRenderHint, setShowRenderHint] = useState(false);
+  const [showAssistant, setShowAssistant] = useState(false);
+  const [viewingStl, setViewingStl] = useState(null);
+  const [apiKey, setApiKey] = useState(getStoredApiKey);
 
-  // Editable fields
   const [status, setStatus] = useState('unprinted');
   const [tags, setTags] = useState([]);
   const [tagInput, setTagInput] = useState('');
@@ -32,7 +51,12 @@ export default function ModelDetail({ modelId, onBack, onSaved }) {
   const [sourceUrl, setSourceUrl] = useState('');
   const [activeImg, setActiveImg] = useState(0);
 
-  useEffect(() => {
+  const handleApiKeyChange = (key) => {
+    setApiKey(key);
+    setStoredApiKey(key);
+  };
+
+  const loadModel = () => {
     setLoading(true);
     fetch(`/api/models/${modelId}`)
       .then(r => r.json())
@@ -42,10 +66,21 @@ export default function ModelDetail({ modelId, onBack, onSaved }) {
         setTags(m.tags || []);
         setNotes(m.notes || '');
         setSourceUrl(m.source_url || '');
+        setScrapeUrl(m.source_url || '');
         setLoading(false);
       })
       .catch(() => setLoading(false));
-  }, [modelId]);
+  };
+
+  useEffect(() => { loadModel(); }, [modelId]);
+
+  useEffect(() => {
+    if (!model || model.source_url) return;
+    fetch(`/api/models/${modelId}/detect-url`)
+      .then(r => r.json())
+      .then(data => { if (data.url) setScrapeUrl(data.url); })
+      .catch(() => {});
+  }, [model, modelId]);
 
   const handleSave = async () => {
     setSaving(true);
@@ -62,22 +97,69 @@ export default function ModelDetail({ modelId, onBack, onSaved }) {
     setSaving(false);
   };
 
+  const handleScrape = async () => {
+    setScraping(true);
+    setScrapeError(null);
+    setScrapeLog([{ level: 'info', msg: `Starting fetch for: ${scrapeUrl || '(auto-detect)'}`, ts: new Date().toISOString() }]);
+
+    try {
+      await fetch(`/api/models/${modelId}/scrape`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
+        body: JSON.stringify({ url: scrapeUrl || undefined }),
+      });
+    } catch (e) {
+      setScrapeLog(l => [...l, { level: 'error', msg: e.message, ts: new Date().toISOString() }]);
+      setScraping(false);
+      return;
+    }
+
+    // Re-open as SSE stream
+    const es = new EventSource(`/api/models/${modelId}/scrape-stream?url=${encodeURIComponent(scrapeUrl || '')}`);
+    scrapeEsRef.current = es;
+    es.onmessage = (e) => {
+      const data = JSON.parse(e.data);
+      if (data.type === 'done') {
+        es.close();
+        setScraping(false);
+        if (data.success) {
+          setShowScrapeInput(false);
+          loadModel();
+          if (onSaved) onSaved();
+        } else {
+          setScrapeError(data.error);
+        }
+      } else {
+        setScrapeLog(l => [...l, data]);
+      }
+    };
+    es.onerror = () => {
+      setScrapeLog(l => [...l, { level: 'error', msg: 'Connection lost.', ts: new Date().toISOString() }]);
+      setScraping(false);
+      es.close();
+    };
+  };
+
   const addTag = (val) => {
     const t = val.trim().toLowerCase();
     if (t && !tags.includes(t)) setTags([...tags, t]);
     setTagInput('');
   };
-
   const removeTag = (t) => setTags(tags.filter(x => x !== t));
+
+  const handleApplyTag = (tag) => {
+    if (!tags.includes(tag)) setTags(prev => [...prev, tag]);
+  };
+  const handleApplyAllTags = (newTags) => {
+    setTags(prev => [...new Set([...prev, ...newTags])]);
+  };
+  const handleApplyStatus = (s) => setStatus(s);
+  const handleApplyNotes = (n) => setNotes(n);
 
   if (loading) return <div className="loading"><div className="spinner" /> Loading...</div>;
   if (!model) return <div className="loading">Model not found</div>;
 
   const images = model.images || [];
-  const stlFiles = (model.files || []).filter(f => f.filetype === 'stl');
-  const slicerFiles = (model.files || []).filter(f => f.filetype === 'slicer');
-  const zipFiles = (model.files || []).filter(f => f.filetype === 'zip');
-  const otherFiles = (model.files || []).filter(f => !['stl','slicer','zip','image'].includes(f.filetype));
 
   return (
     <div className="detail-page">
@@ -89,122 +171,160 @@ export default function ModelDetail({ modelId, onBack, onSaved }) {
             {SOURCE_LABELS[model.source_site] || model.source_site}
           </span>
         )}
+        <div style={{ marginLeft: 'auto', display: 'flex', gap: 8 }}>
+          <button onClick={() => setShowAssistant(s => !s)}
+            style={{
+              padding: '6px 14px', borderRadius: 'var(--radius)',
+              background: showAssistant ? 'rgba(193,127,58,0.15)' : 'var(--bg3)',
+              border: `1px solid ${showAssistant ? 'var(--accent)' : 'var(--border)'}`,
+              color: showAssistant ? 'var(--accent)' : 'var(--text-muted)',
+              cursor: 'pointer', fontSize: 12, fontFamily: 'var(--font-mono)',
+              display: 'flex', alignItems: 'center', gap: 6
+            }}>
+            ✦ {showAssistant ? 'Hide' : 'Ask Claude'}
+          </button>
+        </div>
       </div>
 
       <div className="detail-scroll">
-        <div className="detail-grid">
-          {/* Left: images */}
+        {/* Main layout — expands to 3 cols when assistant is open */}
+        <div style={{
+          display: 'grid',
+          gridTemplateColumns: showAssistant ? '1fr 300px 300px' : '1fr 300px',
+          gap: 20, maxWidth: showAssistant ? 1300 : 1100, alignItems: 'start'
+        }}>
+
+          {/* Left: images + files */}
           <div>
-            <div className="detail-images">
-              {images.length > 0 ? (
-                <>
-                  <img className="detail-main-img" src={images[activeImg]} alt={model.name} />
-                  {images.length > 1 && (
-                    <div className="detail-thumbs">
-                      {images.map((img, i) => (
-                        <img
-                          key={i}
-                          className={`detail-thumb ${activeImg === i ? 'active' : ''}`}
-                          src={img}
-                          alt=""
-                          onClick={() => setActiveImg(i)}
-                        />
-                      ))}
+            {viewingStl ? (
+              <div style={{ marginBottom: 16 }}>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
+                  <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--text-muted)' }}>3D VIEW — {viewingStl.filename}</span>
+                  <button onClick={() => setViewingStl(null)} style={{ background: 'none', border: '1px solid var(--border)', borderRadius: 4, color: 'var(--text-muted)', padding: '3px 8px', cursor: 'pointer', fontSize: 11 }}>✕ Close viewer</button>
+                </div>
+                <StlViewer fileId={viewingStl.id} filename={viewingStl.filename} />
+              </div>
+            ) : (
+              <div className="detail-images" style={{ marginBottom: 16 }}>
+                {images.length > 0 ? (
+                  <>
+                    <img className="detail-main-img" src={images[activeImg]} alt={model.name} />
+                    {images.length > 1 && (
+                      <div className="detail-thumbs">
+                        {images.map((img, i) => (
+                          <img key={i} className={`detail-thumb ${activeImg === i ? 'active' : ''}`} src={img} alt="" onClick={() => setActiveImg(i)} />
+                        ))}
+                      </div>
+                    )}
+                  </>
+                ) : (
+                  <div className="detail-no-img">🧩</div>
+                )}
+              </div>
+            )}
+
+            {/* Image tools */}
+            <div className="detail-card" style={{ marginBottom: 16 }}>
+              <div className="detail-card-title">
+                Images
+                <span style={{ marginLeft: 8, color: 'var(--text-faint)', fontWeight: 'normal' }}>{images.length} found</span>
+              </div>
+              <div style={{ display: 'flex', gap: 8 }}>
+                <button onClick={() => { setShowZipPicker(s => !s); setShowScrapeInput(false); setShowRenderHint(false); }}
+                  style={{ flex: 1, padding: '7px 8px', background: showZipPicker ? 'rgba(193,127,58,0.1)' : 'var(--bg3)', border: `1px dashed ${showZipPicker ? 'var(--accent)' : 'var(--border-bright)'}`, borderRadius: 'var(--radius)', color: showZipPicker ? 'var(--accent)' : 'var(--text-muted)', cursor: 'pointer', fontSize: 12 }}>
+                  📦 Extract from ZIP
+                </button>
+                <button onClick={() => { setShowScrapeInput(s => !s); setShowZipPicker(false); setShowRenderHint(false); }}
+                  style={{ flex: 1, padding: '7px 8px', background: showScrapeInput ? 'rgba(193,127,58,0.1)' : 'var(--bg3)', border: `1px dashed ${showScrapeInput ? 'var(--accent)' : 'var(--border-bright)'}`, borderRadius: 'var(--radius)', color: showScrapeInput ? 'var(--accent)' : 'var(--text-muted)', cursor: 'pointer', fontSize: 12 }}>
+                  🌐 Fetch from site
+                </button>
+                <button onClick={() => { setShowRenderHint(s => !s); setShowZipPicker(false); setShowScrapeInput(false); }}
+                  title="Set which ZIP to auto-extract renders from on next scan"
+                  style={{ padding: '7px 10px', background: showRenderHint ? 'rgba(193,127,58,0.1)' : 'var(--bg3)', border: `1px dashed ${showRenderHint ? 'var(--accent)' : 'var(--border-bright)'}`, borderRadius: 'var(--radius)', color: showRenderHint ? 'var(--accent)' : 'var(--text-muted)', cursor: 'pointer', fontSize: 14 }}>
+                  ⚙
+                </button>
+              </div>
+
+              {showRenderHint && (
+                <div style={{ marginTop: 12 }}>
+                  <RenderHintPanel
+                    mode="model"
+                    modelId={modelId}
+                    currentHint={model.render_zip_hint}
+                    creatorHint={null}
+                    onClose={() => setShowRenderHint(false)}
+                    onSaved={() => { setShowRenderHint(false); loadModel(); }}
+                  />
+                </div>
+              )}
+
+              {showZipPicker && (
+                <div style={{ marginTop: 12 }}>
+                  <ZipImagePicker
+                    modelId={modelId}
+                    onImagesExtracted={() => { setShowZipPicker(false); loadModel(); if (onSaved) onSaved(); }}
+                    onClose={() => setShowZipPicker(false)}
+                  />
+                </div>
+              )}
+
+              {showScrapeInput && (
+                <div style={{ marginTop: 12 }}>
+                  <div style={{ fontSize: 11, color: 'var(--text-faint)', marginBottom: 6 }}>Printables, MyMiniFactory, or Thingiverse URL:</div>
+                  <input className="url-input" value={scrapeUrl} onChange={e => setScrapeUrl(e.target.value)} placeholder="https://www.printables.com/model/..." style={{ marginBottom: 8 }} />
+                  {scrapeError && (
+                    <div style={{ fontSize: 11, color: 'var(--red)', marginBottom: 8, padding: '6px 8px', background: 'rgba(207,114,114,0.1)', borderRadius: 4 }}>✗ {scrapeError}</div>
+                  )}
+                  {scrapeLog.length > 0 && (
+                    <div style={{ marginBottom: 10 }}>
+                      <TaskLog lines={scrapeLog} running={scraping} title="FETCH LOG" height={130} />
                     </div>
                   )}
-                </>
-              ) : (
-                <div className="detail-no-img">🧩</div>
+                  <div style={{ display: 'flex', gap: 8 }}>
+                    <button onClick={() => { setShowScrapeInput(false); setScrapeError(null); setScrapeLog([]); scrapeEsRef.current?.close(); }} style={{ flex: 1, padding: '7px', background: 'var(--bg3)', border: '1px solid var(--border)', borderRadius: 'var(--radius)', color: 'var(--text-muted)', cursor: 'pointer', fontSize: 12 }}>Cancel</button>
+                    <button onClick={handleScrape} disabled={scraping || !scrapeUrl}
+                      style={{ flex: 2, padding: '7px', background: 'var(--accent)', border: 'none', borderRadius: 'var(--radius)', color: '#0d0d0f', cursor: scraping ? 'not-allowed' : 'pointer', fontSize: 13, fontFamily: 'var(--font-display)', letterSpacing: 1, opacity: (scraping || !scrapeUrl) ? 0.6 : 1 }}>
+                      {scraping ? 'Fetching...' : 'Fetch Images'}
+                    </button>
+                  </div>
+                </div>
               )}
             </div>
 
-            {/* Files */}
-            {stlFiles.length > 0 && (
-              <div className="detail-card" style={{ marginTop: 16 }}>
-                <div className="detail-card-title">STL / 3D Files ({stlFiles.length})</div>
-                <div className="file-list">
-                  {stlFiles.map(f => (
-                    <div key={f.id} className="file-item">
-                      <span className="ftype stl" style={{ background: 'rgba(76,175,125,0.15)', color: 'var(--green)' }}>STL</span>
-                      <span className="fname">{f.filename}</span>
-                      <span className="fsize">{formatBytes(f.filesize)}</span>
-                    </div>
-                  ))}
+            {/* Files grouped by release */}
+            {model.files && model.files.length > 0 && (
+              <div className="detail-card">
+                <div className="detail-card-title">
+                  Files
+                  <span style={{ marginLeft: 8, color: 'var(--text-faint)', fontWeight: 'normal' }}>
+                    {model.file_count} total
+                  </span>
                 </div>
-              </div>
-            )}
-
-            {slicerFiles.length > 0 && (
-              <div className="detail-card" style={{ marginTop: 16 }}>
-                <div className="detail-card-title">Slicer Files ({slicerFiles.length})</div>
-                <div className="file-list">
-                  {slicerFiles.map(f => (
-                    <div key={f.id} className="file-item">
-                      <span className="ftype" style={{ background: 'rgba(91,155,213,0.15)', color: 'var(--blue)' }}>SLC</span>
-                      <span className="fname">{f.filename}</span>
-                      <span className="fsize">{formatBytes(f.filesize)}</span>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
-
-            {zipFiles.length > 0 && (
-              <div className="detail-card" style={{ marginTop: 16 }}>
-                <div className="detail-card-title">ZIP Archives ({zipFiles.length})</div>
-                <div className="file-list">
-                  {zipFiles.map(f => (
-                    <div key={f.id} className="file-item">
-                      <span className="ftype" style={{ background: 'rgba(212,170,76,0.15)', color: 'var(--yellow)' }}>ZIP</span>
-                      <span className="fname">{f.filename}</span>
-                      <span className="fsize">{formatBytes(f.filesize)}</span>
-                    </div>
-                  ))}
-                </div>
+                <ReleaseFileList
+                  files={model.files.filter(f => f.filetype !== 'image')}
+                  onView3D={f => setViewingStl(viewingStl?.id === f.id ? null : { id: f.id, filename: f.filename })}
+                  viewingStlId={viewingStl?.id}
+                />
               </div>
             )}
           </div>
 
-          {/* Right: panel */}
+          {/* Middle: metadata panel */}
           <div className="detail-panel">
             <div className="detail-card">
               <div className="detail-card-title">Info</div>
-              <div className="meta-row">
-                <span className="meta-label">Creator</span>
-                <span className="meta-val">{model.creator_name || '—'}</span>
-              </div>
-              <div className="meta-row">
-                <span className="meta-label">Files</span>
-                <span className="meta-val">{model.file_count}</span>
-              </div>
-              <div className="meta-row">
-                <span className="meta-label">Has STL</span>
-                <span className="meta-val">{model.has_stl ? '✓' : '✗'}</span>
-              </div>
-              <div className="meta-row">
-                <span className="meta-label">Chitubox</span>
-                <span className="meta-val">{model.has_chitubox ? '✓' : '✗'}</span>
-              </div>
-              <div className="meta-row">
-                <span className="meta-label">Lychee</span>
-                <span className="meta-val">{model.has_lychee ? '✓' : '✗'}</span>
-              </div>
-              <div className="meta-row">
-                <span className="meta-label">Plate/GCode</span>
-                <span className="meta-val">{model.has_plate ? '✓' : '✗'}</span>
-              </div>
+              <div className="meta-row"><span className="meta-label">Creator</span><span className="meta-val">{model.creator_name || '—'}</span></div>
+              <div className="meta-row"><span className="meta-label">Files</span><span className="meta-val">{model.file_count}</span></div>
+              <div className="meta-row"><span className="meta-label">Has STL</span><span className="meta-val">{model.has_stl ? '✓' : '✗'}</span></div>
+              <div className="meta-row"><span className="meta-label">Chitubox</span><span className="meta-val">{model.has_chitubox ? '✓' : '✗'}</span></div>
+              <div className="meta-row"><span className="meta-label">Lychee</span><span className="meta-val">{model.has_lychee ? '✓' : '✗'}</span></div>
+              <div className="meta-row"><span className="meta-label">Plate/GCode</span><span className="meta-val">{model.has_plate ? '✓' : '✗'}</span></div>
             </div>
 
             <div className="detail-card">
               <div className="detail-card-title">Print Status</div>
-              <select
-                className="status-select"
-                value={status}
-                onChange={e => setStatus(e.target.value)}
-              >
-                {STATUS_OPTIONS.map(s => (
-                  <option key={s} value={s}>{s.charAt(0).toUpperCase() + s.slice(1)}</option>
-                ))}
+              <select className="status-select" value={status} onChange={e => setStatus(e.target.value)}>
+                {STATUS_OPTIONS.map(s => <option key={s} value={s}>{s.charAt(0).toUpperCase() + s.slice(1)}</option>)}
               </select>
             </div>
 
@@ -212,48 +332,46 @@ export default function ModelDetail({ modelId, onBack, onSaved }) {
               <div className="detail-card-title">Tags</div>
               <div className="tags-input" onClick={e => e.currentTarget.querySelector('input').focus()}>
                 {tags.map(t => (
-                  <span key={t} className="tag-chip">
-                    {t}
-                    <button onClick={() => removeTag(t)}>×</button>
-                  </span>
+                  <span key={t} className="tag-chip">{t}<button onClick={() => removeTag(t)}>×</button></span>
                 ))}
-                <input
-                  className="tag-text-input"
-                  value={tagInput}
-                  onChange={e => setTagInput(e.target.value)}
+                <input className="tag-text-input" value={tagInput} onChange={e => setTagInput(e.target.value)}
                   onKeyDown={e => {
                     if (e.key === 'Enter' || e.key === ',') { e.preventDefault(); addTag(tagInput); }
                     if (e.key === 'Backspace' && !tagInput && tags.length) removeTag(tags[tags.length - 1]);
                   }}
-                  placeholder={tags.length ? '' : 'Add tags...'}
-                />
+                  placeholder={tags.length ? '' : 'Add tags...'} />
               </div>
             </div>
 
             <div className="detail-card">
               <div className="detail-card-title">Source URL</div>
-              <input
-                className="url-input"
-                value={sourceUrl}
-                onChange={e => setSourceUrl(e.target.value)}
-                placeholder="https://www.printables.com/model/..."
-              />
+              <input className="url-input" value={sourceUrl} onChange={e => setSourceUrl(e.target.value)} placeholder="https://www.printables.com/model/..." />
             </div>
 
             <div className="detail-card">
               <div className="detail-card-title">Notes</div>
-              <textarea
-                className="notes-textarea"
-                value={notes}
-                onChange={e => setNotes(e.target.value)}
-                placeholder="Print settings, modifications, paint schemes..."
-              />
+              <textarea className="notes-textarea" value={notes} onChange={e => setNotes(e.target.value)} placeholder="Print settings, modifications, paint schemes..." />
             </div>
 
             <button className="save-btn" onClick={handleSave} disabled={saving}>
               {saved ? '✓ SAVED' : saving ? 'SAVING...' : 'SAVE CHANGES'}
             </button>
           </div>
+
+          {/* Right: Claude assistant */}
+          {showAssistant && (
+            <div style={{ height: 600, position: 'sticky', top: 20 }}>
+              <ClaudeAssistant
+                model={{ id: model.id, name: model.name, print_status: status, tags, notes, has_stl: model.has_stl, has_chitubox: model.has_chitubox, has_lychee: model.has_lychee, creator_name: model.creator_name }}
+                apiKey={apiKey}
+                onApiKeyChange={handleApiKeyChange}
+                onApplyTag={handleApplyTag}
+                onApplyAllTags={handleApplyAllTags}
+                onApplyStatus={handleApplyStatus}
+                onApplyNotes={handleApplyNotes}
+              />
+            </div>
+          )}
         </div>
       </div>
     </div>

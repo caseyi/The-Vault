@@ -3,7 +3,8 @@ const cors = require('cors');
 const path = require('path');
 const fs = require('fs');
 const db = require('./db');
-const { scanLibrary, LIBRARY_PATH } = require('./scanner');
+const { scanLibrary, LIBRARY_PATH, matchesHint, pickRenderZips, analyzeFolder, inferReleaseName } = require('./scanner');
+const { scrapeImagesFromUrl, detectUrlFromFolderName } = require('./scraper');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -16,7 +17,42 @@ app.use('/images', express.static(IMAGES_DIR));
 // ── Scan ──────────────────────────────────────────────────────────────────────
 
 let scanInProgress = false;
-let scanProgress = null;
+let scanLog = [];       // running log lines
+let scanSummary = null; // final result
+
+function pushLog(level, msg) {
+  const line = { ts: new Date().toISOString(), level, msg };
+  scanLog.push(line);
+  return line;
+}
+
+// SSE stream — client connects and receives log lines in real time
+app.get('/api/scan/stream', (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders();
+
+  const send = (data) => res.write(`data: ${JSON.stringify(data)}\n\n`);
+
+  // Replay existing log lines for late-joiners
+  scanLog.forEach(line => send(line));
+  if (scanSummary) { send({ type: 'done', ...scanSummary }); res.end(); return; }
+  if (!scanInProgress) { send({ type: 'idle' }); res.end(); return; }
+
+  // Subscribe to new log lines via polling the array length
+  let lastIdx = scanLog.length;
+  const interval = setInterval(() => {
+    while (lastIdx < scanLog.length) send(scanLog[lastIdx++]);
+    if (!scanInProgress) {
+      if (scanSummary) send({ type: 'done', ...scanSummary });
+      clearInterval(interval);
+      res.end();
+    }
+  }, 150);
+
+  req.on('close', () => clearInterval(interval));
+});
 
 app.post('/api/scan', async (req, res) => {
   if (scanInProgress) return res.status(409).json({ error: 'Scan already in progress' });
@@ -24,22 +60,34 @@ app.post('/api/scan', async (req, res) => {
   if (!fs.existsSync(libPath)) return res.status(400).json({ error: `Path not found: ${libPath}` });
 
   scanInProgress = true;
-  scanProgress = { stage: 'starting', started: new Date().toISOString() };
+  scanLog = [];
+  scanSummary = null;
 
   res.json({ message: 'Scan started', path: libPath });
 
+  pushLog('info', `Starting scan: ${libPath}`);
+
   try {
-    const result = await scanLibrary(libPath, (p) => { scanProgress = p; });
-    scanProgress = { stage: 'complete', ...result };
+    const result = await scanLibrary(libPath, (p) => {
+      if (p.stage === 'scanning') {
+        if (p.model) pushLog('scan', `  ${p.creator} / ${p.model}`);
+        else if (p.creator) pushLog('creator', `▸ Creator: ${p.creator}`);
+      }
+    }, pushLog);
+
+    pushLog('success', `✓ Scan complete — ${result.modelsFound} found · ${result.modelsAdded} added · ${result.modelsUpdated} updated · ${result.modelsSkipped} skipped (unchanged)`);
+    scanSummary = { type: 'done', success: true, ...result };
   } catch (err) {
-    scanProgress = { stage: 'error', error: err.message };
+    pushLog('error', `✗ Error: ${err.message}`);
+    scanSummary = { type: 'done', success: false, error: err.message };
   } finally {
     scanInProgress = false;
   }
 });
 
+// Legacy status endpoint (still used by anything polling)
 app.get('/api/scan/status', (req, res) => {
-  res.json({ inProgress: scanInProgress, progress: scanProgress });
+  res.json({ inProgress: scanInProgress, log: scanLog, summary: scanSummary });
 });
 
 // ── Models ─────────────────────────────────────────────────────────────────────
@@ -96,7 +144,7 @@ app.get('/api/models/:id', (req, res) => {
   `).get(req.params.id);
   if (!model) return res.status(404).json({ error: 'Not found' });
 
-  const files = db.prepare('SELECT * FROM model_files WHERE model_id = ? ORDER BY filetype, filename').all(model.id);
+  const files = db.prepare('SELECT * FROM model_files WHERE model_id = ? ORDER BY release_name NULLS LAST, filetype, filename').all(model.id);
   res.json({
     ...model,
     tags: JSON.parse(model.tags || '[]'),
@@ -137,6 +185,107 @@ app.get('/api/creators', (req, res) => {
   res.json(creators);
 });
 
+// Get/set the render ZIP hint for a creator (applies to all its models unless overridden)
+app.get('/api/creators/:id/render-hint', (req, res) => {
+  const creator = db.prepare('SELECT id, name, render_zip_hint FROM creators WHERE id = ?').get(req.params.id);
+  if (!creator) return res.status(404).json({ error: 'Not found' });
+  // Also return sample zip filenames from this creator's models so the UI can suggest them
+  const zips = db.prepare(`
+    SELECT DISTINCT mf.filename
+    FROM model_files mf
+    JOIN models m ON mf.model_id = m.id
+    WHERE m.creator_id = ? AND mf.filetype = 'zip'
+    ORDER BY mf.filename
+  `).all(req.params.id).map(r => r.filename);
+  res.json({ ...creator, available_zips: zips });
+});
+
+app.patch('/api/creators/:id/render-hint', (req, res) => {
+  const { render_zip_hint } = req.body;
+  db.prepare('UPDATE creators SET render_zip_hint = ? WHERE id = ?').run(render_zip_hint || null, req.params.id);
+  res.json({ success: true });
+});
+
+// Re-extract renders for all models belonging to a creator, using the current hint
+app.post('/api/creators/:id/reextract', async (req, res) => {
+  const creator = db.prepare('SELECT * FROM creators WHERE id = ?').get(req.params.id);
+  if (!creator) return res.status(404).json({ error: 'Not found' });
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders();
+
+  const send = (level, msg) => res.write(`data: ${JSON.stringify({ level, msg, ts: new Date().toISOString() })}\n\n`);
+  const done = (data) => { res.write(`data: ${JSON.stringify({ type: 'done', ...data })}\n\n`); res.end(); };
+
+  const hint = creator.render_zip_hint || null;
+  send('info', `Creator: ${creator.name}`);
+  send('info', `Render ZIP hint: ${hint || '(auto-detect by keyword)'}`);
+
+  const models = db.prepare('SELECT * FROM models WHERE creator_id = ?').all(creator.id);
+  send('info', `Processing ${models.length} model(s)…`);
+
+  let updated = 0, skipped = 0;
+  for (const model of models) {
+    // Model-level hint overrides creator hint
+    const effectiveHint = model.render_zip_hint || hint;
+    const analysis = analyzeFolder(model.folder_path);
+    const renderZips = pickRenderZips(analysis, effectiveHint);
+
+    if (renderZips.length === 0) {
+      send('warn', `  ⚠ ${model.name}: no matching ZIP found`);
+      skipped++;
+      continue;
+    }
+
+    send('zip', `  📦 ${model.name}: extracting from ${renderZips.map(z => path.basename(z)).join(', ')}`);
+
+    const IMAGE_EXTS = new Set(['.jpg', '.jpeg', '.png', '.webp', '.gif']);
+    const modelImgDir = path.join(IMAGES_DIR, model.uuid);
+    if (!fs.existsSync(modelImgDir)) fs.mkdirSync(modelImgDir, { recursive: true });
+
+    const freshImages = [];
+    for (const zipPath of renderZips) {
+      try {
+        const zip = new AdmZip(zipPath);
+        for (const entry of zip.getEntries()) {
+          if (entry.isDirectory) continue;
+          const ext = path.extname(entry.entryName).toLowerCase();
+          if (!IMAGE_EXTS.has(ext)) continue;
+          const safeName = path.basename(entry.entryName).replace(/[^a-zA-Z0-9._-]/g, '_');
+          const outPath = path.join(modelImgDir, safeName);
+          zip.extractEntryTo(entry, modelImgDir, false, true, false, safeName);
+          freshImages.push(`/images/${model.uuid}/${safeName}`);
+        }
+      } catch (e) {
+        send('error', `    ✗ Failed: ${e.message}`);
+      }
+    }
+
+    if (freshImages.length > 0) {
+      const existing = JSON.parse(model.images || '[]');
+      const merged = [...new Set([...freshImages, ...existing])];
+      db.prepare(`UPDATE models SET images=?, thumbnail_path=?, folder_hash=NULL, updated_at=datetime('now') WHERE id=?`)
+        .run(JSON.stringify(merged), merged[0], model.id);
+      send('img', `     → ${freshImages.length} image(s) saved`);
+      updated++;
+    } else {
+      send('warn', `     ⚠ No images found inside ZIP(s)`);
+      skipped++;
+    }
+  }
+
+  done({ success: true, updated, skipped });
+});
+
+// Per-model render ZIP hint override
+app.patch('/api/models/:id/render-hint', (req, res) => {
+  const { render_zip_hint } = req.body;
+  db.prepare('UPDATE models SET render_zip_hint = ?, folder_hash = NULL WHERE id = ?').run(render_zip_hint || null, req.params.id);
+  res.json({ success: true });
+});
+
 // ── Stats ─────────────────────────────────────────────────────────────────────
 
 app.get('/api/stats', (req, res) => {
@@ -163,6 +312,397 @@ app.get('/api/tags', (req, res) => {
   }
   const sorted = Object.entries(tagCount).sort((a, b) => b[1] - a[1]).map(([tag, count]) => ({ tag, count }));
   res.json(sorted);
+});
+
+// ── Bulk Actions ──────────────────────────────────────────────────────────────
+
+app.post('/api/models/bulk', (req, res) => {
+  const { ids, print_status, tags_add, tags_remove } = req.body;
+  if (!ids || !Array.isArray(ids) || ids.length === 0) {
+    return res.status(400).json({ error: 'ids array required' });
+  }
+
+  const placeholders = ids.map(() => '?').join(',');
+  let updated = 0;
+
+  if (print_status) {
+    const result = db.prepare(
+      `UPDATE models SET print_status = ?, updated_at = datetime('now') WHERE id IN (${placeholders})`
+    ).run(print_status, ...ids);
+    updated = result.changes;
+  }
+
+  if (tags_add && tags_add.length > 0) {
+    const models = db.prepare(`SELECT id, tags FROM models WHERE id IN (${placeholders})`).all(...ids);
+    const updateTag = db.prepare(`UPDATE models SET tags = ?, updated_at = datetime('now') WHERE id = ?`);
+    for (const m of models) {
+      const existing = JSON.parse(m.tags || '[]');
+      const merged = [...new Set([...existing, ...tags_add])];
+      updateTag.run(JSON.stringify(merged), m.id);
+    }
+    updated = models.length;
+  }
+
+  if (tags_remove && tags_remove.length > 0) {
+    const models = db.prepare(`SELECT id, tags FROM models WHERE id IN (${placeholders})`).all(...ids);
+    const updateTag = db.prepare(`UPDATE models SET tags = ?, updated_at = datetime('now') WHERE id = ?`);
+    for (const m of models) {
+      const existing = JSON.parse(m.tags || '[]');
+      const filtered = existing.filter(t => !tags_remove.includes(t));
+      updateTag.run(JSON.stringify(filtered), m.id);
+    }
+    updated = models.length;
+  }
+
+  res.json({ success: true, updated });
+});
+
+// SSE stream version of scrape (GET so EventSource can use it)
+app.get('/api/models/:id/scrape-stream', async (req, res) => {
+  const model = db.prepare('SELECT * FROM models WHERE id = ?').get(req.params.id);
+  if (!model) return res.status(404).end();
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders();
+
+  const send = (level, msg) => res.write(`data: ${JSON.stringify({ level, msg, ts: new Date().toISOString() })}\n\n`);
+  const done = (data) => { res.write(`data: ${JSON.stringify({ type: 'done', ...data })}\n\n`); res.end(); };
+
+  let sourceUrl = req.query.url || model.source_url;
+  if (!sourceUrl) {
+    const folderName = path.basename(model.folder_path);
+    const detected = detectUrlFromFolderName(folderName);
+    if (detected) { sourceUrl = detected.url; send('info', `Auto-detected URL: ${sourceUrl}`); }
+  }
+
+  if (!sourceUrl) return done({ success: false, error: 'No source URL — paste one manually.' });
+
+  send('info', `Fetching: ${sourceUrl}`);
+
+  try {
+    const { savedPaths, sourceSite, sourceUrl: finalUrl } = await scrapeImagesFromUrl(sourceUrl, model.uuid, send);
+    if (savedPaths.length === 0) return done({ success: false, error: 'No images could be downloaded.' });
+
+    send('success', `✓ Downloaded ${savedPaths.length} image(s)`);
+
+    const existingImages = JSON.parse(model.images || '[]');
+    const allImages = [...new Set([...existingImages, ...savedPaths])];
+    db.prepare(`UPDATE models SET images=?, thumbnail_path=?, source_url=?, updated_at=datetime('now') WHERE id=?`)
+      .run(JSON.stringify(allImages), allImages[0], finalUrl, model.id);
+    if (sourceSite && sourceSite !== 'unknown') {
+      db.prepare(`UPDATE models SET source_site=? WHERE id=?`).run(sourceSite, model.id);
+    }
+    done({ success: true, images: savedPaths, total: allImages.length });
+  } catch (err) {
+    done({ success: false, error: err.message });
+  }
+});
+
+app.post('/api/models/:id/scrape', async (req, res) => {
+  const model = db.prepare('SELECT * FROM models WHERE id = ?').get(req.params.id);
+  if (!model) return res.status(404).json({ error: 'Not found' });
+
+  // SSE mode if client requests it
+  const useStream = req.headers.accept === 'text/event-stream';
+  if (useStream) {
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders();
+  }
+
+  const sendLog = (level, msg) => {
+    if (useStream) res.write(`data: ${JSON.stringify({ level, msg, ts: new Date().toISOString() })}\n\n`);
+  };
+  const sendDone = (data) => {
+    if (useStream) { res.write(`data: ${JSON.stringify({ type: 'done', ...data })}\n\n`); res.end(); }
+    else res.json(data);
+  };
+  const sendError = (msg) => {
+    if (useStream) { res.write(`data: ${JSON.stringify({ type: 'done', success: false, error: msg })}\n\n`); res.end(); }
+    else res.status(500).json({ error: msg });
+  };
+
+  let sourceUrl = req.body.url || model.source_url;
+  if (!sourceUrl) {
+    const folderName = path.basename(model.folder_path);
+    const detected = detectUrlFromFolderName(folderName);
+    if (detected) { sourceUrl = detected.url; sendLog('info', `Auto-detected URL from folder name: ${sourceUrl}`); }
+  }
+
+  if (!sourceUrl) return sendError('No source URL provided and none could be auto-detected from the folder name.');
+
+  sendLog('info', `Fetching page: ${sourceUrl}`);
+
+  try {
+    const { savedPaths, sourceSite, sourceUrl: finalUrl } = await scrapeImagesFromUrl(sourceUrl, model.uuid, sendLog);
+
+    if (savedPaths.length === 0) return sendError('Found the page but could not download any images.');
+
+    sendLog('success', `✓ Downloaded ${savedPaths.length} image(s)`);
+
+    const existingImages = JSON.parse(model.images || '[]');
+    const allImages = [...new Set([...existingImages, ...savedPaths])];
+    const thumbnail = allImages[0];
+
+    db.prepare(`UPDATE models SET images = ?, thumbnail_path = ?, source_url = ?, updated_at = datetime('now') WHERE id = ?`)
+      .run(JSON.stringify(allImages), thumbnail, finalUrl, model.id);
+    if (sourceSite && sourceSite !== 'unknown') {
+      db.prepare(`UPDATE models SET source_site = ? WHERE id = ?`).run(sourceSite, model.id);
+    }
+
+    sendDone({ success: true, images: savedPaths, total: allImages.length });
+  } catch (err) {
+    sendError(err.message);
+  }
+});
+
+// Auto-detect source URL from folder name
+app.get('/api/models/:id/detect-url', (req, res) => {
+  const model = db.prepare('SELECT folder_path, source_url FROM models WHERE id = ?').get(req.params.id);
+  if (!model) return res.status(404).json({ error: 'Not found' });
+
+  if (model.source_url) return res.json({ url: model.source_url, source: 'saved' });
+
+  const folderName = path.basename(model.folder_path);
+  const detected = detectUrlFromFolderName(folderName);
+  if (detected) return res.json({ url: detected.url, site: detected.site, source: 'folder_name' });
+
+  res.json({ url: null });
+});
+
+// ── ZIP Image Picker ──────────────────────────────────────────────────────────
+
+// List all ZIP files for a model
+app.get('/api/models/:id/zips', (req, res) => {
+  const model = db.prepare('SELECT * FROM models WHERE id = ?').get(req.params.id);
+  if (!model) return res.status(404).json({ error: 'Not found' });
+
+  const zips = db.prepare(
+    "SELECT * FROM model_files WHERE model_id = ? AND (filetype = 'zip' OR filename LIKE '%.zip')"
+  ).all(model.id);
+
+  res.json(zips);
+});
+
+// Preview images inside a ZIP without extracting
+app.get('/api/files/:fileId/zip-contents', (req, res) => {
+  const file = db.prepare('SELECT * FROM model_files WHERE id = ?').get(req.params.fileId);
+  if (!file) return res.status(404).json({ error: 'File not found' });
+  if (!fs.existsSync(file.filepath)) return res.status(404).json({ error: 'File not found on disk' });
+
+  const IMAGE_EXTS = new Set(['.jpg', '.jpeg', '.png', '.webp', '.gif']);
+  try {
+    const AdmZip = require('adm-zip');
+    const zip = new AdmZip(file.filepath);
+    const entries = zip.getEntries()
+      .filter(e => !e.isDirectory)
+      .map(e => {
+        const ext = path.extname(e.entryName).toLowerCase();
+        return {
+          name: e.entryName,
+          basename: path.basename(e.entryName),
+          size: e.header.size,
+          isImage: IMAGE_EXTS.has(ext),
+          ext
+        };
+      });
+    res.json({
+      filename: file.filename,
+      totalEntries: entries.length,
+      images: entries.filter(e => e.isImage),
+      all: entries
+    });
+  } catch (e) {
+    res.status(500).json({ error: `Could not read ZIP: ${e.message}` });
+  }
+});
+
+// Extract images from a specific ZIP and save them
+app.post('/api/files/:fileId/extract-images', (req, res) => {
+  const file = db.prepare('SELECT * FROM model_files WHERE id = ?').get(req.params.fileId);
+  if (!file) return res.status(404).json({ error: 'File not found' });
+
+  const model = db.prepare('SELECT * FROM models WHERE id = ?').get(file.model_id);
+  if (!model) return res.status(404).json({ error: 'Model not found' });
+
+  const { selectedFiles } = req.body; // optional: array of entry names to extract, or extract all images
+
+  const IMAGE_EXTS = new Set(['.jpg', '.jpeg', '.png', '.webp', '.gif']);
+  try {
+    const AdmZip = require('adm-zip');
+    const zip = new AdmZip(file.filepath);
+    const entries = zip.getEntries().filter(e => {
+      if (e.isDirectory) return false;
+      const ext = path.extname(e.entryName).toLowerCase();
+      if (selectedFiles && selectedFiles.length > 0) {
+        return selectedFiles.includes(e.entryName);
+      }
+      return IMAGE_EXTS.has(ext);
+    });
+
+    if (entries.length === 0) {
+      return res.status(422).json({ error: 'No image files found in this ZIP' });
+    }
+
+    const modelImgDir = path.join(IMAGES_DIR, model.uuid);
+    if (!fs.existsSync(modelImgDir)) fs.mkdirSync(modelImgDir, { recursive: true });
+
+    const savedPaths = [];
+    for (const entry of entries) {
+      const safeName = path.basename(entry.entryName).replace(/[^a-zA-Z0-9._-]/g, '_');
+      const destPath = path.join(modelImgDir, safeName);
+      zip.extractEntryTo(entry, modelImgDir, false, true, false, safeName);
+      if (fs.existsSync(destPath)) {
+        savedPaths.push(`/images/${model.uuid}/${safeName}`);
+      }
+    }
+
+    // Merge with existing images
+    const existingImages = JSON.parse(model.images || '[]');
+    const allImages = [...new Set([...existingImages, ...savedPaths])];
+    const thumbnail = allImages[0];
+
+    db.prepare(`
+      UPDATE models SET images = ?, thumbnail_path = ?, updated_at = datetime('now') WHERE id = ?
+    `).run(JSON.stringify(allImages), thumbnail, model.id);
+
+    res.json({ success: true, extracted: savedPaths.length, images: savedPaths, total: allImages.length });
+  } catch (e) {
+    res.status(500).json({ error: `Extraction failed: ${e.message}` });
+  }
+});
+
+// ── Claude AI Assistant ───────────────────────────────────────────────────────
+
+app.post('/api/ai/assist', async (req, res) => {
+  const { modelId, action, context, userMessage, history } = req.body;
+
+  let model = null;
+  if (modelId) {
+    model = db.prepare(`
+      SELECT m.*, c.name as creator_name FROM models m
+      LEFT JOIN creators c ON m.creator_id = c.id WHERE m.id = ?
+    `).get(modelId);
+  }
+
+  const systemPrompt = `You are a helpful assistant for "The Vault", a 3D printing model library manager.
+You help users organize their 3D print collection. You can suggest:
+- Tags to apply to models (keep tags short, 1-3 words, lowercase, useful for filtering)
+- Print status (unprinted, sliced, printing, printed, painted, failed)
+- Notes about print settings, recommended resin/filament, scale, supports
+- Organization tips
+
+When suggesting tags, return them as a JSON array in your response wrapped in <tags>["tag1","tag2"]</tags> tags.
+When suggesting a status, wrap it in <status>printed</status> tags.
+When suggesting notes, wrap them in <notes>your notes here</notes> tags.
+
+Keep responses concise and practical. You're talking to a 3D printing enthusiast who collects miniatures, terrain, and props.`;
+
+  let userContent = userMessage || '';
+
+  if (model && !userMessage) {
+    // Auto-generate context message based on action
+    const tags = JSON.parse(model.tags || '[]');
+    const modelContext = `Model: "${model.name}" by ${model.creator_name || 'unknown'}
+Current status: ${model.print_status}
+Current tags: ${tags.length > 0 ? tags.join(', ') : 'none'}
+Has STL: ${model.has_stl ? 'yes' : 'no'}, Chitubox: ${model.has_chitubox ? 'yes' : 'no'}, Lychee: ${model.has_lychee ? 'yes' : 'no'}
+Notes: ${model.notes || 'none'}
+${context || ''}`;
+
+    if (action === 'suggest_tags') {
+      userContent = `${modelContext}\n\nPlease suggest 5-10 relevant tags for this model. Consider: scale, type (miniature/terrain/prop/bust), faction/theme, game system, difficulty, style.`;
+    } else if (action === 'suggest_organization') {
+      userContent = `${modelContext}\n\nSuggest how to organize this model — recommended tags, any notes about printing it, and whether the status seems right.`;
+    } else if (action === 'suggest_notes') {
+      userContent = `${modelContext}\n\nSuggest useful print notes for this model (resin vs FDM, recommended scale, support strategy, painting tips if it's a miniature).`;
+    } else {
+      userContent = modelContext;
+    }
+  }
+
+  const messages = [
+    ...(history || []),
+    { role: 'user', content: userContent }
+  ];
+
+  try {
+    const https = require('https');
+    const payload = JSON.stringify({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 1024,
+      system: systemPrompt,
+      messages
+    });
+
+    const options = {
+      hostname: 'api.anthropic.com',
+      path: '/v1/messages',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': req.headers['x-claude-key'] || process.env.CLAUDE_API_KEY || '',
+        'anthropic-version': '2023-06-01',
+        'Content-Length': Buffer.byteLength(payload)
+      }
+    };
+
+    const apiReq = https.request(options, (apiRes) => {
+      let data = '';
+      apiRes.on('data', chunk => data += chunk);
+      apiRes.on('end', () => {
+        try {
+          const parsed = JSON.parse(data);
+          if (parsed.error) return res.status(400).json({ error: parsed.error.message });
+          const text = parsed.content?.[0]?.text || '';
+
+          // Parse structured suggestions out of the response
+          const tagsMatch = text.match(/<tags>([\s\S]*?)<\/tags>/);
+          const statusMatch = text.match(/<status>([\s\S]*?)<\/status>/);
+          const notesMatch = text.match(/<notes>([\s\S]*?)<\/notes>/);
+
+          let suggestedTags = null, suggestedStatus = null, suggestedNotes = null;
+          if (tagsMatch) { try { suggestedTags = JSON.parse(tagsMatch[1]); } catch {} }
+          if (statusMatch) suggestedStatus = statusMatch[1].trim();
+          if (notesMatch) suggestedNotes = notesMatch[1].trim();
+
+          // Clean display text
+          const displayText = text
+            .replace(/<tags>[\s\S]*?<\/tags>/g, '')
+            .replace(/<status>[\s\S]*?<\/status>/g, '')
+            .replace(/<notes>[\s\S]*?<\/notes>/g, '')
+            .trim();
+
+          res.json({ text: displayText, suggestedTags, suggestedStatus, suggestedNotes });
+        } catch (e) {
+          res.status(500).json({ error: 'Failed to parse AI response' });
+        }
+      });
+    });
+
+    apiReq.on('error', (e) => res.status(500).json({ error: e.message }));
+    apiReq.write(payload);
+    apiReq.end();
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── STL File Serving ──────────────────────────────────────────────────────────
+
+// Serve individual STL files for the 3D viewer (by model_file id)
+app.get('/api/files/:fileId/stl', (req, res) => {
+  const file = db.prepare('SELECT * FROM model_files WHERE id = ? AND filetype = ?').get(req.params.fileId, 'stl');
+  if (!file) return res.status(404).json({ error: 'STL file not found' });
+  if (!fs.existsSync(file.filepath)) return res.status(404).json({ error: 'File not found on disk' });
+
+  res.setHeader('Content-Type', 'model/stl');
+  res.setHeader('Content-Disposition', `inline; filename="${file.filename}"`);
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  fs.createReadStream(file.filepath).pipe(res);
 });
 
 // ── Health ────────────────────────────────────────────────────────────────────
