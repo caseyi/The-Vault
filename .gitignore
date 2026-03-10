@@ -1,0 +1,30 @@
+# Dependencies
+node_modules/
+package-lock.json
+
+# Build output
+frontend/build/
+
+# Runtime data
+*.db
+*.db-journal
+/data/
+
+# OS junk
+.DS_Store
+Thumbs.db
+._*
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+npm-debug.log*
+*.log
+
+# Environment
+.env
+.env.local
