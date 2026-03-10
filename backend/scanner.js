@@ -95,6 +95,7 @@ function folderHash(folderPath) {
     let list;
     try { list = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
     for (const e of list) {
+      if (isJunkFile(e.name) || IGNORED_FOLDERS.has(e.name)) continue;
       const full = path.join(dir, e.name);
       if (e.isDirectory()) {
         walk(full);
@@ -183,6 +184,7 @@ function extractImagesFromFolder(folderPath, modelUuid) {
   try {
     const modelImgDir = path.join(IMAGES_DIR, modelUuid);
     for (const file of fs.readdirSync(folderPath)) {
+      if (isJunkFile(file)) continue;
       if (isRenderImage(file)) {
         const src = path.join(folderPath, file);
         if (!fs.existsSync(modelImgDir)) fs.mkdirSync(modelImgDir, { recursive: true });
@@ -332,7 +334,7 @@ async function scanLibrary(libraryPath, progressCallback, logger) {
 
   try {
     const allCreatorDirs = fs.readdirSync(libraryPath, { withFileTypes: true }).filter(d => d.isDirectory());
-    const creatorDirs = allCreatorDirs.filter(d => !IGNORED_FOLDERS.has(d.name));
+    const creatorDirs = allCreatorDirs.filter(d => !IGNORED_FOLDERS.has(d.name) && !isJunkFile(d.name));
     const ignoredCount = allCreatorDirs.length - creatorDirs.length;
     log('info', `Found ${creatorDirs.length} creator folder(s)${ignoredCount ? ` (${ignoredCount} system folder${ignoredCount > 1 ? 's' : ''} ignored)` : ''}`);
 
@@ -345,8 +347,8 @@ async function scanLibrary(libraryPath, progressCallback, logger) {
 
       if (progressCallback) progressCallback({ stage: 'scanning', creator: creatorName });
 
-      const modelDirs  = fs.readdirSync(creatorPath, { withFileTypes: true }).filter(d => d.isDirectory() && !IGNORED_FOLDERS.has(d.name));
-      const directFiles = fs.readdirSync(creatorPath, { withFileTypes: true }).filter(d => !d.isDirectory());
+      const modelDirs  = fs.readdirSync(creatorPath, { withFileTypes: true }).filter(d => d.isDirectory() && !IGNORED_FOLDERS.has(d.name) && !isJunkFile(d.name));
+      const directFiles = fs.readdirSync(creatorPath, { withFileTypes: true }).filter(d => !d.isDirectory() && !isJunkFile(d.name));
       const hasDirectFiles = directFiles.some(f => { const e = path.extname(f.name).toLowerCase(); return STL_EXTS.has(e) || e === '.zip'; });
 
       const foldersToProcess = modelDirs.map(d => ({
