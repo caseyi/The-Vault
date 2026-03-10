@@ -407,13 +407,14 @@ export default function ModelDetail({ modelId, onBack, onSaved }) {
           {showAssistant && (
             <div style={{ height: 600, position: 'sticky', top: 20 }}>
               <ClaudeAssistant
-                model={{ id: model.id, name: model.name, print_status: status, tags, notes, has_stl: model.has_stl, has_chitubox: model.has_chitubox, has_lychee: model.has_lychee, creator_name: model.creator_name }}
+                model={{ id: model.id, name: model.name, print_status: status, tags, notes, has_stl: model.has_stl, has_chitubox: model.has_chitubox, has_lychee: model.has_lychee, creator_name: model.creator_name, source_url: sourceUrl }}
                 apiKey={apiKey}
                 onApiKeyChange={handleApiKeyChange}
                 onApplyTag={handleApplyTag}
                 onApplyAllTags={handleApplyAllTags}
                 onApplyStatus={handleApplyStatus}
                 onApplyNotes={handleApplyNotes}
+                onApplyUrl={(url) => setSourceUrl(url)}
               />
             </div>
           )}

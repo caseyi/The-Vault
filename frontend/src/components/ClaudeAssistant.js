@@ -1,6 +1,7 @@
 import React, { useState, useRef, useEffect } from 'react';
 
 const QUICK_ACTIONS = [
+  { id: 'find_online', label: '🔍 Find Online', desc: 'Search for this model on Printables, MMF, Thingiverse…' },
   { id: 'suggest_tags', label: '🏷 Suggest Tags', desc: 'Get tag ideas based on model name & creator' },
   { id: 'suggest_organization', label: '📋 Organize', desc: 'Full organization recommendations' },
   { id: 'suggest_notes', label: '🖨 Print Notes', desc: 'Printing tips, scale, supports, resin' },
@@ -23,6 +24,57 @@ function Message({ msg }) {
       }}>
         {msg.content}
       </div>
+
+      {/* Search Results */}
+      {msg.searchResults && msg.searchResults.length > 0 && (
+        <div style={{ maxWidth: '88%', marginTop: 8, background: 'var(--bg3)', border: '1px solid var(--border)', borderRadius: 6, padding: '8px 10px' }}>
+          <div style={{ fontFamily: 'var(--font-mono)', fontSize: 9, letterSpacing: 2, color: 'var(--text-faint)', textTransform: 'uppercase', marginBottom: 8 }}>
+            Found Online
+          </div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+            {msg.searchResults.map((r, i) => (
+              <a key={i} href={r.url} target="_blank" rel="noopener noreferrer"
+                style={{
+                  display: 'block', padding: '8px 10px', background: 'var(--bg4)',
+                  border: '1px solid var(--border)', borderRadius: 5,
+                  textDecoration: 'none', color: 'var(--text)',
+                  transition: 'border-color 0.12s'
+                }}
+                onMouseEnter={e => e.currentTarget.style.borderColor = 'var(--accent)'}
+                onMouseLeave={e => e.currentTarget.style.borderColor = 'var(--border)'}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 2 }}>
+                  <span style={{ fontFamily: 'var(--font-display)', fontSize: 12, color: 'var(--accent)', letterSpacing: 0.5 }}>
+                    {r.title || r.site || 'Link'}
+                  </span>
+                  <span style={{
+                    fontSize: 9, fontFamily: 'var(--font-mono)', letterSpacing: 1,
+                    padding: '1px 5px', borderRadius: 3,
+                    background: r.free ? 'rgba(76,175,125,0.12)' : 'rgba(193,127,58,0.12)',
+                    color: r.free ? 'var(--green)' : 'var(--accent)',
+                    border: `1px solid ${r.free ? 'rgba(76,175,125,0.3)' : 'rgba(193,127,58,0.3)'}`,
+                  }}>
+                    {r.free ? 'FREE' : 'PAID'}
+                  </span>
+                </div>
+                <div style={{ fontSize: 10, color: 'var(--text-muted)', lineHeight: 1.4 }}>
+                  {r.description || r.url}
+                </div>
+                {r.site && (
+                  <div style={{ fontSize: 9, color: 'var(--text-faint)', fontFamily: 'var(--font-mono)', marginTop: 2 }}>
+                    {r.site}
+                  </div>
+                )}
+              </a>
+            ))}
+          </div>
+          {msg.onApplyUrl && msg.searchResults[0]?.url && (
+            <button onClick={() => msg.onApplyUrl(msg.searchResults[0].url)}
+              style={{ width: '100%', marginTop: 8, padding: '5px', background: 'var(--accent)', border: 'none', borderRadius: 4, color: '#0d0d0f', fontFamily: 'var(--font-display)', fontSize: 13, letterSpacing: 1, cursor: 'pointer' }}>
+              SET AS SOURCE URL
+            </button>
+          )}
+        </div>
+      )}
 
       {/* Suggestions */}
       {msg.suggestions && (
@@ -86,7 +138,7 @@ function Message({ msg }) {
   );
 }
 
-export default function ClaudeAssistant({ model, apiKey, onApplyTag, onApplyAllTags, onApplyStatus, onApplyNotes, onApiKeyChange }) {
+export default function ClaudeAssistant({ model, apiKey, onApplyTag, onApplyAllTags, onApplyStatus, onApplyNotes, onApplyUrl, onApiKeyChange }) {
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
@@ -112,42 +164,63 @@ export default function ClaudeAssistant({ model, apiKey, onApplyTag, onApplyAllT
     setInput('');
     setLoading(true);
 
-    // Build history for API (only role/content, no metadata)
-    const history = messages.map(m => ({ role: m.role, content: m.content }));
-
     try {
-      const r = await fetch('/api/ai/assist', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-claude-key': apiKey
-        },
-        body: JSON.stringify({
-          modelId: model.id,
-          action,
-          userMessage: action ? null : userText,
-          history
-        })
-      });
+      // Web search action uses a separate endpoint
+      if (action === 'find_online' || (userText && /\b(find|search|where|buy|download|link|url|source)\b/i.test(userText))) {
+        const r = await fetch('/api/ai/search', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-claude-key': apiKey },
+          body: JSON.stringify({
+            modelId: model.id,
+            query: action === 'find_online' ? null : userText
+          })
+        });
 
-      const data = await r.json();
-      if (!r.ok) throw new Error(data.error);
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.error);
 
-      const assistantMsg = {
-        role: 'assistant',
-        content: data.text || '(no response)',
-        suggestions: {
-          tags: data.suggestedTags,
-          status: data.suggestedStatus,
-          notes: data.suggestedNotes
-        },
-        onApplyTag,
-        onApplyAllTags,
-        onApplyStatus,
-        onApplyNotes
-      };
+        const assistantMsg = {
+          role: 'assistant',
+          content: data.text || 'Here\'s what I found:',
+          searchResults: data.results || [],
+          onApplyUrl,
+        };
 
-      setMessages(prev => [...prev, assistantMsg]);
+        setMessages(prev => [...prev, assistantMsg]);
+      } else {
+        // Regular assist
+        const history = messages.map(m => ({ role: m.role, content: m.content }));
+
+        const r = await fetch('/api/ai/assist', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-claude-key': apiKey },
+          body: JSON.stringify({
+            modelId: model.id,
+            action,
+            userMessage: action ? null : userText,
+            history
+          })
+        });
+
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.error);
+
+        const assistantMsg = {
+          role: 'assistant',
+          content: data.text || '(no response)',
+          suggestions: {
+            tags: data.suggestedTags,
+            status: data.suggestedStatus,
+            notes: data.suggestedNotes
+          },
+          onApplyTag,
+          onApplyAllTags,
+          onApplyStatus,
+          onApplyNotes
+        };
+
+        setMessages(prev => [...prev, assistantMsg]);
+      }
     } catch (e) {
       setMessages(prev => [...prev, {
         role: 'assistant',

@@ -714,6 +714,132 @@ ${context || ''}`;
   }
 });
 
+// ── Claude Web Search for Model Matching ──────────────────────────────────────
+
+app.post('/api/ai/search', async (req, res) => {
+  const { modelId, query } = req.body;
+  const apiKey = req.headers['x-claude-key'] || process.env.CLAUDE_API_KEY || '';
+  if (!apiKey) return res.status(401).json({ error: 'API key required' });
+
+  let model = null;
+  if (modelId) {
+    model = db.prepare(`
+      SELECT m.*, c.name as creator_name FROM models m
+      LEFT JOIN creators c ON m.creator_id = c.id WHERE m.id = ?
+    `).get(modelId);
+  }
+
+  const modelName = model?.name || query || 'unknown model';
+  const creatorName = model?.creator_name || '';
+
+  const searchQuery = query || `${modelName} ${creatorName} 3D print STL miniature`.trim();
+
+  const systemPrompt = `You are a web research assistant for "The Vault", a 3D print library manager.
+Your job is to search the web and find links where the user can download or purchase this 3D model.
+
+Prioritize results from these sites:
+- Printables (printables.com)
+- MyMiniFactory (myminifactory.com)
+- Thingiverse (thingiverse.com)
+- Cults3D (cults3d.com)
+- Patreon (patreon.com) — for creator pages
+- Gumroad (gumroad.com) — for creator shops
+
+For each result, provide:
+- The URL
+- The site name
+- A brief description of what's available there
+- Whether it appears to be free or paid
+
+Format your results as JSON wrapped in <results>[...]</results> tags. Each result should have: url, site, title, description, free (boolean).
+
+Also include a brief conversational summary outside the tags.`;
+
+  const userContent = `Find where I can get this 3D model online:
+Model name: "${modelName}"
+${creatorName ? `Creator/artist: ${creatorName}` : ''}
+${model?.source_url ? `Known source URL: ${model.source_url}` : ''}
+${query ? `Additional search context: ${query}` : ''}
+
+Search for this model and provide download/purchase links.`;
+
+  try {
+    const https = require('https');
+    const payload = JSON.stringify({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 2048,
+      system: systemPrompt,
+      tools: [{
+        type: 'web_search_20250305',
+        name: 'web_search',
+        max_uses: 3,
+      }],
+      messages: [{ role: 'user', content: userContent }]
+    });
+
+    const options = {
+      hostname: 'api.anthropic.com',
+      path: '/v1/messages',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': apiKey,
+        'anthropic-version': '2023-06-01',
+        'Content-Length': Buffer.byteLength(payload)
+      }
+    };
+
+    const apiReq = https.request(options, (apiRes) => {
+      let data = '';
+      apiRes.on('data', chunk => data += chunk);
+      apiRes.on('end', () => {
+        try {
+          const parsed = JSON.parse(data);
+          if (parsed.error) return res.status(400).json({ error: parsed.error.message });
+
+          // Extract text from response content blocks
+          const textBlocks = (parsed.content || []).filter(b => b.type === 'text');
+          const fullText = textBlocks.map(b => b.text).join('\n');
+
+          // Parse structured results
+          const resultsMatch = fullText.match(/<results>([\s\S]*?)<\/results>/);
+          let searchResults = [];
+          if (resultsMatch) {
+            try { searchResults = JSON.parse(resultsMatch[1]); } catch {}
+          }
+
+          // Clean display text
+          const displayText = fullText
+            .replace(/<results>[\s\S]*?<\/results>/g, '')
+            .trim();
+
+          // Also extract any web search citations from the response
+          const citations = [];
+          for (const block of (parsed.content || [])) {
+            if (block.type === 'text' && block.citations) {
+              for (const cite of block.citations) {
+                if (cite.url && !citations.find(c => c.url === cite.url)) {
+                  citations.push({ url: cite.url, title: cite.title || '' });
+                }
+              }
+            }
+          }
+
+          res.json({ text: displayText, results: searchResults, citations });
+        } catch (e) {
+          res.status(500).json({ error: 'Failed to parse AI response' });
+        }
+      });
+    });
+
+    apiReq.on('error', (e) => res.status(500).json({ error: e.message }));
+    apiReq.write(payload);
+    apiReq.end();
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── STL File Serving ──────────────────────────────────────────────────────────
 
 // Serve individual STL files for the 3D viewer (by model_file id)
