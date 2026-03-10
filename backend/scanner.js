@@ -245,7 +245,7 @@ function analyzeFolder(folderPath, creatorName) {
       function walkSub(dir) {
         let list; try { list = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
         for (const e of list) {
-          if (isJunkFile(e.name)) continue;
+          if (IGNORED_FOLDERS.has(e.name) || isJunkFile(e.name)) continue;
           const fp = path.join(dir, e.name);
           if (e.isDirectory()) { walkSub(fp); continue; }
           const ext = path.extname(e.name).toLowerCase();

@@ -239,6 +239,49 @@ describe('analyzeFolder', () => {
     expect(r.files[0].filename).toBe('arm.stl');
   });
 
+  test('finds files in deeply nested subfolders', () => {
+    // Wicked archive/Weapons/Lukes lightsaber/files structure
+    const lvl1 = path.join(tmpDir, 'Weapons');
+    const lvl2 = path.join(lvl1, 'Lukes lightsaber');
+    const lvl3 = path.join(lvl2, 'files');
+    fs.mkdirSync(lvl3, { recursive: true });
+    fs.writeFileSync(path.join(lvl3, 'saber_hilt.stl'), 'x');
+    fs.writeFileSync(path.join(lvl3, 'saber_blade.stl'), 'y');
+    fs.writeFileSync(path.join(lvl2, 'preview.png'), 'img');
+    const r = analyzeFolder(tmpDir);
+    expect(r.hasStl).toBe(true);
+    expect(r.files.filter(f => f.ext === '.stl').length).toBe(2);
+    expect(r.images.length).toBe(1);
+  });
+
+  test('skips @eaDir folders nested inside subdirectories', () => {
+    const sub = path.join(tmpDir, 'STL_Files');
+    const eaDir = path.join(sub, '@eaDir');
+    fs.mkdirSync(eaDir, { recursive: true });
+    fs.writeFileSync(path.join(sub, 'model.stl'), 'x');
+    fs.writeFileSync(path.join(eaDir, 'model.stl@SynoEAStream'), 'junk');
+    fs.writeFileSync(path.join(eaDir, 'SYNO_THUMB.jpg'), 'junk');
+    const r = analyzeFolder(tmpDir);
+    expect(r.files.length).toBe(1);
+    expect(r.files[0].filename).toBe('model.stl');
+  });
+
+  test('handles mixed depth with junk files at every level', () => {
+    const lvl1 = path.join(tmpDir, 'Characters');
+    const lvl2 = path.join(lvl1, 'Gojira');
+    fs.mkdirSync(lvl2, { recursive: true });
+    fs.writeFileSync(path.join(lvl1, 'base.stl'), 'x');
+    fs.writeFileSync(path.join(lvl1, '._base.stl'), 'junk');
+    fs.writeFileSync(path.join(lvl2, 'head.stl'), 'y');
+    fs.writeFileSync(path.join(lvl2, 'head.stl@SynoEAStream'), 'junk');
+    fs.mkdirSync(path.join(lvl2, '@eaDir'));
+    fs.writeFileSync(path.join(lvl2, '@eaDir', 'stuff'), 'junk');
+    const r = analyzeFolder(tmpDir);
+    const stls = r.files.filter(f => f.ext === '.stl');
+    expect(stls.length).toBe(2);
+    expect(stls.map(f => f.filename).sort()).toEqual(['base.stl', 'head.stl']);
+  });
+
   test('assigns null release_name to loose non-zip files', () => {
     fs.writeFileSync(path.join(tmpDir, 'model.stl'), 'x');
     const r = analyzeFolder(tmpDir);
