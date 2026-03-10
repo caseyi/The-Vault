@@ -24,6 +24,14 @@ export default function App() {
 
   useEffect(() => { fetchStats(); }, [fetchStats]);
 
+  // Auto-open scan modal if a scan is already in progress on page load
+  useEffect(() => {
+    fetch(`${API}/api/scan/status`)
+      .then(r => r.json())
+      .then(s => { if (s.inProgress) setShowScan(true); })
+      .catch(() => {});
+  }, []);
+
   const openModel = (model) => { setSelectedModel(model); setView('detail'); };
   const closeModel = () => { setSelectedModel(null); setView('gallery'); };
 

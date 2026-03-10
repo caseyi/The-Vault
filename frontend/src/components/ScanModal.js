@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import TaskLog from './TaskLog';
 
 export default function ScanModal({ onClose, onScanComplete }) {
@@ -8,28 +8,13 @@ export default function ScanModal({ onClose, onScanComplete }) {
   const [done, setDone] = useState(false);
   const [summary, setSummary] = useState(null);
   const [lines, setLines] = useState([]);
+  const [checking, setChecking] = useState(true); // loading state while checking scan status
   const esRef = useRef(null);
 
-  const startScan = async () => {
-    setRunning(true);
-    setDone(false);
-    setSummary(null);
-    setLines([]);
+  // Connect (or reconnect) to the SSE stream
+  const connectToStream = useCallback(() => {
+    if (esRef.current) esRef.current.close();
 
-    // Fire off scan
-    try {
-      await fetch('/api/scan', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ path, force }),
-      });
-    } catch (e) {
-      setLines(l => [...l, { level: 'error', msg: e.message, ts: new Date().toISOString() }]);
-      setRunning(false);
-      return;
-    }
-
-    // Open SSE stream
     const es = new EventSource('/api/scan/stream');
     esRef.current = es;
 
@@ -42,6 +27,7 @@ export default function ScanModal({ onClose, onScanComplete }) {
         es.close();
         if (onScanComplete) onScanComplete();
       } else if (data.type === 'idle') {
+        // No scan running and no results — just close stream
         es.close();
         setRunning(false);
       } else {
@@ -54,9 +40,80 @@ export default function ScanModal({ onClose, onScanComplete }) {
       setRunning(false);
       es.close();
     };
+  }, [onScanComplete]);
+
+  // On mount: check if a scan is already running and reconnect
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch('/api/scan/status');
+        const status = await res.json();
+        if (cancelled) return;
+
+        if (status.inProgress) {
+          // Scan is running — show existing log and connect to stream
+          setRunning(true);
+          setLines(status.log || []);
+          connectToStream();
+        } else if (status.summary?.success !== undefined) {
+          // Scan finished before we opened — show results
+          setLines(status.log || []);
+          setSummary(status.summary);
+          setDone(true);
+        }
+      } catch {
+        // API unreachable — just show the start form
+      } finally {
+        if (!cancelled) setChecking(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [connectToStream]);
+
+  // Cleanup SSE on unmount
+  useEffect(() => () => esRef.current?.close(), []);
+
+  const startScan = async () => {
+    setRunning(true);
+    setDone(false);
+    setSummary(null);
+    setLines([]);
+
+    try {
+      const res = await fetch('/api/scan', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path, force }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ error: 'Scan request failed' }));
+        setLines(l => [...l, { level: 'error', msg: err.error || 'Failed to start scan', ts: new Date().toISOString() }]);
+        setRunning(false);
+        return;
+      }
+    } catch (e) {
+      setLines(l => [...l, { level: 'error', msg: e.message, ts: new Date().toISOString() }]);
+      setRunning(false);
+      return;
+    }
+
+    // Connect to SSE stream for live updates
+    connectToStream();
   };
 
-  useEffect(() => () => esRef.current?.close(), []);
+  if (checking) {
+    return (
+      <div className="modal-overlay">
+        <div className="modal" style={{ width: 580 }}>
+          <div className="modal-title">SCAN LIBRARY</div>
+          <div style={{ padding: '24px 0', textAlign: 'center', color: 'var(--text-muted)', fontSize: 12, fontFamily: 'var(--font-mono)' }}>
+            Checking scan status…
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="modal-overlay" onClick={e => { if (e.target === e.currentTarget && !running) onClose(); }}>

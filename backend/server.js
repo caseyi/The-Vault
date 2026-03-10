@@ -3,7 +3,7 @@ const cors = require('cors');
 const path = require('path');
 const fs = require('fs');
 const db = require('./db');
-const { scanLibrary, LIBRARY_PATH, matchesHint, pickRenderZips, analyzeFolder, inferReleaseName } = require('./scanner');
+const { scanLibrary, LIBRARY_PATH, matchesHint, pickRenderArchives, analyzeFolder, inferReleaseName } = require('./scanner');
 const { scrapeImagesFromUrl, detectUrlFromFolderName } = require('./scraper');
 
 const app = express();
@@ -72,6 +72,7 @@ app.post('/api/scan', async (req, res) => {
   res.json({ message: 'Scan started', path: libPath, force });
 
   pushLog('info', `Starting ${force ? 'FULL ' : ''}scan: ${libPath}`);
+  pushLog('info', 'Discovering creators and models…');
 
   try {
     const result = await scanLibrary(libPath, (p) => {
