@@ -10,11 +10,12 @@ const STATUS_COLORS = {
   printed: '#4caf7d', painted: '#9b72cf', failed: '#cf7272'
 };
 
-function ModelCard({ model, onClick, bulkMode, selected, onToggle }) {
+function ModelCard({ model, onClick, bulkMode, selected, onToggle, onHide }) {
   const imgs = model.images || [];
   const [imgIdx, setImgIdx] = useState(0);
   const [hovered, setHovered] = useState(false);
   const currentImg = imgs[imgIdx] || model.thumbnail_path || imgs[0];
+  const isHidden = model.hidden === 1 || model.hidden === true;
 
   const handleClick = (e) => {
     if (bulkMode) { onToggle(model.id); return; }
@@ -31,10 +32,18 @@ function ModelCard({ model, onClick, bulkMode, selected, onToggle }) {
     });
   };
 
+  const handleHide = (e) => {
+    e.stopPropagation();
+    onHide(model.id, !isHidden);
+  };
+
   return (
     <div className="model-card" onClick={handleClick}
       onMouseEnter={() => setHovered(true)} onMouseLeave={() => setHovered(false)}
-      style={selected ? { borderColor: '#c17f3a', boxShadow: '0 0 0 2px rgba(193,127,58,0.4)' } : {}}>
+      style={{
+        ...(selected ? { borderColor: '#c17f3a', boxShadow: '0 0 0 2px rgba(193,127,58,0.4)' } : {}),
+        ...(isHidden ? { opacity: 0.45 } : {}),
+      }}>
       {bulkMode && (
         <div style={{
           position: 'absolute', top: 8, left: 8, zIndex: 2,
@@ -46,6 +55,29 @@ function ModelCard({ model, onClick, bulkMode, selected, onToggle }) {
         }}>
           {selected ? '✓' : ''}
         </div>
+      )}
+      {/* Hidden badge */}
+      {isHidden && (
+        <div style={{
+          position: 'absolute', top: 8, left: 8, zIndex: 2,
+          background: 'rgba(13,13,15,0.85)', borderRadius: 4,
+          padding: '2px 6px', fontSize: 10, color: '#7a7a8c',
+          fontFamily: 'var(--font-mono)', letterSpacing: 0.5,
+          border: '1px solid #3f3f4d', backdropFilter: 'blur(4px)',
+        }}>HIDDEN</div>
+      )}
+      {/* Hide/unhide button on hover */}
+      {hovered && !bulkMode && (
+        <button onClick={handleHide} title={isHidden ? 'Unhide model' : 'Hide model'}
+          style={{
+            position: 'absolute', top: 8, right: 8, zIndex: 4,
+            background: 'rgba(13,13,15,0.85)', border: '1px solid #3f3f4d',
+            borderRadius: 4, color: isHidden ? '#c17f3a' : '#7a7a8c',
+            cursor: 'pointer', fontSize: 13, padding: '3px 6px',
+            lineHeight: 1, backdropFilter: 'blur(4px)',
+          }}>
+          {isHidden ? '👁' : '🙈'}
+        </button>
       )}
       {currentImg ? (
         <img className="model-card-img" src={currentImg} alt={model.name} loading="lazy"
@@ -93,7 +125,7 @@ function ModelCard({ model, onClick, bulkMode, selected, onToggle }) {
   );
 }
 
-function BulkActionBar({ selectedIds, onClearSelection, onBulkStatus, onBulkTag, onSelectAll, totalVisible }) {
+function BulkActionBar({ selectedIds, onClearSelection, onBulkStatus, onBulkTag, onBulkHide, onSelectAll, totalVisible }) {
   const [showStatusMenu, setShowStatusMenu] = useState(false);
   const [showTagMenu, setShowTagMenu] = useState(false);
   const [tagInput, setTagInput] = useState('');
@@ -161,6 +193,16 @@ function BulkActionBar({ selectedIds, onClearSelection, onBulkStatus, onBulkTag,
         )}
       </div>
 
+      {/* Bulk hide button */}
+      <button onClick={() => onBulkHide(true)}
+        style={{ background: '#242429', border: '1px solid #3f3f4d', borderRadius: 4, color: '#7a7a8c', padding: '6px 12px', cursor: 'pointer', fontSize: 12 }}>
+        🙈 Hide
+      </button>
+      <button onClick={() => onBulkHide(false)}
+        style={{ background: '#242429', border: '1px solid #3f3f4d', borderRadius: 4, color: '#7a7a8c', padding: '6px 12px', cursor: 'pointer', fontSize: 12 }}>
+        👁 Unhide
+      </button>
+
       <div style={{ marginLeft: 'auto', display: 'flex', gap: 8, alignItems: 'center' }}>
         {saving && <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: '#c17f3a' }}>Saving...</span>}
         <button onClick={onClearSelection} style={{ background: 'none', border: '1px solid #3f3f4d', borderRadius: 4, color: '#7a7a8c', padding: '5px 12px', cursor: 'pointer', fontSize: 12 }}>Cancel</button>
@@ -169,7 +211,7 @@ function BulkActionBar({ selectedIds, onClearSelection, onBulkStatus, onBulkTag,
   );
 }
 
-export default function Gallery({ filters, onFilterChange, onModelClick }) {
+export default function Gallery({ filters, onFilterChange, onModelClick, showHidden, onRefreshStats }) {
   const [models, setModels] = useState([]);
   const [total, setTotal] = useState(0);
   const [pages, setPages] = useState(1);
@@ -187,6 +229,7 @@ export default function Gallery({ filters, onFilterChange, onModelClick }) {
         ...(filters.creator && { creator: filters.creator }),
         ...(filters.status && { status: filters.status }),
         ...(filters.tags && { tags: filters.tags }),
+        ...(showHidden && { show_hidden: '1' }),
       });
       const r = await fetch(`/api/models?${params}`);
       const data = await r.json();
@@ -195,9 +238,9 @@ export default function Gallery({ filters, onFilterChange, onModelClick }) {
       setPages(data.pages || 1);
     } catch {}
     setLoading(false);
-  }, [filters, page]);
+  }, [filters, page, showHidden]);
 
-  useEffect(() => { setPage(1); }, [filters]);
+  useEffect(() => { setPage(1); }, [filters, showHidden]);
   useEffect(() => { fetchModels(); }, [fetchModels]);
 
   const toggleSelect = (id) => setSelectedIds(prev => prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]);
@@ -217,6 +260,25 @@ export default function Gallery({ filters, onFilterChange, onModelClick }) {
       body: JSON.stringify({ ids: selectedIds, tags_add: tagsAdd, tags_remove: tagsRemove })
     });
     fetchModels();
+  };
+
+  const handleBulkHide = async (hide) => {
+    await fetch('/api/models/bulk', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ids: selectedIds, hidden: hide })
+    });
+    clearSelection();
+    fetchModels();
+    if (onRefreshStats) onRefreshStats();
+  };
+
+  const handleHideModel = async (id, hide) => {
+    await fetch(`/api/models/${id}`, {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ hidden: hide })
+    });
+    fetchModels();
+    if (onRefreshStats) onRefreshStats();
   };
 
   const pageNums = [];
@@ -258,7 +320,8 @@ export default function Gallery({ filters, onFilterChange, onModelClick }) {
             <div className="model-grid">
               {models.map(m => (
                 <ModelCard key={m.id} model={m} onClick={onModelClick}
-                  bulkMode={bulkMode} selected={selectedIds.includes(m.id)} onToggle={toggleSelect} />
+                  bulkMode={bulkMode} selected={selectedIds.includes(m.id)}
+                  onToggle={toggleSelect} onHide={handleHideModel} />
               ))}
             </div>
             {pages > 1 && (
@@ -278,7 +341,7 @@ export default function Gallery({ filters, onFilterChange, onModelClick }) {
 
       {bulkMode && selectedIds.length > 0 && (
         <BulkActionBar selectedIds={selectedIds} onClearSelection={clearSelection}
-          onBulkStatus={handleBulkStatus} onBulkTag={handleBulkTag}
+          onBulkStatus={handleBulkStatus} onBulkTag={handleBulkTag} onBulkHide={handleBulkHide}
           onSelectAll={() => setSelectedIds(models.map(m => m.id))} totalVisible={models.length} />
       )}
     </div>

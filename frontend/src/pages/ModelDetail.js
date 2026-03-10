@@ -172,6 +172,24 @@ export default function ModelDetail({ modelId, onBack, onSaved }) {
           </span>
         )}
         <div style={{ marginLeft: 'auto', display: 'flex', gap: 8 }}>
+          <button onClick={async () => {
+              const newHidden = !(model.hidden === 1 || model.hidden === true);
+              await fetch(`/api/models/${model.id}`, {
+                method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ hidden: newHidden })
+              });
+              setModel(m => ({ ...m, hidden: newHidden ? 1 : 0 }));
+              if (onSaved) onSaved();
+            }}
+            style={{
+              padding: '6px 14px', borderRadius: 'var(--radius)',
+              background: (model.hidden === 1 || model.hidden === true) ? 'rgba(193,127,58,0.15)' : 'var(--bg3)',
+              border: `1px solid ${(model.hidden === 1 || model.hidden === true) ? 'var(--accent)' : 'var(--border)'}`,
+              color: (model.hidden === 1 || model.hidden === true) ? 'var(--accent)' : 'var(--text-muted)',
+              cursor: 'pointer', fontSize: 12, fontFamily: 'var(--font-mono)',
+            }}>
+            {(model.hidden === 1 || model.hidden === true) ? '👁 Unhide' : '🙈 Hide'}
+          </button>
           <button onClick={() => setShowAssistant(s => !s)}
             style={{
               padding: '6px 14px', borderRadius: 'var(--radius)',

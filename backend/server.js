@@ -99,11 +99,16 @@ app.get('/api/scan/status', (req, res) => {
 // ── Models ─────────────────────────────────────────────────────────────────────
 
 app.get('/api/models', (req, res) => {
-  const { search, creator, status, tags, page = 1, limit = 48 } = req.query;
+  const { search, creator, status, tags, page = 1, limit = 48, show_hidden } = req.query;
   const offset = (parseInt(page) - 1) * parseInt(limit);
 
   let where = ['1=1'];
   const params = [];
+
+  // Hide hidden models by default; show_hidden=1 to include them
+  if (!show_hidden || show_hidden === '0') {
+    where.push('(m.hidden IS NULL OR m.hidden = 0)');
+  }
 
   if (search) {
     where.push('(m.name LIKE ? OR c.name LIKE ? OR m.tags LIKE ? OR m.notes LIKE ?)');
@@ -160,7 +165,7 @@ app.get('/api/models/:id', (req, res) => {
 });
 
 app.patch('/api/models/:id', (req, res) => {
-  const { print_status, tags, notes, source_url, name, thumbnail_path } = req.body;
+  const { print_status, tags, notes, source_url, name, thumbnail_path, hidden } = req.body;
   const model = db.prepare('SELECT id FROM models WHERE id = ?').get(req.params.id);
   if (!model) return res.status(404).json({ error: 'Not found' });
 
@@ -172,6 +177,7 @@ app.patch('/api/models/:id', (req, res) => {
   if (source_url !== undefined) { updates.push('source_url = ?'); params.push(source_url); }
   if (name !== undefined) { updates.push('name = ?'); params.push(name); }
   if (thumbnail_path !== undefined) { updates.push('thumbnail_path = ?'); params.push(thumbnail_path); }
+  if (hidden !== undefined) { updates.push('hidden = ?'); params.push(hidden ? 1 : 0); }
 
   if (updates.length === 0) return res.status(400).json({ error: 'Nothing to update' });
   updates.push("updated_at = datetime('now')");
@@ -297,14 +303,15 @@ app.patch('/api/models/:id/render-hint', (req, res) => {
 // ── Stats ─────────────────────────────────────────────────────────────────────
 
 app.get('/api/stats', (req, res) => {
-  const total = db.prepare('SELECT COUNT(*) as n FROM models').get().n;
+  const total = db.prepare('SELECT COUNT(*) as n FROM models WHERE hidden IS NULL OR hidden = 0').get().n;
+  const totalHidden = db.prepare('SELECT COUNT(*) as n FROM models WHERE hidden = 1').get().n;
   const byStatus = db.prepare(`
-    SELECT print_status, COUNT(*) as n FROM models GROUP BY print_status
+    SELECT print_status, COUNT(*) as n FROM models WHERE hidden IS NULL OR hidden = 0 GROUP BY print_status
   `).all();
   const creators = db.prepare('SELECT COUNT(*) as n FROM creators').get().n;
-  const withImages = db.prepare("SELECT COUNT(*) as n FROM models WHERE thumbnail_path IS NOT NULL").get().n;
+  const withImages = db.prepare("SELECT COUNT(*) as n FROM models WHERE thumbnail_path IS NOT NULL AND (hidden IS NULL OR hidden = 0)").get().n;
   const lastScan = db.prepare('SELECT * FROM scan_log ORDER BY id DESC LIMIT 1').get();
-  res.json({ total, byStatus, creators, withImages, lastScan });
+  res.json({ total, totalHidden, byStatus, creators, withImages, lastScan });
 });
 
 // ── Tags ──────────────────────────────────────────────────────────────────────
@@ -325,7 +332,7 @@ app.get('/api/tags', (req, res) => {
 // ── Bulk Actions ──────────────────────────────────────────────────────────────
 
 app.post('/api/models/bulk', (req, res) => {
-  const { ids, print_status, tags_add, tags_remove } = req.body;
+  const { ids, print_status, tags_add, tags_remove, hidden } = req.body;
   if (!ids || !Array.isArray(ids) || ids.length === 0) {
     return res.status(400).json({ error: 'ids array required' });
   }
@@ -337,6 +344,13 @@ app.post('/api/models/bulk', (req, res) => {
     const result = db.prepare(
       `UPDATE models SET print_status = ?, updated_at = datetime('now') WHERE id IN (${placeholders})`
     ).run(print_status, ...ids);
+    updated = result.changes;
+  }
+
+  if (hidden !== undefined) {
+    const result = db.prepare(
+      `UPDATE models SET hidden = ?, updated_at = datetime('now') WHERE id IN (${placeholders})`
+    ).run(hidden ? 1 : 0, ...ids);
     updated = result.changes;
   }
 
@@ -717,4 +731,9 @@ app.get('/api/files/:fileId/stl', (req, res) => {
 
 app.get('/api/health', (req, res) => res.json({ ok: true, libraryPath: LIBRARY_PATH }));
 
-app.listen(PORT, () => console.log(`The Vault API running on port ${PORT}`));
+// Only start the server if run directly (not when imported for testing)
+if (require.main === module) {
+  app.listen(PORT, () => console.log(`The Vault API running on port ${PORT}`));
+}
+
+module.exports = app;

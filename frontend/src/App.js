@@ -15,6 +15,7 @@ export default function App() {
   const [filters, setFilters] = useState({ search: '', creator: '', status: '', tags: '' });
   const [showScan, setShowScan] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [showHidden, setShowHidden] = useState(false);
 
   const fetchStats = useCallback(() => {
     fetch(`${API}/api/stats`).then(r => r.json()).then(setStats).catch(() => {});
@@ -37,6 +38,8 @@ export default function App() {
         onFilterChange={setFilters}
         onScanClick={() => setShowScan(true)}
         onHomeClick={closeModel}
+        showHidden={showHidden}
+        onToggleHidden={() => setShowHidden(h => !h)}
       />
       <main className="main-content">
         {view === 'gallery' && (
@@ -44,6 +47,8 @@ export default function App() {
             filters={filters}
             onFilterChange={setFilters}
             onModelClick={openModel}
+            showHidden={showHidden}
+            onRefreshStats={fetchStats}
           />
         )}
         {view === 'detail' && selectedModel && (

@@ -95,5 +95,6 @@ try { db.exec(`ALTER TABLE scan_log ADD COLUMN models_skipped INTEGER DEFAULT 0`
 try { db.exec(`ALTER TABLE model_files ADD COLUMN filepath TEXT NOT NULL DEFAULT ''`); } catch {}
 try { db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_models_folder_path_unique ON models(folder_path)`); } catch {}
 try { db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_files_filepath_unique ON model_files(filepath)`); } catch {}
+try { db.exec(`ALTER TABLE models ADD COLUMN hidden INTEGER DEFAULT 0`); } catch {}
 
 module.exports = db;

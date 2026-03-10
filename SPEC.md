@@ -1,0 +1,547 @@
+# The Vault — Project Specification
+
+**Version:** 1.0.0
+**Last Updated:** 2026-03-10
+**Maintainer:** Casey (caseyi@uw.edu)
+**Repository:** github.com/caseyi/stlvault
+**Host:** Synology NAS "Dagobah"
+
+---
+
+## 1. Overview
+
+The Vault is a self-hosted 3D print library manager designed to run on a Synology NAS (or any Docker host). It indexes a folder tree of STL/3D print model files organized by creator, extracts metadata and images, and provides a dark-themed gallery UI for browsing, tagging, and managing print status.
+
+### Core Capabilities
+
+- **Library scanning:** Recursively indexes a NAS folder tree structured as `Library/CreatorName/ModelName/files...`
+- **Image extraction:** Pulls images from ZIP archives (render packs) and scrapes source websites for thumbnails
+- **Gallery browsing:** Filterable/searchable grid of model cards with image cycling
+- **Model detail:** Full metadata view, thumbnail management, STL 3D preview, file listing by release
+- **Print status tracking:** Per-model lifecycle (unprinted → sliced → printing → printed → painted → failed)
+- **AI assistant:** Claude-powered tag suggestions, organization advice, and print notes
+- **Render ZIP hints:** Creator-level and model-level wildcard patterns for identifying render archives
+
+---
+
+## 2. Architecture
+
+### Stack
+
+| Layer | Technology |
+|---|---|
+| Backend | Node.js 20 + Express |
+| Database | SQLite via better-sqlite3 (synchronous, WAL mode) |
+| Frontend | React 18 (Create React App) |
+| Reverse proxy | nginx (inside frontend container) |
+| Deployment | Docker Compose (2 containers) |
+| CI/CD | GitHub Actions → ghcr.io |
+| Host | Synology NAS (Docker package) |
+
+### Container Topology
+
+```
+┌─ frontend (port 8484) ─────────────────┐
+│  nginx serves React build              │
+│  Proxies /api/* → backend:3001         │
+│  SSE endpoints get special proxy rules  │
+└────────────────────────────────────────┘
+        │
+┌─ backend (port 3001) ──────────────────┐
+│  Express API                           │
+│  /data/ = named volume (DB + images)   │
+│  /library/ = read-only bind mount      │
+└────────────────────────────────────────┘
+```
+
+### Docker Compose Volumes
+
+| Mount | Container | Path | Mode |
+|---|---|---|---|
+| Named volume `vault_data` | backend | `/data` | read-write |
+| NAS library folder | backend | `/library/STL Archive` | read-only |
+
+### Key File Paths (on NAS)
+
+- Database: `/data/vault.db` (inside named volume)
+- Extracted images: `/data/images/{model_uuid}/` (inside named volume)
+- Library root: `/library/STL Archive/` (read-only mount)
+
+---
+
+## 3. Database Schema
+
+### `creators` Table
+
+| Column | Type | Notes |
+|---|---|---|
+| id | INTEGER PK | Auto-increment |
+| name | TEXT UNIQUE NOT NULL | Creator/artist name |
+| folder_path | TEXT | Absolute path on NAS |
+| notes | TEXT | Free-form notes |
+| render_zip_hint | TEXT | Wildcard pattern for render ZIPs (e.g., `*render*`) |
+| created_at | TEXT | ISO datetime |
+
+### `models` Table
+
+| Column | Type | Notes |
+|---|---|---|
+| id | INTEGER PK | Auto-increment |
+| uuid | TEXT UNIQUE NOT NULL | UUIDv4 for image storage paths |
+| name | TEXT NOT NULL | Model display name (derived from folder name) |
+| creator_id | INTEGER FK → creators(id) | ON DELETE SET NULL |
+| folder_path | TEXT UNIQUE NOT NULL | Absolute path to model folder |
+| source_site | TEXT | Detected source (Printables, MMF, Thingiverse, Cults3D, Gumroad) |
+| source_url | TEXT | Full URL to source listing |
+| description | TEXT | From scraping or manual entry |
+| tags | TEXT | JSON array of strings, default `'[]'` |
+| print_status | TEXT | Enum: unprinted, sliced, printing, printed, painted, failed |
+| notes | TEXT | Free-form notes |
+| file_count | INTEGER | Total files in model folder |
+| has_stl | INTEGER | Boolean: contains .stl files |
+| has_chitubox | INTEGER | Boolean: contains .chitubox files |
+| has_lychee | INTEGER | Boolean: contains .lys/.lychee files |
+| has_plate | INTEGER | Boolean: contains plate/pre-supported files |
+| thumbnail_path | TEXT | Relative path to chosen thumbnail image |
+| images | TEXT | JSON array of image paths, default `'[]'` |
+| folder_hash | TEXT | SHA-1 of `filename:size:mtime` for skip optimization |
+| render_zip_hint | TEXT | Model-level override for render ZIP pattern |
+| hidden | INTEGER | 0 = visible (default), 1 = hidden from gallery |
+| last_scanned | TEXT | ISO datetime of last scan |
+| created_at | TEXT | ISO datetime |
+| updated_at | TEXT | ISO datetime |
+
+### `model_files` Table
+
+| Column | Type | Notes |
+|---|---|---|
+| id | INTEGER PK | Auto-increment |
+| model_id | INTEGER FK → models(id) | ON DELETE CASCADE |
+| filename | TEXT NOT NULL | File name only |
+| filepath | TEXT UNIQUE NOT NULL | Full path on disk (DEFAULT '' for V1 migration) |
+| filetype | TEXT | Extension-based type |
+| filesize | INTEGER | Bytes |
+| release_name | TEXT | Inferred release/group name |
+| created_at | TEXT | ISO datetime |
+
+### `scan_log` Table
+
+| Column | Type | Notes |
+|---|---|---|
+| id | INTEGER PK | Auto-increment |
+| scan_path | TEXT | Path that was scanned |
+| status | TEXT | running, completed, error |
+| models_found | INTEGER | Total model folders found |
+| models_added | INTEGER | New models indexed |
+| models_updated | INTEGER | Existing models re-indexed |
+| models_skipped | INTEGER | Models skipped (hash match) |
+| error | TEXT | Error message if failed |
+| started_at | TEXT | ISO datetime |
+| finished_at | TEXT | ISO datetime |
+
+### Indexes
+
+- `idx_models_folder_path` on models(folder_path)
+- `idx_models_creator` on models(creator_id)
+- `idx_models_status` on models(print_status)
+- `idx_models_name` on models(name)
+- `idx_models_source_site` on models(source_site)
+- `idx_files_model` on model_files(model_id)
+- `idx_files_filepath` on model_files(filepath)
+- `idx_creators_name` on creators(name)
+- `idx_files_release` on model_files(release_name)
+
+### Migration Strategy
+
+All schema changes use the try/catch ALTER TABLE pattern for backwards compatibility:
+
+```javascript
+try { db.exec(`ALTER TABLE tablename ADD COLUMN col_name TYPE DEFAULT val`); } catch {}
+```
+
+`CREATE TABLE IF NOT EXISTS` is a **no-op for existing tables** — it does NOT add new columns. Every new column MUST have a corresponding ALTER TABLE migration line in `db.js`.
+
+---
+
+## 4. API Endpoints
+
+### Library Scanning
+
+| Method | Path | Description |
+|---|---|---|
+| GET | `/api/scan/status` | Current scan status and latest log entry |
+| POST | `/api/scan` | Start a scan. Body: `{ path?: string, force?: boolean }`. Force nulls all folder_hash values first. |
+| GET | `/api/scan/stream` | **SSE** — Real-time scan progress events |
+
+### Models
+
+| Method | Path | Description |
+|---|---|---|
+| GET | `/api/models` | List models (hidden excluded by default). Query params: `status`, `creator`, `search`, `tags`, `page`, `limit`, `show_hidden=1` |
+| GET | `/api/models/:id` | Single model with its files |
+| PATCH | `/api/models/:id` | Update model fields: `print_status`, `tags`, `notes`, `source_url`, `name`, `thumbnail_path`, `hidden` |
+| POST | `/api/models/bulk` | Bulk update: `{ ids: number[], print_status?, tags_add?, tags_remove?, hidden? }` |
+| GET | `/api/models/:id/scrape-stream` | **SSE** — Scrape source website for images and metadata |
+
+### Files
+
+| Method | Path | Description |
+|---|---|---|
+| GET | `/api/files/:fileId/zip-contents` | List images inside a ZIP archive |
+| POST | `/api/files/:fileId/extract-images` | Extract selected images from ZIP. Body: `{ entries: string[] }` |
+| GET | `/api/files/:fileId/stl` | Stream raw STL file for 3D viewer |
+
+### Creators
+
+| Method | Path | Description |
+|---|---|---|
+| GET | `/api/creators` | List all creators with model counts |
+| PATCH | `/api/creators/:id` | Update creator. Body: `{ render_zip_hint?, notes? }` |
+| POST | `/api/creators/:id/reextract` | **SSE** — Re-extract render images for all models by this creator |
+
+### Stats
+
+| Method | Path | Description |
+|---|---|---|
+| GET | `/api/stats` | Aggregate counts: total models, by status, by source site |
+
+### AI
+
+| Method | Path | Description |
+|---|---|---|
+| POST | `/api/ai/assist` | Proxy to Claude API. Body: `{ modelId, action?, userMessage?, history[] }`. Requires `x-claude-key` header. |
+
+### Static Files
+
+| Method | Path | Description |
+|---|---|---|
+| GET | `/images/*` | Serve extracted/scraped images from `/data/images/` |
+
+---
+
+## 5. Scanner Behavior
+
+### Folder Structure Assumption
+
+```
+/library/STL Archive/
+  CreatorName/
+    ModelName/
+      file1.stl
+      file2.zip
+      renders/image1.png
+    AnotherModel/
+      ...
+  AnotherCreator/
+    ...
+```
+
+The scanner expects exactly two levels: creator folders at level 1, model folders at level 2.
+
+### Ignored Folders
+
+The scanner skips these system/junk folders at all three traversal levels (creator, model, and file analysis):
+
+```
+@eaDir, @tmp, @appstore, @autoupdate, @database, @S2S,
+#recycle, #snapshot,
+.DS_Store, .Spotlight-V100, .Trashes, .fseventsd,
+__MACOSX, Thumbs.db, .synology_cache,
+$RECYCLE.BIN, System Volume Information
+```
+
+### Scan Optimization (folder_hash)
+
+For each model folder, the scanner computes a SHA-1 hash of all `filename:size:mtime` entries. If the hash matches the stored `folder_hash`, the model is skipped (only `last_scanned` is touched). This makes re-scans of large libraries fast.
+
+**Force rescan** sets all `folder_hash` values to NULL before scanning, causing every model to be re-indexed. This is needed after V1→V2 migration to populate empty `filepath` values.
+
+### Source URL Detection
+
+The scanner infers source URLs from folder names using regex patterns:
+
+| Pattern | Site | URL Template |
+|---|---|---|
+| `PR-(\d+)` or `printables-(\d+)` | Printables | `https://www.printables.com/model/{id}` |
+| `TV-(\d+)` or `thingiverse-(\d+)` | Thingiverse | `https://www.thingiverse.com/thing:{id}` |
+| `MMF-(\d+)` | MyMiniFactory | `https://www.myminifactory.com/object/3d-print-{id}` |
+| `Cults-` prefix | Cults3D | (marked, no URL) |
+| `Gumroad-` prefix | Gumroad | (marked, no URL) |
+
+### Release Name Inference
+
+Files are grouped into "releases" by detecting common prefixes/suffixes in filenames. The `inferReleaseName()` function strips file extensions and groups files that share path segments.
+
+### Render ZIP Detection
+
+The `pickRenderZips()` function identifies ZIP files containing render images using:
+
+1. Model-level `render_zip_hint` override (highest priority)
+2. Creator-level `render_zip_hint` pattern
+3. Auto-detection: ZIPs matching patterns like `*render*`, `*image*`, `*photo*`, `*picture*`
+
+`matchesHint(filename, pattern)` supports `*` wildcards converted to regex.
+
+---
+
+## 6. Frontend Components
+
+### App.js (Root)
+
+- Manages global state: view (gallery/detail), selected model, filters, stats, creators
+- Fetches `/api/stats`, `/api/creators`, `/api/models` on mount
+- Passes callbacks for navigation, filtering, and data refresh
+
+### Gallery.js
+
+- Responsive grid of `ModelCard` components
+- Each card shows thumbnail with image cycling (hover ‹/› arrows, counter badge)
+- Toolbar: search, sort dropdown, tag filter
+- `BulkActionBar` for multi-select operations (change status, add tags)
+- Filter state from sidebar (status, creator, source site)
+
+### ModelDetail.js
+
+- Full model view with tabbed sections
+- Thumbnail strip with ★ set-as-thumbnail button
+- Web scraping UI with SSE progress display
+- ZIP image picker trigger
+- STL file 3D viewer
+- Release-grouped file list
+- Render hint panel
+- Claude AI assistant panel
+- Editable fields: name, status, tags, notes, source URL
+
+### Sidebar.js
+
+- Library stats display (total models, status breakdown)
+- Status filter buttons
+- Creator list with model counts
+- Render hint ⚙ config button per creator
+- Scan library button
+
+### ScanModal.js
+
+- Path input (defaults to library path)
+- Force full rescan checkbox
+- SSE-connected progress display via TaskLog
+- Start/close controls
+
+### ZipImagePicker.js
+
+- Lists ZIP files for a model via `/api/files/:fileId/zip-contents`
+- Shows image entries as checkboxes
+- Extract selected images via `/api/files/:fileId/extract-images`
+- **Known issue:** ZIP files with empty `filepath` (V1 models) show "File not found on disk" — requires force rescan
+
+### StlViewer.js
+
+- Three.js-based 3D model viewer
+- Loads STL files via `/api/files/:fileId/stl`
+- Orbit controls (rotate, zoom, pan)
+- Wireframe toggle
+- Dynamic CDN loading of Three.js, STLLoader, OrbitControls
+
+### ClaudeAssistant.js
+
+- Chat interface for Claude AI integration
+- Quick actions: Suggest Tags, Organize, Print Notes
+- User-provided Anthropic API key (stored in browser localStorage)
+- Sends model context to backend `/api/ai/assist` endpoint
+
+### TaskLog.js
+
+- Terminal-style scrolling log display
+- Used by ScanModal, scrape UI, reextract UI
+- Color-coded by message type (info, success, warn, error)
+
+### ReleaseFileList.js
+
+- Groups model files by release name
+- Role detection badges (Renders, Supported, FDM, Resin, Pre-supported, etc.)
+- File size display
+
+### RenderHintPanel.js
+
+- Creator-level render ZIP hint configuration
+- Model-level override
+- ZIP file suggestions from existing files
+- "Re-extract all" button with SSE progress
+
+---
+
+## 7. Nginx Configuration
+
+```nginx
+# SSE endpoints — streaming proxy
+location ~ /api/(scan/stream|models/\d+/scrape-stream|creators/\d+/reextract) {
+    proxy_pass http://backend:3001;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header Connection '';
+    proxy_buffering off;
+    proxy_cache off;
+    proxy_read_timeout 600s;
+    chunked_transfer_encoding off;
+}
+
+# Regular API
+location /api/ {
+    proxy_pass http://backend:3001;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_read_timeout 300s;
+}
+
+# Static images
+location /images/ {
+    proxy_pass http://backend:3001;
+}
+
+# SPA fallback
+location / {
+    try_files $uri $uri/ /index.html;
+}
+```
+
+**Critical:** SSE endpoints MUST have `Connection ''` (not `upgrade`), `proxy_buffering off`, and `proxy_cache off` to work through nginx.
+
+---
+
+## 8. Deployment
+
+### CI/CD Pipeline
+
+GitHub Actions builds and pushes multi-arch Docker images to `ghcr.io/caseyi/stlvault-{backend,frontend}:latest` on push to main.
+
+### Update Script (`update.sh`)
+
+1. Saves current `:latest` images as `:rollback` tags
+2. Pulls new images via `docker compose pull`
+3. Restarts containers via `docker compose up -d --remove-orphans`
+4. Prunes dangling images (keeping rollback)
+
+Rollback: `./update.sh rollback` re-tags `:rollback` as `:latest` and restarts.
+
+### First-Time Setup (`setup-from-github.sh`)
+
+Creates directory structure, downloads `docker-compose.yml`, runs initial pull and start.
+
+---
+
+## 9. Design Tokens
+
+### Colors
+
+| Token | Value | Usage |
+|---|---|---|
+| --bg1 | #0d0d0f | Page background |
+| --bg2 | #141418 | Card/panel background |
+| --bg3 | #1c1c21 | Elevated surfaces |
+| --bg4 | #24242b | Input backgrounds |
+| --accent | #c17f3a | Primary accent (warm gold) |
+| --text | #e8e8ed | Primary text |
+| --text-muted | #7a7a8c | Secondary text |
+| --text-faint | #4a4a5a | Tertiary/hint text |
+| --border | #2e2e36 | Default borders |
+| --border-bright | #3f3f4d | Elevated borders |
+| --success | #5cb85c | Success states |
+| --warning | #c17f3a | Warning (same as accent) |
+| --error | #cf7272 | Error states |
+
+### Fonts
+
+| Token | Font | Usage |
+|---|---|---|
+| --font-display | 'Bebas Neue' | Headings, buttons, labels |
+| --font-body | 'DM Sans' | Body text |
+| --font-mono | 'JetBrains Mono' | Code, technical text, counters |
+
+---
+
+## 10. Known Issues & Technical Debt
+
+1. **V1 empty filepath:** Models indexed before the `filepath` column was added have empty strings. Force rescan fixes this but must be run manually after upgrade.
+
+2. **No authentication:** The Vault has no login system. It relies on network isolation (LAN-only access on NAS).
+
+3. **No pagination:** Gallery loads all models at once. Will need pagination or virtual scrolling for very large libraries (1000+ models).
+
+4. **Scraper fragility:** Web scrapers use CSS selectors and page structure that can break when source sites update their HTML.
+
+5. **Single-user:** No concurrent scan protection. Starting a scan while one is running will cause issues.
+
+6. **localStorage for API key:** The Claude API key is stored in browser localStorage — lost on browser data clear.
+
+---
+
+## 11. File Inventory
+
+```
+stlvault/
+├── backend/
+│   ├── Dockerfile
+│   ├── package.json
+│   ├── db.js              # Schema + migrations
+│   ├── server.js           # Express API (~714 lines)
+│   ├── scanner.js          # Library indexer (~401 lines)
+│   └── scraper.js          # Web scraper (~258 lines)
+├── frontend/
+│   ├── Dockerfile
+│   ├── package.json
+│   ├── nginx.conf
+│   └── src/
+│       ├── App.js
+│       ├── App.css          # All styles (~777 lines)
+│       ├── index.js
+│       ├── pages/
+│       │   ├── Gallery.js
+│       │   └── ModelDetail.js
+│       └── components/
+│           ├── Sidebar.js
+│           ├── ScanModal.js
+│           ├── ZipImagePicker.js
+│           ├── StlViewer.js
+│           ├── ClaudeAssistant.js
+│           ├── TaskLog.js
+│           ├── ReleaseFileList.js
+│           └── RenderHintPanel.js
+├── docker-compose.yml
+├── update.sh
+├── setup-from-github.sh
+└── .github/workflows/       # CI/CD
+```
+
+---
+
+## 12. Dependencies
+
+### Backend (package.json)
+
+| Package | Purpose |
+|---|---|
+| express | HTTP server + routing |
+| better-sqlite3 | Synchronous SQLite driver |
+| cors | Cross-origin support (dev) |
+| multer | File upload handling |
+| adm-zip | ZIP file reading/extraction |
+| chokidar | File system watching |
+| sharp | Image processing/resizing |
+| uuid | UUIDv4 generation |
+| node-cron | Scheduled tasks |
+
+### Frontend (package.json)
+
+| Package | Purpose |
+|---|---|
+| react | UI framework |
+| react-dom | DOM rendering |
+| react-scripts | CRA build toolchain |
+
+### CDN Dependencies (loaded at runtime)
+
+| Library | Version | Component |
+|---|---|---|
+| Three.js | r128 | StlViewer.js |
+| STLLoader | 0.128.0 | StlViewer.js |
+| OrbitControls | 0.128.0 | StlViewer.js |

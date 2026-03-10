@@ -2,6 +2,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const AdmZip = require('adm-zip');
+const { createExtractorFromData } = require('node-unrar-js');
 const { v4: uuidv4 } = require('uuid');
 const db = require('./db');
 
@@ -14,7 +15,8 @@ const IMAGE_EXTS  = new Set(['.jpg', '.jpeg', '.png', '.webp', '.gif']);
 const STL_EXTS    = new Set(['.stl', '.obj', '.3mf']);
 const SLICE_EXTS  = new Set(['.chitubox', '.ctb', '.photon', '.lys', '.lychee']);
 const PLATE_EXTS  = new Set(['.gcode', '.gco', '.nc']);
-const RENDER_KW   = ['render', 'preview', 'thumb', 'photo', 'pic', 'image', 'renders', 'previews', 'photos'];
+const RENDER_KW   = ['render', 'preview', 'thumb', 'photo', 'pic', 'image', 'renders', 'previews', 'photos', 'presentation'];
+const ARCHIVE_EXTS = new Set(['.zip', '.rar']);
 
 // Synology system / junk folders to skip during scanning
 const IGNORED_FOLDERS = new Set([
@@ -25,9 +27,18 @@ const IGNORED_FOLDERS = new Set([
   '$RECYCLE.BIN', 'System Volume Information',
 ]);
 
+// Synology extended-attribute stream files and other junk file patterns to skip
+function isJunkFile(filename) {
+  return filename.includes('@SynoEAStream') ||
+         filename.includes('@SynoResource') ||
+         filename.startsWith('._') ||
+         filename === '.DS_Store' ||
+         filename === 'Thumbs.db';
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-function isRenderZip(filename) {
+function isRenderArchive(filename) {
   const lower = filename.toLowerCase();
   return RENDER_KW.some(k => lower.includes(k));
 }
@@ -50,13 +61,13 @@ function matchesHint(filename, hint) {
   });
 }
 
-function pickRenderZips(analysis, hint) {
+function pickRenderArchives(analysis, hint) {
   if (hint) {
-    // Use only the explicitly hinted ZIP(s); fall back to auto-detect if none match
-    const hinted = analysis.files.filter(f => f.ext === '.zip' && matchesHint(f.filename, hint)).map(f => f.filepath);
+    // Use only the explicitly hinted archive(s); fall back to auto-detect if none match
+    const hinted = analysis.files.filter(f => ARCHIVE_EXTS.has(f.ext) && matchesHint(f.filename, hint)).map(f => f.filepath);
     if (hinted.length > 0) return hinted;
   }
-  return analysis.renderZips; // auto-detected by keyword
+  return analysis.renderArchives; // auto-detected by keyword
 }
 
 function isRenderImage(filename) {
@@ -136,6 +147,37 @@ function extractImagesFromZip(zipPath, modelUuid) {
   return extracted;
 }
 
+function extractImagesFromRar(rarPath, modelUuid) {
+  const extracted = [];
+  try {
+    const buf = Uint8Array.from(fs.readFileSync(rarPath)).buffer;
+    const extractor = createExtractorFromData({ data: buf });
+    const list = extractor.extract();
+    const files = [...list.files];
+    const modelImgDir = path.join(IMAGES_DIR, modelUuid);
+    if (!fs.existsSync(modelImgDir)) fs.mkdirSync(modelImgDir, { recursive: true });
+    for (const file of files) {
+      if (!file.fileHeader.flags.directory && isRenderImage(file.fileHeader.name)) {
+        const safeName = path.basename(file.fileHeader.name).replace(/[^a-zA-Z0-9._-]/g, '_');
+        const outPath = path.join(modelImgDir, safeName);
+        if (!fs.existsSync(outPath) && file.extraction) {
+          fs.writeFileSync(outPath, Buffer.from(file.extraction));
+        }
+        extracted.push(`/images/${modelUuid}/${safeName}`);
+      }
+    }
+  } catch (e) {
+    console.warn(`Could not extract rar ${rarPath}: ${e.message}`);
+  }
+  return extracted;
+}
+
+function extractImagesFromArchive(archivePath, modelUuid) {
+  const ext = path.extname(archivePath).toLowerCase();
+  if (ext === '.rar') return extractImagesFromRar(archivePath, modelUuid);
+  return extractImagesFromZip(archivePath, modelUuid);
+}
+
 function extractImagesFromFolder(folderPath, modelUuid) {
   const extracted = [];
   try {
@@ -185,7 +227,7 @@ function inferReleaseName(raw, creatorName) {
 function analyzeFolder(folderPath, creatorName) {
   const result = {
     files: [], hasStl: false, hasChitubox: false, hasLychee: false, hasPlate: false,
-    images: [], renderZips: [], releases: new Set(),
+    images: [], renderArchives: [], releases: new Set(),
   };
 
   let topEntries;
@@ -193,7 +235,7 @@ function analyzeFolder(folderPath, creatorName) {
   catch { return result; }
 
   for (const entry of topEntries) {
-    if (IGNORED_FOLDERS.has(entry.name)) continue;
+    if (IGNORED_FOLDERS.has(entry.name) || isJunkFile(entry.name)) continue;
     const full = path.join(folderPath, entry.name);
 
     if (entry.isDirectory()) {
@@ -203,6 +245,7 @@ function analyzeFolder(folderPath, creatorName) {
       function walkSub(dir) {
         let list; try { list = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
         for (const e of list) {
+          if (isJunkFile(e.name)) continue;
           const fp = path.join(dir, e.name);
           if (e.isDirectory()) { walkSub(fp); continue; }
           const ext = path.extname(e.name).toLowerCase();
@@ -213,7 +256,7 @@ function analyzeFolder(folderPath, creatorName) {
           if (ext==='.lys'||ext==='.lychee')                           result.hasLychee = true;
           if (PLATE_EXTS.has(ext))                                     result.hasPlate = true;
           if (IMAGE_EXTS.has(ext))                                     result.images.push(fp);
-          if (ext==='.zip' && isRenderZip(e.name))                     result.renderZips.push(fp);
+          if (ARCHIVE_EXTS.has(ext) && isRenderArchive(e.name))             result.renderArchives.push(fp);
         }
       }
       walkSub(full);
@@ -221,7 +264,7 @@ function analyzeFolder(folderPath, creatorName) {
     } else {
       const ext = path.extname(entry.name).toLowerCase();
       let size = 0; try { size = fs.statSync(full).size; } catch {}
-      const releaseName = ext === '.zip' ? inferReleaseName(entry.name, creatorName) : null;
+      const releaseName = ARCHIVE_EXTS.has(ext) ? inferReleaseName(entry.name, creatorName) : null;
       if (releaseName) result.releases.add(releaseName);
       result.files.push({ filename: entry.name, filepath: full, ext, size, release_name: releaseName });
       if (STL_EXTS.has(ext))                                     result.hasStl = true;
@@ -229,7 +272,7 @@ function analyzeFolder(folderPath, creatorName) {
       if (ext==='.lys'||ext==='.lychee')                         result.hasLychee = true;
       if (PLATE_EXTS.has(ext))                                   result.hasPlate = true;
       if (IMAGE_EXTS.has(ext))                                   result.images.push(full);
-      if (ext==='.zip' && isRenderZip(entry.name))               result.renderZips.push(full);
+      if (ARCHIVE_EXTS.has(ext) && isRenderArchive(entry.name))       result.renderArchives.push(full);
     }
   }
 
@@ -343,10 +386,10 @@ async function scanLibrary(libraryPath, progressCallback, logger) {
 
           // Only re-extract images if folder changed
           const freshImages = [];
-          const renderZips = pickRenderZips(analysis, hint);
-          for (const zipPath of renderZips) {
-            log('zip', `    📦 ${path.basename(zipPath)}`);
-            const imgs = extractImagesFromZip(zipPath, modelUuid);
+          const renderArchives = pickRenderArchives(analysis, hint);
+          for (const archivePath of renderArchives) {
+            log('zip', `    📦 ${path.basename(archivePath)}`);
+            const imgs = extractImagesFromArchive(archivePath, modelUuid);
             freshImages.push(...imgs);
             if (imgs.length) log('img', `       → ${imgs.length} image(s)`);
           }
@@ -398,4 +441,4 @@ async function scanLibrary(libraryPath, progressCallback, logger) {
   }
 }
 
-module.exports = { scanLibrary, LIBRARY_PATH, matchesHint, pickRenderZips, analyzeFolder, inferReleaseName };
+module.exports = { scanLibrary, LIBRARY_PATH, matchesHint, pickRenderArchives, analyzeFolder, inferReleaseName };

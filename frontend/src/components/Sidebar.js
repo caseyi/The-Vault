@@ -11,7 +11,7 @@ const STATUS_OPTIONS = [
   { value: 'failed', label: 'Failed', dot: '#cf7272' },
 ];
 
-export default function Sidebar({ open, onToggle, stats, creators, filters, onFilterChange, onScanClick, onHomeClick }) {
+export default function Sidebar({ open, onToggle, stats, creators, filters, onFilterChange, onScanClick, onHomeClick, showHidden, onToggleHidden }) {
   const [hintCreator, setHintCreator] = useState(null); // { id, name, render_zip_hint }
   const byStatus = stats?.byStatus || [];
   const getCount = (status) => (byStatus.find(b => b.print_status === status) || {}).n || 0;
@@ -37,6 +37,12 @@ export default function Sidebar({ open, onToggle, stats, creators, filters, onFi
               <div className="sidebar-stat"><span className="sidebar-stat-label">Total models</span><span className="sidebar-stat-val">{stats?.total ?? '—'}</span></div>
               <div className="sidebar-stat"><span className="sidebar-stat-label">Creators</span><span className="sidebar-stat-val">{stats?.creators ?? '—'}</span></div>
               <div className="sidebar-stat"><span className="sidebar-stat-label">With images</span><span className="sidebar-stat-val">{stats?.withImages ?? '—'}</span></div>
+              {(stats?.totalHidden > 0) && (
+                <div className="sidebar-stat">
+                  <span className="sidebar-stat-label">Hidden</span>
+                  <span className="sidebar-stat-val" style={{ color: 'var(--text-faint)' }}>{stats.totalHidden}</span>
+                </div>
+              )}
             </div>
 
             <div className="sidebar-section">
@@ -50,6 +56,24 @@ export default function Sidebar({ open, onToggle, stats, creators, filters, onFi
                 </button>
               ))}
             </div>
+
+            {/* Show Hidden toggle */}
+            {(stats?.totalHidden > 0 || showHidden) && (
+              <div className="sidebar-section" style={{ paddingTop: 0 }}>
+                <button
+                  className={`status-filter-btn ${showHidden ? 'active' : ''}`}
+                  onClick={onToggleHidden}
+                  style={{ color: showHidden ? 'var(--accent)' : 'var(--text-muted)' }}
+                  title={showHidden ? 'Hide hidden models' : 'Show hidden models'}
+                >
+                  <span className="dot" style={{ background: showHidden ? '#c17f3a' : '#2a2a35' }} />
+                  Show Hidden
+                  <span style={{ marginLeft: 'auto', fontFamily: 'var(--font-mono)', fontSize: '10px', color: 'var(--text-faint)' }}>
+                    {stats?.totalHidden ?? 0}
+                  </span>
+                </button>
+              </div>
+            )}
 
             <div className="sidebar-section" style={{ flex: 1, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
               <div className="sidebar-section-label">Creators</div>
