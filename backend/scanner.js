@@ -309,6 +309,15 @@ function discoverModelFolders(rootDir, namePrefix, maxDepth) {
 
     if (hasPrintableFiles) {
       results.push({ name: prefix || path.basename(dir), fullPath: dir });
+      // Also recurse into subdirectories — they may contain their own models
+      // (e.g. a folder with ZIPs at one level AND sub-folders with more models)
+      if (subdirs.length > 0) {
+        for (const sub of subdirs) {
+          const childPath = path.join(dir, sub.name);
+          const childName = prefix ? `${prefix} / ${sub.name}` : sub.name;
+          recurse(childPath, childName, depth - 1);
+        }
+      }
     } else if (subdirs.length > 0) {
       for (const sub of subdirs) {
         const childPath = path.join(dir, sub.name);

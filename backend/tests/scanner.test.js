@@ -362,7 +362,7 @@ describe('discoverModelFolders', () => {
     ]);
   });
 
-  test('mixed: folder with files stops recursion, pure category recurses', () => {
+  test('mixed: sibling model folder and category folder both discovered', () => {
     // Top level has one model folder with STLs and one category
     const directModel = path.join(tmpDir, 'Quick Print');
     const nested = path.join(tmpDir, 'Collection', 'SubModel');
@@ -375,6 +375,43 @@ describe('discoverModelFolders', () => {
     expect(results).toHaveLength(2);
     const names = results.map(r => r.name).sort();
     expect(names).toEqual(['Collection / SubModel', 'Quick Print']);
+  });
+
+  test('mixed: folder with printable files AND subdirectories discovers both', () => {
+    // Star Wars has ZIPs at its level AND sub-folders with their own models
+    const starWars = path.join(tmpDir, 'Star Wars');
+    const vehicles = path.join(starWars, 'Vehicles', 'X-wing');
+    const chars = path.join(starWars, 'Characters', 'Luke');
+    fs.mkdirSync(starWars, { recursive: true });
+    fs.mkdirSync(vehicles, { recursive: true });
+    fs.mkdirSync(chars, { recursive: true });
+    // ZIPs directly in Star Wars
+    fs.writeFileSync(path.join(starWars, 'bonus-pack.zip'), 'x');
+    // STLs in nested model folders
+    fs.writeFileSync(path.join(vehicles, 'x-wing.stl'), 'x');
+    fs.writeFileSync(path.join(chars, 'luke.stl'), 'x');
+
+    const results = discoverModelFolders(tmpDir, '', 5);
+    expect(results).toHaveLength(3);
+    const names = results.map(r => r.name).sort();
+    expect(names).toEqual([
+      'Star Wars',
+      'Star Wars / Characters / Luke',
+      'Star Wars / Vehicles / X-wing',
+    ]);
+  });
+
+  test('mixed: only parent has printable files, subdirs have images only', () => {
+    // Parent has ZIPs, subdirs only have images — no double-counting
+    const parent = path.join(tmpDir, 'MyModel');
+    const sub = path.join(parent, 'Renders');
+    fs.mkdirSync(sub, { recursive: true });
+    fs.writeFileSync(path.join(parent, 'model.stl'), 'x');
+    fs.writeFileSync(path.join(sub, 'render.jpg'), 'x');
+
+    const results = discoverModelFolders(tmpDir, '', 5);
+    expect(results).toHaveLength(1);
+    expect(results[0].name).toBe('MyModel');
   });
 
   test('skips @eaDir and junk files during discovery', () => {
