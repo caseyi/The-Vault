@@ -1,6 +1,6 @@
 # The Vault — Project Specification
 
-**Version:** 1.0.0
+**Version:** 0.1.0 (build auto-incremented via pre-commit hook)
 **Last Updated:** 2026-03-10
 **Maintainer:** Casey (caseyi@uw.edu)
 **Repository:** github.com/caseyi/stlvault
@@ -14,13 +14,16 @@ The Vault is a self-hosted 3D print library manager designed to run on a Synolog
 
 ### Core Capabilities
 
-- **Library scanning:** Recursively indexes a NAS folder tree structured as `Library/CreatorName/ModelName/files...`
-- **Image extraction:** Pulls images from ZIP archives (render packs) and scrapes source websites for thumbnails
-- **Gallery browsing:** Filterable/searchable grid of model cards with image cycling
+- **Library scanning:** Recursively indexes a NAS folder tree with deep folder discovery — handles both flat `Creator/Model` and nested archive structures like `Creator/Category/Subcategory/Model`
+- **Image extraction:** Pulls images from ZIP and RAR archives (render packs) and scrapes source websites for thumbnails
+- **Gallery browsing:** Filterable/searchable grid of model cards with image cycling, bulk operations, hide/show
 - **Model detail:** Full metadata view, thumbnail management, STL 3D preview, file listing by release
 - **Print status tracking:** Per-model lifecycle (unprinted → sliced → printing → printed → painted → failed)
-- **AI assistant:** Claude-powered tag suggestions, organization advice, and print notes
-- **Render ZIP hints:** Creator-level and model-level wildcard patterns for identifying render archives
+- **AI assistant:** Claude-powered tag suggestions, organization advice, print notes, and **web search** for finding model sources online
+- **Render archive hints:** Creator-level and model-level wildcard patterns for identifying render archives (ZIP + RAR)
+- **Junk file filtering:** Automatically skips Synology metadata (@SynoEAStream, @SynoResource), macOS (._*, .DS_Store), and Windows (Thumbs.db) junk files
+- **Scan persistence:** Scan progress survives page reloads — reconnects to running scan via SSE
+- **Version tracking:** Auto-incrementing build number via git pre-commit hook, displayed in sidebar and `/api/health`
 
 ---
 
@@ -210,6 +213,13 @@ try { db.exec(`ALTER TABLE tablename ADD COLUMN col_name TYPE DEFAULT val`); } c
 | Method | Path | Description |
 |---|---|---|
 | POST | `/api/ai/assist` | Proxy to Claude API. Body: `{ modelId, action?, userMessage?, history[] }`. Requires `x-claude-key` header. |
+| POST | `/api/ai/search` | Web search via Claude with `web_search` tool. Body: `{ modelId?, query? }`. Returns `{ text, results[], citations[] }`. Requires `x-claude-key` header. |
+
+### Health & Version
+
+| Method | Path | Description |
+|---|---|---|
+| GET | `/api/health` | Server health check. Returns `{ ok, libraryPath, version, build }` |
 
 ### Static Files
 
@@ -221,8 +231,11 @@ try { db.exec(`ALTER TABLE tablename ADD COLUMN col_name TYPE DEFAULT val`); } c
 
 ## 5. Scanner Behavior
 
-### Folder Structure Assumption
+### Folder Structure
 
+The scanner supports both flat and deeply nested folder structures:
+
+**Flat (2-level):**
 ```
 /library/STL Archive/
   CreatorName/
@@ -230,17 +243,31 @@ try { db.exec(`ALTER TABLE tablename ADD COLUMN col_name TYPE DEFAULT val`); } c
       file1.stl
       file2.zip
       renders/image1.png
-    AnotherModel/
-      ...
-  AnotherCreator/
-    ...
 ```
 
-The scanner expects exactly two levels: creator folders at level 1, model folders at level 2.
+**Nested archive (N-level):**
+```
+/library/STL Archive/
+  Wicked Archive/
+    Star Wars/           ← category (no printable files, recurses)
+      Vehicles/          ← category
+        X-wing/          ← model (has STL/ZIP files)
+          x-wing.stl
+      Characters/        ← category
+        Luke/            ← model
+          luke.stl
+    Fantasy/             ← category
+      Dragons/           ← model
+        dragon.stl
+```
+
+Level 1 dirs are always **creators**. Below that, the `discoverModelFolders()` function recursively walks directories until it finds folders containing printable files (STL, ZIP, RAR, slicer files, gcode). Folders that only contain subdirectories are treated as categories and traversed further. Maximum recursion depth: 5 levels.
+
+Nested models get breadcrumb-style names: `"Star Wars / Vehicles / X-wing"`.
 
 ### Ignored Folders
 
-The scanner skips these system/junk folders at all three traversal levels (creator, model, and file analysis):
+The scanner skips these system/junk folders at all traversal levels (creator, model, category, and file analysis):
 
 ```
 @eaDir, @tmp, @appstore, @autoupdate, @database, @S2S,
@@ -249,6 +276,16 @@ The scanner skips these system/junk folders at all three traversal levels (creat
 __MACOSX, Thumbs.db, .synology_cache,
 $RECYCLE.BIN, System Volume Information
 ```
+
+### Junk File Filtering
+
+The `isJunkFile()` function skips individual files matching these patterns at every code path (directory listing, image extraction, folder hashing):
+
+- `@SynoEAStream` — Synology extended attribute streams
+- `@SynoResource` — Synology resource forks
+- `._*` prefix — macOS resource forks
+- `.DS_Store` — macOS folder metadata
+- `Thumbs.db` — Windows thumbnail cache
 
 ### Scan Optimization (folder_hash)
 
@@ -272,13 +309,15 @@ The scanner infers source URLs from folder names using regex patterns:
 
 Files are grouped into "releases" by detecting common prefixes/suffixes in filenames. The `inferReleaseName()` function strips file extensions and groups files that share path segments.
 
-### Render ZIP Detection
+### Render Archive Detection
 
-The `pickRenderZips()` function identifies ZIP files containing render images using:
+The `pickRenderArchives()` function identifies ZIP and RAR files containing render images using:
 
 1. Model-level `render_zip_hint` override (highest priority)
 2. Creator-level `render_zip_hint` pattern
-3. Auto-detection: ZIPs matching patterns like `*render*`, `*image*`, `*photo*`, `*picture*`
+3. Auto-detection: archives matching keyword patterns: `render`, `preview`, `thumb`, `photo`, `pic`, `image`, `presentation`, and plurals
+
+Supported archive formats: `.zip` (via adm-zip), `.rar` (via node-unrar-js, pure WASM)
 
 `matchesHint(filename, pattern)` supports `*` wildcards converted to regex.
 
@@ -290,6 +329,8 @@ The `pickRenderZips()` function identifies ZIP files containing render images us
 
 - Manages global state: view (gallery/detail), selected model, filters, stats, creators
 - Fetches `/api/stats`, `/api/creators`, `/api/models` on mount
+- Fetches version from `/api/health` and passes to Sidebar
+- Auto-opens scan modal if a scan is already in progress on page load
 - Passes callbacks for navigation, filtering, and data refresh
 
 ### Gallery.js
@@ -316,15 +357,19 @@ The `pickRenderZips()` function identifies ZIP files containing render images us
 
 - Library stats display (total models, status breakdown)
 - Status filter buttons
+- Show Hidden toggle (appears when hidden models exist)
 - Creator list with model counts
 - Render hint ⚙ config button per creator
 - Scan library button
+- Version display at bottom (from `/api/health`)
 
 ### ScanModal.js
 
 - Path input (defaults to library path)
 - Force full rescan checkbox
 - SSE-connected progress display via TaskLog
+- **Scan persistence:** On mount, checks `/api/scan/status` and auto-reconnects to running scan
+- Shows "Checking scan status…" loading state while detecting state
 - Start/close controls
 
 ### ZipImagePicker.js
@@ -345,9 +390,12 @@ The `pickRenderZips()` function identifies ZIP files containing render images us
 ### ClaudeAssistant.js
 
 - Chat interface for Claude AI integration
-- Quick actions: Suggest Tags, Organize, Print Notes
+- Quick actions: **Find Online** (web search), Suggest Tags, Organize, Print Notes
+- "Find Online" uses `/api/ai/search` with Claude's `web_search` tool to find model sources on Printables, MMF, Thingiverse, Cults3D, Patreon, Gumroad
+- Search results render as clickable cards with FREE/PAID badges and "SET AS SOURCE URL" button
+- Free-text messages with search-like keywords auto-route to the search endpoint
 - User-provided Anthropic API key (stored in browser localStorage)
-- Sends model context to backend `/api/ai/assist` endpoint
+- Sends model context to backend `/api/ai/assist` or `/api/ai/search` endpoints
 
 ### TaskLog.js
 
@@ -416,12 +464,22 @@ GitHub Actions builds and pushes multi-arch Docker images to `ghcr.io/caseyi/stl
 
 ### Update Script (`update.sh`)
 
-1. Saves current `:latest` images as `:rollback` tags
+1. Saves current `:latest` images as `:rollback` tags (with proper if/else error handling under `set -e`)
 2. Pulls new images via `docker compose pull`
 3. Restarts containers via `docker compose up -d --remove-orphans`
-4. Prunes dangling images (keeping rollback)
+4. Displays access URL using `get_ip()` portable function (fallback chain: `hostname -I` → `hostname -i` → `ip route` → `localhost`)
+5. Prunes dangling images (keeping rollback)
 
 Rollback: `./update.sh rollback` re-tags `:rollback` as `:latest` and restarts.
+
+**Synology compatibility:** BusyBox on Synology only supports `hostname -i` (lowercase), not `hostname -I` (uppercase). The `get_ip()` function handles this transparently.
+
+### Version Tracking
+
+`backend/version.json` contains `{"version": "0.1.0", "build": N}` where the build number auto-increments on every git commit via a `.git/hooks/pre-commit` hook. The version is:
+- Displayed in the sidebar footer
+- Returned by `/api/health`
+- Logged at server startup
 
 ### First-Time Setup (`setup-from-github.sh`)
 
@@ -473,32 +531,47 @@ Creates directory structure, downloads `docker-compose.yml`, runs initial pull a
 
 6. **localStorage for API key:** The Claude API key is stored in browser localStorage — lost on browser data clear.
 
+7. **better-sqlite3 native binary:** The better-sqlite3 package requires a prebuilt native binary (GLIBC 2.29+). Running `npm install` on Synology NAS can wipe the binary if compilation fails. Use `npm install <package> --ignore-scripts` for adding new packages on the NAS, and recover the binary via `docker cp` from the running container if lost.
+
+8. **update.sh must be manually bootstrapped:** If `update.sh` itself needs updating, you must manually `git pull` since the script can't update itself mid-run.
+
 ---
 
 ## 11. File Inventory
 
 ```
 stlvault/
+├── .gitignore
+├── SPEC.md                  # This file
 ├── backend/
 │   ├── Dockerfile
 │   ├── package.json
-│   ├── db.js              # Schema + migrations
-│   ├── server.js           # Express API (~714 lines)
-│   ├── scanner.js          # Library indexer (~401 lines)
-│   └── scraper.js          # Web scraper (~258 lines)
+│   ├── version.json         # Auto-incremented build number
+│   ├── db.js                # Schema + migrations
+│   ├── server.js            # Express API (~860 lines)
+│   ├── scanner.js           # Library indexer (~475 lines)
+│   ├── scraper.js           # Web scraper (~258 lines)
+│   └── tests/
+│       ├── scanner.test.js  # 69 tests (utility + discovery)
+│       ├── api.test.js      # API endpoint tests
+│       └── scraper.test.js  # Scraper tests
 ├── frontend/
 │   ├── Dockerfile
 │   ├── package.json
 │   ├── nginx.conf
 │   └── src/
 │       ├── App.js
-│       ├── App.css          # All styles (~777 lines)
+│       ├── App.test.js
+│       ├── App.css           # All styles (~777 lines)
 │       ├── index.js
 │       ├── pages/
 │       │   ├── Gallery.js
-│       │   └── ModelDetail.js
+│       │   ├── Gallery.test.js    # 13 tests
+│       │   ├── ModelDetail.js
+│       │   └── ModelDetail.test.js # 15 tests
 │       └── components/
 │           ├── Sidebar.js
+│           ├── Sidebar.test.js
 │           ├── ScanModal.js
 │           ├── ZipImagePicker.js
 │           ├── StlViewer.js
@@ -507,14 +580,41 @@ stlvault/
 │           ├── ReleaseFileList.js
 │           └── RenderHintPanel.js
 ├── docker-compose.yml
-├── update.sh
+├── update.sh                 # Synology-compatible with get_ip() fallback
 ├── setup-from-github.sh
-└── .github/workflows/       # CI/CD
+└── .github/workflows/        # CI/CD
 ```
 
 ---
 
-## 12. Dependencies
+## 12. Test Suite
+
+**112 tests total** (69 backend + 43 frontend)
+
+### Backend Tests (Jest)
+
+| File | Tests | Coverage |
+|---|---|---|
+| scanner.test.js | 69 | matchesHint, pickRenderArchives, analyzeFolder, inferReleaseName, discoverModelFolders |
+| api.test.js | — | API endpoint integration tests |
+| scraper.test.js | — | Web scraper tests |
+
+Run: `cd backend && npx jest`
+
+### Frontend Tests (React Testing Library)
+
+| File | Tests | Coverage |
+|---|---|---|
+| Gallery.test.js | 13 | Cards, count, empty state, badges, click, search, bulk, hidden |
+| ModelDetail.test.js | 15 | Loading, metadata, status, tags, notes, images, save, Claude, hide |
+| Sidebar.test.js | — | Sidebar rendering and filters |
+| App.test.js | — | Root component rendering |
+
+Run: `cd frontend && npx react-scripts test --watchAll=false`
+
+---
+
+## 13. Dependencies
 
 ### Backend (package.json)
 
@@ -525,6 +625,7 @@ stlvault/
 | cors | Cross-origin support (dev) |
 | multer | File upload handling |
 | adm-zip | ZIP file reading/extraction |
+| node-unrar-js | RAR file extraction (pure WASM, no native deps) |
 | chokidar | File system watching |
 | sharp | Image processing/resizing |
 | uuid | UUIDv4 generation |
