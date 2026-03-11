@@ -11,7 +11,7 @@ const STATUS_OPTIONS = [
   { value: 'failed', label: 'Failed', dot: '#cf7272' },
 ];
 
-export default function Sidebar({ open, onToggle, stats, creators, filters, onFilterChange, onScanClick, onHomeClick, showHidden, onToggleHidden }) {
+export default function Sidebar({ open, onToggle, stats, creators, filters, onFilterChange, onScanClick, onHomeClick, showHidden, onToggleHidden, appVersion }) {
   const [hintCreator, setHintCreator] = useState(null); // { id, name, render_zip_hint }
   const byStatus = stats?.byStatus || [];
   const getCount = (status) => (byStatus.find(b => b.print_status === status) || {}).n || 0;
@@ -113,6 +113,11 @@ export default function Sidebar({ open, onToggle, stats, creators, filters, onFi
             </div>
 
             <button className="scan-btn" onClick={onScanClick}>⟳ SCAN LIBRARY</button>
+            {appVersion && (
+              <div style={{ padding: '8px 16px', fontFamily: 'var(--font-mono)', fontSize: 9, color: 'var(--text-faint)', letterSpacing: 1, textAlign: 'center' }}>
+                v{appVersion}
+              </div>
+            )}
           </>
         )}
 

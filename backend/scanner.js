@@ -281,6 +281,47 @@ function analyzeFolder(folderPath, creatorName) {
   return result;
 }
 
+/**
+ * Recursively discover model folders under a root directory.
+ * A "model folder" is one that directly contains printable files (STL, ZIP, etc).
+ * A folder with only subdirectories is a "category" — we recurse deeper.
+ * Returns array of { name, fullPath } entries.
+ * @param {string} rootDir - The directory to search
+ * @param {string} namePrefix - Breadcrumb prefix for display names (e.g. "Star Wars / Vehicles")
+ * @param {number} maxDepth - Maximum recursion depth (default 5)
+ */
+function discoverModelFolders(rootDir, namePrefix, maxDepth) {
+  if (maxDepth === undefined) maxDepth = 5;
+  const results = [];
+
+  function recurse(dir, prefix, depth) {
+    if (depth <= 0) return;
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    entries = entries.filter(e => !IGNORED_FOLDERS.has(e.name) && !isJunkFile(e.name));
+
+    const subdirs = entries.filter(e => e.isDirectory());
+    const files   = entries.filter(e => !e.isDirectory());
+    const hasPrintableFiles = files.some(f => {
+      const ext = path.extname(f.name).toLowerCase();
+      return STL_EXTS.has(ext) || ARCHIVE_EXTS.has(ext) || SLICE_EXTS.has(ext) || PLATE_EXTS.has(ext);
+    });
+
+    if (hasPrintableFiles) {
+      results.push({ name: prefix || path.basename(dir), fullPath: dir });
+    } else if (subdirs.length > 0) {
+      for (const sub of subdirs) {
+        const childPath = path.join(dir, sub.name);
+        const childName = prefix ? `${prefix} / ${sub.name}` : sub.name;
+        recurse(childPath, childName, depth - 1);
+      }
+    }
+  }
+
+  recurse(rootDir, namePrefix || '', maxDepth);
+  return results;
+}
+
 // ── Prepared statements (compiled once, reused thousands of times) ────────────
 
 const stmts = {
@@ -347,16 +388,13 @@ async function scanLibrary(libraryPath, progressCallback, logger) {
 
       if (progressCallback) progressCallback({ stage: 'scanning', creator: creatorName });
 
-      const modelDirs  = fs.readdirSync(creatorPath, { withFileTypes: true }).filter(d => d.isDirectory() && !IGNORED_FOLDERS.has(d.name) && !isJunkFile(d.name));
-      const directFiles = fs.readdirSync(creatorPath, { withFileTypes: true }).filter(d => !d.isDirectory() && !isJunkFile(d.name));
-      const hasDirectFiles = directFiles.some(f => { const e = path.extname(f.name).toLowerCase(); return STL_EXTS.has(e) || e === '.zip'; });
-
-      const foldersToProcess = modelDirs.map(d => ({
-        name: d.name, fullPath: path.join(creatorPath, d.name), creatorId, creatorName
+      // Discover model folders recursively — handles archive-style creators
+      // like "Wicked Archive/Star Wars/Vehicles/X-wing" by walking past
+      // category-only folders until finding actual printable content.
+      const discovered = discoverModelFolders(creatorPath, '', 5);
+      const foldersToProcess = discovered.map(d => ({
+        ...d, creatorId, creatorName
       }));
-      if (hasDirectFiles && modelDirs.length === 0) {
-        foldersToProcess.push({ name: creatorName, fullPath: creatorPath, creatorId, creatorName });
-      }
 
       log('creator', `▸ ${creatorName} (${foldersToProcess.length} model${foldersToProcess.length !== 1 ? 's' : ''})`);
 
@@ -443,4 +481,4 @@ async function scanLibrary(libraryPath, progressCallback, logger) {
   }
 }
 
-module.exports = { scanLibrary, LIBRARY_PATH, matchesHint, pickRenderArchives, analyzeFolder, inferReleaseName };
+module.exports = { scanLibrary, LIBRARY_PATH, matchesHint, pickRenderArchives, analyzeFolder, inferReleaseName, discoverModelFolders };

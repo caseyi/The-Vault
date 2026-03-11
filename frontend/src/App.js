@@ -16,6 +16,13 @@ export default function App() {
   const [showScan, setShowScan] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [showHidden, setShowHidden] = useState(false);
+  const [appVersion, setAppVersion] = useState(null);
+
+  useEffect(() => {
+    fetch(`${API}/api/health`).then(r => r.json())
+      .then(d => setAppVersion(d.version ? `${d.version}.${d.build}` : null))
+      .catch(() => {});
+  }, []);
 
   const fetchStats = useCallback(() => {
     fetch(`${API}/api/stats`).then(r => r.json()).then(setStats).catch(() => {});
@@ -48,6 +55,7 @@ export default function App() {
         onHomeClick={closeModel}
         showHidden={showHidden}
         onToggleHidden={() => setShowHidden(h => !h)}
+        appVersion={appVersion}
       />
       <main className="main-content">
         {view === 'gallery' && (

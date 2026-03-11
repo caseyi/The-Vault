@@ -17,7 +17,7 @@ jest.mock('../db', () => {
   };
 });
 
-const { matchesHint, pickRenderArchives, analyzeFolder, inferReleaseName } = require('../scanner');
+const { matchesHint, pickRenderArchives, analyzeFolder, inferReleaseName, discoverModelFolders } = require('../scanner');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
@@ -317,5 +317,116 @@ describe('analyzeFolder', () => {
     fs.writeFileSync(path.join(tmpDir, 'print.gcode'), 'x');
     const r = analyzeFolder(tmpDir);
     expect(r.hasPlate).toBe(true);
+  });
+});
+
+// ── discoverModelFolders ─────────────────────────────────────────────────────
+
+describe('discoverModelFolders', () => {
+  let tmpDir;
+  beforeEach(() => { tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'discover-')); });
+  afterEach(() => { fs.rmSync(tmpDir, { recursive: true, force: true }); });
+
+  test('flat structure: folders with STLs are models', () => {
+    const m1 = path.join(tmpDir, 'Dragon');
+    const m2 = path.join(tmpDir, 'Knight');
+    fs.mkdirSync(m1); fs.mkdirSync(m2);
+    fs.writeFileSync(path.join(m1, 'dragon.stl'), 'x');
+    fs.writeFileSync(path.join(m2, 'knight.stl'), 'x');
+
+    const results = discoverModelFolders(tmpDir, '', 5);
+    expect(results).toHaveLength(2);
+    const names = results.map(r => r.name).sort();
+    expect(names).toEqual(['Dragon', 'Knight']);
+  });
+
+  test('nested archive: recurses through category folders to find models', () => {
+    // Wicked Archive / Star Wars / Vehicles / X-wing / x-wing.stl
+    const xwing = path.join(tmpDir, 'Star Wars', 'Vehicles', 'X-wing');
+    const luke = path.join(tmpDir, 'Star Wars', 'Characters', 'Luke');
+    const dragon = path.join(tmpDir, 'Fantasy', 'Dragons');
+    fs.mkdirSync(xwing, { recursive: true });
+    fs.mkdirSync(luke, { recursive: true });
+    fs.mkdirSync(dragon, { recursive: true });
+    fs.writeFileSync(path.join(xwing, 'x-wing.stl'), 'x');
+    fs.writeFileSync(path.join(luke, 'luke.stl'), 'x');
+    fs.writeFileSync(path.join(dragon, 'dragon.stl'), 'x');
+
+    const results = discoverModelFolders(tmpDir, '', 5);
+    expect(results).toHaveLength(3);
+    const names = results.map(r => r.name).sort();
+    expect(names).toEqual([
+      'Fantasy / Dragons',
+      'Star Wars / Characters / Luke',
+      'Star Wars / Vehicles / X-wing',
+    ]);
+  });
+
+  test('mixed: folder with files stops recursion, pure category recurses', () => {
+    // Top level has one model folder with STLs and one category
+    const directModel = path.join(tmpDir, 'Quick Print');
+    const nested = path.join(tmpDir, 'Collection', 'SubModel');
+    fs.mkdirSync(directModel);
+    fs.mkdirSync(nested, { recursive: true });
+    fs.writeFileSync(path.join(directModel, 'part.stl'), 'x');
+    fs.writeFileSync(path.join(nested, 'model.stl'), 'x');
+
+    const results = discoverModelFolders(tmpDir, '', 5);
+    expect(results).toHaveLength(2);
+    const names = results.map(r => r.name).sort();
+    expect(names).toEqual(['Collection / SubModel', 'Quick Print']);
+  });
+
+  test('skips @eaDir and junk files during discovery', () => {
+    const real = path.join(tmpDir, 'Model');
+    const junk = path.join(tmpDir, '@eaDir');
+    fs.mkdirSync(real);
+    fs.mkdirSync(junk);
+    fs.writeFileSync(path.join(real, 'file.stl'), 'x');
+    fs.writeFileSync(path.join(junk, 'data.stl'), 'x');
+
+    const results = discoverModelFolders(tmpDir, '', 5);
+    expect(results).toHaveLength(1);
+    expect(results[0].name).toBe('Model');
+  });
+
+  test('respects maxDepth limit', () => {
+    // Create a structure deeper than maxDepth=2
+    const deep = path.join(tmpDir, 'A', 'B', 'C', 'D');
+    fs.mkdirSync(deep, { recursive: true });
+    fs.writeFileSync(path.join(deep, 'model.stl'), 'x');
+
+    const results = discoverModelFolders(tmpDir, '', 2);
+    expect(results).toHaveLength(0); // Can't reach depth 4 with maxDepth 2
+  });
+
+  test('handles ZIP files as printable content', () => {
+    const m = path.join(tmpDir, 'Pack');
+    fs.mkdirSync(m);
+    fs.writeFileSync(path.join(m, 'models.zip'), 'x');
+
+    const results = discoverModelFolders(tmpDir, '', 5);
+    expect(results).toHaveLength(1);
+    expect(results[0].name).toBe('Pack');
+  });
+
+  test('empty folders and image-only folders are skipped', () => {
+    const empty = path.join(tmpDir, 'Empty');
+    const imgOnly = path.join(tmpDir, 'Images');
+    fs.mkdirSync(empty);
+    fs.mkdirSync(imgOnly);
+    fs.writeFileSync(path.join(imgOnly, 'photo.jpg'), 'x');
+
+    const results = discoverModelFolders(tmpDir, '', 5);
+    expect(results).toHaveLength(0);
+  });
+
+  test('creator root with direct files uses basename as name', () => {
+    // Files directly in the scanned dir (no subdirs)
+    fs.writeFileSync(path.join(tmpDir, 'model.stl'), 'x');
+
+    const results = discoverModelFolders(tmpDir, '', 5);
+    expect(results).toHaveLength(1);
+    expect(results[0].fullPath).toBe(tmpDir);
   });
 });

@@ -10,6 +10,10 @@ const app = express();
 const PORT = process.env.PORT || 3001;
 const IMAGES_DIR = process.env.IMAGES_DIR || '/data/images';
 
+// Version info — auto-incremented by pre-commit hook
+let APP_VERSION = { version: '0.0.0', build: 0 };
+try { APP_VERSION = JSON.parse(fs.readFileSync(path.join(__dirname, 'version.json'), 'utf8')); } catch {}
+
 app.use(cors());
 app.use(express.json());
 app.use('/images', express.static(IMAGES_DIR));
@@ -856,11 +860,11 @@ app.get('/api/files/:fileId/stl', (req, res) => {
 
 // ── Health ────────────────────────────────────────────────────────────────────
 
-app.get('/api/health', (req, res) => res.json({ ok: true, libraryPath: LIBRARY_PATH }));
+app.get('/api/health', (req, res) => res.json({ ok: true, libraryPath: LIBRARY_PATH, ...APP_VERSION }));
 
 // Only start the server if run directly (not when imported for testing)
 if (require.main === module) {
-  app.listen(PORT, () => console.log(`The Vault API running on port ${PORT}`));
+  app.listen(PORT, () => console.log(`The Vault v${APP_VERSION.version} (build ${APP_VERSION.build}) running on port ${PORT}`));
 }
 
 module.exports = app;
