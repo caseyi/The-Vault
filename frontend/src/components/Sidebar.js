@@ -11,8 +11,17 @@ const STATUS_OPTIONS = [
   { value: 'failed', label: 'Failed', dot: '#cf7272' },
 ];
 
-export default function Sidebar({ open, onToggle, stats, creators, filters, onFilterChange, onScanClick, onHomeClick, showHidden, onToggleHidden, appVersion }) {
+export default function Sidebar({ open, onToggle, stats, creators, tags, filters, onFilterChange, onScanClick, onHomeClick, showHidden, onToggleHidden, appVersion }) {
   const [hintCreator, setHintCreator] = useState(null); // { id, name, render_zip_hint }
+  const [showAllTags, setShowAllTags] = useState(false);
+
+  const activeTags = filters.tags ? filters.tags.split(',').filter(Boolean) : [];
+  const toggleTag = (tag) => {
+    const newTags = activeTags.includes(tag)
+      ? activeTags.filter(t => t !== tag)
+      : [...activeTags, tag];
+    onFilterChange({ ...filters, tags: newTags.join(',') });
+  };
   const byStatus = stats?.byStatus || [];
   const getCount = (status) => (byStatus.find(b => b.print_status === status) || {}).n || 0;
 
@@ -75,7 +84,73 @@ export default function Sidebar({ open, onToggle, stats, creators, filters, onFi
               </div>
             )}
 
-            <div className="sidebar-section" style={{ flex: 1, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
+            {/* Thumbnail filter */}
+            <div className="sidebar-section" style={{ paddingTop: 0 }}>
+              <button
+                className={`status-filter-btn ${filters.has_thumbnail ? 'active' : ''}`}
+                onClick={() => onFilterChange({ ...filters, has_thumbnail: !filters.has_thumbnail })}
+                style={{ color: filters.has_thumbnail ? 'var(--accent)' : 'var(--text-muted)' }}
+              >
+                <span className="dot" style={{ background: filters.has_thumbnail ? 'var(--accent)' : '#2a2a35' }} />
+                Has Thumbnail
+                <span style={{ marginLeft: 'auto', fontFamily: 'var(--font-mono)', fontSize: '10px', color: 'var(--text-faint)' }}>
+                  {stats?.withImages ?? 0}
+                </span>
+              </button>
+            </div>
+
+            {/* Tag Cloud */}
+            {tags && tags.length > 0 && (
+              <div className="sidebar-section" style={{ flex: 1, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
+                <div className="sidebar-section-label" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  Tags
+                  {activeTags.length > 0 && (
+                    <button onClick={() => onFilterChange({ ...filters, tags: '' })}
+                      style={{ background: 'none', border: 'none', color: 'var(--accent)', cursor: 'pointer', fontSize: 9, fontFamily: 'var(--font-mono)', letterSpacing: 1 }}>
+                      CLEAR
+                    </button>
+                  )}
+                </div>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, overflowY: 'auto', padding: '2px 0' }}>
+                  {(showAllTags ? tags : tags.slice(0, 30)).map(t => {
+                    const isActive = activeTags.includes(t.tag);
+                    return (
+                      <button
+                        key={t.tag}
+                        onClick={() => toggleTag(t.tag)}
+                        style={{
+                          background: isActive ? 'rgba(193,127,58,0.2)' : 'rgba(255,255,255,0.04)',
+                          border: `1px solid ${isActive ? 'var(--accent)' : 'rgba(255,255,255,0.08)'}`,
+                          borderRadius: 12, padding: '3px 10px', cursor: 'pointer',
+                          fontSize: 11, fontFamily: 'var(--font-mono)',
+                          color: isActive ? 'var(--accent)' : 'var(--text-muted)',
+                          whiteSpace: 'nowrap', lineHeight: '18px',
+                          transition: 'all 0.15s ease',
+                        }}
+                      >
+                        {t.tag}
+                        <span style={{ marginLeft: 4, fontSize: 9, opacity: 0.6 }}>{t.count}</span>
+                      </button>
+                    );
+                  })}
+                  {!showAllTags && tags.length > 30 && (
+                    <button
+                      onClick={() => setShowAllTags(true)}
+                      style={{
+                        background: 'none', border: '1px dashed rgba(255,255,255,0.1)',
+                        borderRadius: 12, padding: '3px 10px', cursor: 'pointer',
+                        fontSize: 10, fontFamily: 'var(--font-mono)', color: 'var(--text-faint)',
+                      }}
+                    >
+                      +{tags.length - 30} more
+                    </button>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {/* Creators — collapsed by default when tags are available */}
+            <div className="sidebar-section" style={{ overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
               <div className="sidebar-section-label">Creators</div>
               <div className="creator-list">
                 <button className={`creator-btn ${filters.creator === '' ? 'active' : ''}`}

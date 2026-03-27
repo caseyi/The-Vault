@@ -12,7 +12,8 @@ export default function App() {
   const [selectedModel, setSelectedModel] = useState(null);
   const [stats, setStats] = useState(null);
   const [creators, setCreators] = useState([]);
-  const [filters, setFilters] = useState({ search: '', creator: '', status: '', tags: '' });
+  const [filters, setFilters] = useState({ search: '', creator: '', status: '', tags: '', has_thumbnail: false })
+  const [tags, setTags] = useState([]);
   const [showScan, setShowScan] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [showHidden, setShowHidden] = useState(false);
@@ -28,6 +29,7 @@ export default function App() {
   const fetchStats = useCallback(() => {
     fetch(`${API}/api/stats`).then(r => r.json()).then(setStats).catch(() => {});
     fetch(`${API}/api/creators`).then(r => r.json()).then(setCreators).catch(() => {});
+    fetch(`${API}/api/tags`).then(r => r.json()).then(setTags).catch(() => {});
   }, []);
 
   useEffect(() => { fetchStats(); }, [fetchStats]);
@@ -50,6 +52,7 @@ export default function App() {
         onToggle={() => setSidebarOpen(o => !o)}
         stats={stats}
         creators={creators}
+        tags={tags}
         filters={filters}
         onFilterChange={setFilters}
         onScanClick={() => setShowScan(true)}

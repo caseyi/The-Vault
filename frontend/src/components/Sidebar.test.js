@@ -14,7 +14,8 @@ const defaultProps = {
     { id: 1, name: 'ArtistA', model_count: 6, render_zip_hint: null },
     { id: 2, name: 'ArtistB', model_count: 4, render_zip_hint: '*renders*' },
   ],
-  filters: { search: '', creator: '', status: '', tags: '' },
+  tags: [{ tag: 'fantasy', count: 5 }, { tag: 'sci-fi', count: 3 }],
+  filters: { search: '', creator: '', status: '', tags: '', has_thumbnail: false },
   onFilterChange: jest.fn(),
   onScanClick: jest.fn(),
   onHomeClick: jest.fn(),
@@ -29,7 +30,7 @@ describe('Sidebar', () => {
     expect(screen.getByText('10')).toBeInTheDocument();
     expect(screen.getAllByText(/Creators/i).length).toBeGreaterThan(0);
     expect(screen.getByText('With images')).toBeInTheDocument();
-    expect(screen.getByText('7')).toBeInTheDocument();
+    expect(screen.getAllByText('7').length).toBeGreaterThan(0);
   });
 
   test('renders status filter buttons', () => {
@@ -102,5 +103,33 @@ describe('Sidebar', () => {
     // Counts should appear next to status labels
     expect(screen.getAllByText('5').length).toBeGreaterThan(0); // unprinted
     expect(screen.getAllByText('2').length).toBeGreaterThan(0); // failed
+  });
+
+  test('renders tag cloud', () => {
+    render(<Sidebar {...defaultProps} />);
+    expect(screen.getByText('Tags')).toBeInTheDocument();
+    expect(screen.getByText('fantasy')).toBeInTheDocument();
+    expect(screen.getByText('sci-fi')).toBeInTheDocument();
+  });
+
+  test('clicking tag calls onFilterChange with tag', () => {
+    render(<Sidebar {...defaultProps} />);
+    fireEvent.click(screen.getByText('fantasy'));
+    expect(defaultProps.onFilterChange).toHaveBeenCalledWith(
+      expect.objectContaining({ tags: 'fantasy' })
+    );
+  });
+
+  test('renders Has Thumbnail filter', () => {
+    render(<Sidebar {...defaultProps} />);
+    expect(screen.getByText('Has Thumbnail')).toBeInTheDocument();
+  });
+
+  test('clicking Has Thumbnail toggles filter', () => {
+    render(<Sidebar {...defaultProps} />);
+    fireEvent.click(screen.getByText('Has Thumbnail'));
+    expect(defaultProps.onFilterChange).toHaveBeenCalledWith(
+      expect.objectContaining({ has_thumbnail: true })
+    );
   });
 });

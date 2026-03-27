@@ -229,6 +229,7 @@ export default function Gallery({ filters, onFilterChange, onModelClick, showHid
         ...(filters.creator && { creator: filters.creator }),
         ...(filters.status && { status: filters.status }),
         ...(filters.tags && { tags: filters.tags }),
+        ...(filters.has_thumbnail && { has_thumbnail: '1' }),
         ...(showHidden && { show_hidden: '1' }),
       });
       const r = await fetch(`/api/models?${params}`);
@@ -301,6 +302,30 @@ export default function Gallery({ filters, onFilterChange, onModelClick, showHid
         </button>
         <div className="result-count">{total.toLocaleString()} models</div>
       </div>
+
+      {/* Active tag filters */}
+      {filters.tags && (
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, padding: '4px 16px 0', alignItems: 'center' }}>
+          <span style={{ fontSize: 10, fontFamily: 'var(--font-mono)', color: 'var(--text-faint)', letterSpacing: 1, marginRight: 4 }}>TAGS:</span>
+          {filters.tags.split(',').filter(Boolean).map(tag => (
+            <button key={tag} onClick={() => {
+              const remaining = filters.tags.split(',').filter(t => t && t !== tag).join(',');
+              onFilterChange({ ...filters, tags: remaining });
+            }} style={{
+              background: 'rgba(193,127,58,0.15)', border: '1px solid rgba(193,127,58,0.3)',
+              borderRadius: 12, padding: '2px 8px 2px 10px', cursor: 'pointer',
+              fontSize: 11, fontFamily: 'var(--font-mono)', color: 'var(--accent)',
+              display: 'flex', alignItems: 'center', gap: 4,
+            }}>
+              {tag} <span style={{ fontSize: 13, opacity: 0.7 }}>×</span>
+            </button>
+          ))}
+          <button onClick={() => onFilterChange({ ...filters, tags: '' })}
+            style={{ background: 'none', border: 'none', color: 'var(--text-faint)', cursor: 'pointer', fontSize: 9, fontFamily: 'var(--font-mono)', letterSpacing: 1 }}>
+            CLEAR ALL
+          </button>
+        </div>
+      )}
 
       <div className="gallery-scroll">
         {loading && <div className="loading"><div className="spinner" /> Loading...</div>}

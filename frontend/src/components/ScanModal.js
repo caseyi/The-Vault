@@ -9,6 +9,8 @@ export default function ScanModal({ onClose, onScanComplete }) {
   const [summary, setSummary] = useState(null);
   const [lines, setLines] = useState([]);
   const [checking, setChecking] = useState(true); // loading state while checking scan status
+  const [tagging, setTagging] = useState(false);
+  const [tagResult, setTagResult] = useState(null);
   const esRef = useRef(null);
 
   // Connect (or reconnect) to the SSE stream
@@ -102,6 +104,36 @@ export default function ScanModal({ onClose, onScanComplete }) {
     connectToStream();
   };
 
+  const generateTags = async () => {
+    setTagging(true);
+    setTagResult(null);
+    setLines(l => [...l, { level: 'info', msg: 'Generating tags with Claude AI…', ts: new Date().toISOString() }]);
+    try {
+      const apiKey = localStorage.getItem('claude_api_key') || '';
+      const res = await fetch('/api/ai/generate-tags', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(apiKey && { 'x-claude-key': apiKey }),
+        },
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setLines(l => [...l, { level: 'error', msg: data.error || 'Tag generation failed', ts: new Date().toISOString() }]);
+        setTagResult({ success: false, error: data.error });
+      } else {
+        setLines(l => [...l, { level: 'success', msg: `✓ Tagged ${data.tagged} of ${data.total} models`, ts: new Date().toISOString() }]);
+        setTagResult(data);
+        if (onScanComplete) onScanComplete(); // refresh gallery
+      }
+    } catch (e) {
+      setLines(l => [...l, { level: 'error', msg: e.message, ts: new Date().toISOString() }]);
+      setTagResult({ success: false, error: e.message });
+    } finally {
+      setTagging(false);
+    }
+  };
+
   if (checking) {
     return (
       <div className="modal-overlay">
@@ -167,11 +199,20 @@ export default function ScanModal({ onClose, onScanComplete }) {
         )}
 
         <div className="modal-actions" style={{ marginTop: 16 }}>
-          <button className="btn-cancel" onClick={onClose} disabled={running}>
+          <button className="btn-cancel" onClick={onClose} disabled={running || tagging}>
             {done ? 'Close' : 'Cancel'}
           </button>
-          <button className="btn-primary" onClick={() => { setDone(false); startScan(); }} disabled={running}>
+          <button className="btn-primary" onClick={() => { setDone(false); startScan(); }} disabled={running || tagging}>
             {running ? 'Scanning…' : done ? 'Rescan' : 'Start Scan'}
+          </button>
+          <button
+            className="btn-primary"
+            onClick={generateTags}
+            disabled={running || tagging}
+            style={{ background: tagging ? 'var(--bg-card)' : 'rgba(155,114,207,0.15)', color: '#9b72cf', border: '1px solid rgba(155,114,207,0.3)' }}
+            title="Use Claude AI to auto-generate tags for all models based on names, creators, and folder structure"
+          >
+            {tagging ? 'Tagging…' : 'Generate Tags'}
           </button>
           {done && (
             <button className="btn-primary" onClick={onClose}>View Results</button>

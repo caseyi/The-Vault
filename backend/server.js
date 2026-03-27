@@ -104,7 +104,7 @@ app.get('/api/scan/status', (req, res) => {
 // ── Models ─────────────────────────────────────────────────────────────────────
 
 app.get('/api/models', (req, res) => {
-  const { search, creator, status, tags, page = 1, limit = 48, show_hidden } = req.query;
+  const { search, creator, status, tags, page = 1, limit = 48, show_hidden, has_thumbnail } = req.query;
   const offset = (parseInt(page) - 1) * parseInt(limit);
 
   let where = ['1=1'];
@@ -113,6 +113,11 @@ app.get('/api/models', (req, res) => {
   // Hide hidden models by default; show_hidden=1 to include them
   if (!show_hidden || show_hidden === '0') {
     where.push('(m.hidden IS NULL OR m.hidden = 0)');
+  }
+
+  // Thumbnail filter
+  if (has_thumbnail === '1') {
+    where.push('m.thumbnail_path IS NOT NULL');
   }
 
   if (search) {
@@ -124,7 +129,7 @@ app.get('/api/models', (req, res) => {
   if (status) { where.push('m.print_status = ?'); params.push(status); }
   if (tags) {
     const tagList = tags.split(',');
-    tagList.forEach(t => { where.push("m.tags LIKE ?"); params.push(`%${t.trim()}%`); });
+    tagList.forEach(t => { where.push("m.tags LIKE ?"); params.push(`%"${t.trim()}"%`); });
   }
 
   const whereStr = where.join(' AND ');
@@ -842,6 +847,119 @@ Search for this model and provide download/purchase links.`;
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
+});
+
+// ── AI Auto-Tagging ──────────────────────────────────────────────────────────
+
+app.post('/api/ai/generate-tags', async (req, res) => {
+  const apiKey = req.headers['x-claude-key'] || process.env.CLAUDE_API_KEY || '';
+  if (!apiKey) return res.status(401).json({ error: 'API key required' });
+
+  // Gather all models with creator names
+  const models = db.prepare(`
+    SELECT m.id, m.name, m.tags, m.folder_path, c.name as creator_name
+    FROM models m LEFT JOIN creators c ON m.creator_id = c.id
+    WHERE (m.hidden IS NULL OR m.hidden = 0)
+    ORDER BY c.name, m.name
+  `).all();
+
+  if (models.length === 0) return res.json({ success: true, tagged: 0 });
+
+  // Build a manifest for Claude — batch into chunks of 100 to avoid token limits
+  const BATCH_SIZE = 100;
+  const batches = [];
+  for (let i = 0; i < models.length; i += BATCH_SIZE) {
+    batches.push(models.slice(i, i + BATCH_SIZE));
+  }
+
+  const https = require('https');
+  let totalTagged = 0;
+
+  const systemPrompt = `You are a tagging assistant for "The Vault", a 3D print model library.
+Given a list of 3D printable models with their names, creator names, and folder paths, generate up to 5 relevant tags per model.
+
+Rules:
+- Max 5 tags per model. Fewer is fine if there aren't 5 meaningful tags.
+- The creator name should ALWAYS be included as a tag (exactly as given).
+- Tags should be lowercase.
+- Tags should describe the model's franchise, category, character, or theme.
+- Examples: "star wars", "marvel", "thundercats", "dragon", "miniature", "terrain", "bust", "vehicle", "droid", "rebel", "empire", "fantasy", "sci-fi", "anime", "warhammer", "dnd"
+- Use broad franchise tags (e.g. "star wars") AND specific tags (e.g. "rebel", "x-wing")
+- Use the folder path structure for context clues (e.g. "Star Wars/Vehicles/X-wing" → tags: ["star wars", "vehicle", "x-wing"])
+- If a model name suggests a known character or IP, tag appropriately (e.g. "Cheetara" → ["thundercats", "cheetara"])
+
+Respond with ONLY a JSON array. Each element: {"id": <model_id>, "tags": ["tag1", "tag2", ...]}
+No other text or explanation — just the JSON array.`;
+
+  for (const batch of batches) {
+    const manifest = batch.map(m => ({
+      id: m.id,
+      name: m.name,
+      creator: m.creator_name,
+      path: m.folder_path.replace(/^\/library\/?/, '')
+    }));
+
+    const userContent = `Tag these 3D models:\n\n${JSON.stringify(manifest, null, 1)}`;
+
+    const payload = JSON.stringify({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 4096,
+      system: systemPrompt,
+      messages: [{ role: 'user', content: userContent }]
+    });
+
+    const result = await new Promise((resolve, reject) => {
+      const options = {
+        hostname: 'api.anthropic.com',
+        path: '/v1/messages',
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': apiKey,
+          'anthropic-version': '2023-06-01',
+          'Content-Length': Buffer.byteLength(payload)
+        }
+      };
+
+      const apiReq = https.request(options, (apiRes) => {
+        let data = '';
+        apiRes.on('data', chunk => data += chunk);
+        apiRes.on('end', () => {
+          try {
+            const parsed = JSON.parse(data);
+            if (parsed.error) return reject(new Error(parsed.error.message));
+            const textBlocks = (parsed.content || []).filter(b => b.type === 'text');
+            const fullText = textBlocks.map(b => b.text).join('\n');
+            // Extract JSON array — may be wrapped in code fences
+            const jsonMatch = fullText.match(/\[[\s\S]*\]/);
+            if (jsonMatch) resolve(JSON.parse(jsonMatch[0]));
+            else reject(new Error('No JSON array in AI response'));
+          } catch (e) { reject(e); }
+        });
+      });
+
+      apiReq.on('error', reject);
+      apiReq.write(payload);
+      apiReq.end();
+    });
+
+    // Apply tags to DB
+    const updateStmt = db.prepare(`UPDATE models SET tags = ?, updated_at = datetime('now') WHERE id = ?`);
+    const applyBatch = db.transaction((tagResults) => {
+      for (const item of tagResults) {
+        if (!item.id || !Array.isArray(item.tags)) continue;
+        // Merge with existing tags
+        const existing = batch.find(m => m.id === item.id);
+        const existingTags = existing ? JSON.parse(existing.tags || '[]') : [];
+        const merged = [...new Set([...existingTags, ...item.tags.map(t => t.toLowerCase())])].slice(0, 5);
+        updateStmt.run(JSON.stringify(merged), item.id);
+        totalTagged++;
+      }
+    });
+    applyBatch(result);
+  }
+
+  res.json({ success: true, tagged: totalTagged, total: models.length });
 });
 
 // ── STL File Serving ──────────────────────────────────────────────────────────
