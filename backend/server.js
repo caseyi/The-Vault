@@ -962,6 +962,152 @@ No other text or explanation — just the JSON array.`;
   res.json({ success: true, tagged: totalTagged, total: models.length });
 });
 
+// ── AI Image Finder (SSE) ────────────────────────────────────────────────────
+
+app.get('/api/ai/find-images', async (req, res) => {
+  const apiKey = req.headers['x-claude-key'] || req.query.key || process.env.CLAUDE_API_KEY || '';
+  if (!apiKey) { res.status(401).json({ error: 'API key required' }); return; }
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders();
+
+  const send = (data) => res.write(`data: ${JSON.stringify(data)}\n\n`);
+  const log = (level, msg) => send({ level, msg, ts: new Date().toISOString() });
+  const done = (data) => { send({ type: 'done', ...data }); res.end(); };
+
+  // Get models without thumbnails
+  const models = db.prepare(`
+    SELECT m.id, m.uuid, m.name, m.folder_path, m.source_url, m.images, c.name as creator_name
+    FROM models m LEFT JOIN creators c ON m.creator_id = c.id
+    WHERE m.thumbnail_path IS NULL AND (m.hidden IS NULL OR m.hidden = 0)
+    ORDER BY c.name, m.name
+  `).all();
+
+  if (models.length === 0) {
+    log('info', 'All models already have thumbnails!');
+    return done({ success: true, found: 0, scraped: 0, total: 0 });
+  }
+
+  log('info', `Found ${models.length} model(s) without thumbnails`);
+
+  const https = require('https');
+  let scraped = 0, failed = 0;
+
+  for (let i = 0; i < models.length; i++) {
+    const model = models[i];
+    const label = `[${i + 1}/${models.length}] ${model.creator_name || '?'} / ${model.name}`;
+
+    // Step 1: Try to get a source URL
+    let sourceUrl = model.source_url;
+
+    // Try folder name detection first (free, no API call)
+    if (!sourceUrl) {
+      const folderName = path.basename(model.folder_path);
+      const detected = detectUrlFromFolderName(folderName);
+      if (detected) {
+        sourceUrl = detected.url;
+        log('info', `${label} — auto-detected URL from folder: ${sourceUrl}`);
+      }
+    }
+
+    // If still no URL, ask Claude to search
+    if (!sourceUrl) {
+      log('search', `${label} — searching online…`);
+      try {
+        const searchResult = await new Promise((resolve, reject) => {
+          const searchPrompt = `Find the download page for this 3D printable model:
+Model: "${model.name}"
+${model.creator_name ? `Creator: "${model.creator_name}"` : ''}
+
+Search Printables, MyMiniFactory, Thingiverse, Cults3D, Patreon, and Gumroad.
+Return ONLY the most likely URL. No explanation, just the URL. If you cannot find it, reply with "NONE".`;
+
+          const payload = JSON.stringify({
+            model: 'claude-sonnet-4-20250514',
+            max_tokens: 256,
+            tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: 2 }],
+            messages: [{ role: 'user', content: searchPrompt }]
+          });
+
+          const options = {
+            hostname: 'api.anthropic.com', path: '/v1/messages', method: 'POST',
+            headers: {
+              'Content-Type': 'application/json', 'x-api-key': apiKey,
+              'anthropic-version': '2023-06-01', 'Content-Length': Buffer.byteLength(payload)
+            }
+          };
+
+          const apiReq = https.request(options, (apiRes) => {
+            let data = '';
+            apiRes.on('data', chunk => data += chunk);
+            apiRes.on('end', () => {
+              try {
+                const parsed = JSON.parse(data);
+                if (parsed.error) return reject(new Error(parsed.error.message));
+                const textBlocks = (parsed.content || []).filter(b => b.type === 'text');
+                const text = textBlocks.map(b => b.text).join('\n').trim();
+                // Extract URL from response
+                const urlMatch = text.match(/https?:\/\/[^\s"<>]+/);
+                if (urlMatch && !text.includes('NONE')) resolve(urlMatch[0]);
+                else resolve(null);
+              } catch (e) { reject(e); }
+            });
+          });
+          apiReq.on('error', reject);
+          apiReq.write(payload);
+          apiReq.end();
+        });
+
+        if (searchResult) {
+          sourceUrl = searchResult;
+          log('info', `${label} — found: ${sourceUrl}`);
+          // Save the URL for future use
+          db.prepare('UPDATE models SET source_url = ? WHERE id = ?').run(sourceUrl, model.id);
+        } else {
+          log('warn', `${label} — no URL found, skipping`);
+          failed++;
+          continue;
+        }
+      } catch (e) {
+        log('error', `${label} — search failed: ${e.message}`);
+        failed++;
+        continue;
+      }
+    }
+
+    // Step 2: Scrape images from the URL
+    try {
+      log('img', `${label} — scraping images from ${sourceUrl}`);
+      const { savedPaths, sourceSite } = await scrapeImagesFromUrl(sourceUrl, model.uuid, (level, msg) => {
+        log(level, `  ${msg}`);
+      });
+
+      if (savedPaths.length > 0) {
+        const existingImages = JSON.parse(model.images || '[]');
+        const allImages = [...new Set([...existingImages, ...savedPaths])];
+        db.prepare(`UPDATE models SET images=?, thumbnail_path=?, source_url=?, updated_at=datetime('now') WHERE id=?`)
+          .run(JSON.stringify(allImages), allImages[0], sourceUrl, model.id);
+        if (sourceSite && sourceSite !== 'unknown') {
+          db.prepare(`UPDATE models SET source_site=? WHERE id=?`).run(sourceSite, model.id);
+        }
+        log('success', `${label} — ✓ ${savedPaths.length} image(s) saved`);
+        scraped++;
+      } else {
+        log('warn', `${label} — no images downloaded`);
+        failed++;
+      }
+    } catch (e) {
+      log('error', `${label} — scrape failed: ${e.message}`);
+      failed++;
+    }
+  }
+
+  log('success', `✓ Done — ${scraped} models scraped, ${failed} failed, ${models.length} total`);
+  done({ success: true, found: models.length, scraped, failed });
+});
+
 // ── STL File Serving ──────────────────────────────────────────────────────────
 
 // Serve individual STL files for the 3D viewer (by model_file id)

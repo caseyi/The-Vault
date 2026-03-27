@@ -11,9 +11,11 @@ export default function ScanModal({ onClose, onScanComplete }) {
   const [checking, setChecking] = useState(true); // loading state while checking scan status
   const [tagging, setTagging] = useState(false);
   const [tagResult, setTagResult] = useState(null);
+  const [findingImages, setFindingImages] = useState(false);
   const [apiKey, setApiKey] = useState(() => localStorage.getItem('claude_api_key') || '');
   const [showKey, setShowKey] = useState(false);
   const esRef = useRef(null);
+  const imgEsRef = useRef(null);
 
   // Connect (or reconnect) to the SSE stream
   const connectToStream = useCallback(() => {
@@ -135,6 +137,35 @@ export default function ScanModal({ onClose, onScanComplete }) {
     }
   };
 
+  const findImages = () => {
+    setFindingImages(true);
+    setLines(l => [...l, { level: 'info', msg: 'Searching for images for models without thumbnails…', ts: new Date().toISOString() }]);
+
+    const keyParam = apiKey ? `?key=${encodeURIComponent(apiKey)}` : '';
+    const es = new EventSource(`/api/ai/find-images${keyParam}`);
+    imgEsRef.current = es;
+
+    es.onmessage = (e) => {
+      const data = JSON.parse(e.data);
+      if (data.type === 'done') {
+        setFindingImages(false);
+        es.close();
+        if (onScanComplete) onScanComplete();
+      } else {
+        setLines(l => [...l, data]);
+      }
+    };
+
+    es.onerror = () => {
+      setLines(l => [...l, { level: 'error', msg: 'Image search connection lost', ts: new Date().toISOString() }]);
+      setFindingImages(false);
+      es.close();
+    };
+  };
+
+  // Cleanup image finder SSE on unmount
+  useEffect(() => () => imgEsRef.current?.close(), []);
+
   if (checking) {
     return (
       <div className="modal-overlay">
@@ -231,21 +262,30 @@ export default function ScanModal({ onClose, onScanComplete }) {
           </div>
         )}
 
-        <div className="modal-actions" style={{ marginTop: 16 }}>
-          <button className="btn-cancel" onClick={onClose} disabled={running || tagging}>
+        <div className="modal-actions" style={{ marginTop: 16, flexWrap: 'wrap' }}>
+          <button className="btn-cancel" onClick={onClose} disabled={running || tagging || findingImages}>
             {done ? 'Close' : 'Cancel'}
           </button>
-          <button className="btn-primary" onClick={() => { setDone(false); startScan(); }} disabled={running || tagging}>
+          <button className="btn-primary" onClick={() => { setDone(false); startScan(); }} disabled={running || tagging || findingImages}>
             {running ? 'Scanning…' : done ? 'Rescan' : 'Start Scan'}
           </button>
           <button
             className="btn-primary"
             onClick={generateTags}
-            disabled={running || tagging}
+            disabled={running || tagging || findingImages}
             style={{ background: tagging ? 'var(--bg-card)' : 'rgba(155,114,207,0.15)', color: '#9b72cf', border: '1px solid rgba(155,114,207,0.3)' }}
             title="Use Claude AI to auto-generate tags for all models based on names, creators, and folder structure"
           >
             {tagging ? 'Tagging…' : 'Generate Tags'}
+          </button>
+          <button
+            className="btn-primary"
+            onClick={findImages}
+            disabled={running || tagging || findingImages}
+            style={{ background: findingImages ? 'var(--bg-card)' : 'rgba(91,155,213,0.15)', color: '#5b9bd5', border: '1px solid rgba(91,155,213,0.3)' }}
+            title="Use Claude AI to search online and download images for models without thumbnails"
+          >
+            {findingImages ? 'Finding…' : 'Find Images'}
           </button>
           {done && (
             <button className="btn-primary" onClick={onClose}>View Results</button>
