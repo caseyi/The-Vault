@@ -17,6 +17,7 @@ export default function App() {
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [showHidden, setShowHidden] = useState(false);
   const [appVersion, setAppVersion] = useState(null);
+  const [refreshKey, setRefreshKey] = useState(0);
 
   useEffect(() => {
     fetch(`${API}/api/health`).then(r => r.json())
@@ -65,6 +66,7 @@ export default function App() {
             onModelClick={openModel}
             showHidden={showHidden}
             onRefreshStats={fetchStats}
+            refreshKey={refreshKey}
           />
         )}
         {view === 'detail' && selectedModel && (
@@ -77,7 +79,8 @@ export default function App() {
       </main>
       {showScan && (
         <ScanModal
-          onClose={() => { setShowScan(false); fetchStats(); }}
+          onClose={() => { setShowScan(false); fetchStats(); setRefreshKey(k => k + 1); }}
+          onScanComplete={() => { fetchStats(); setRefreshKey(k => k + 1); }}
         />
       )}
     </div>

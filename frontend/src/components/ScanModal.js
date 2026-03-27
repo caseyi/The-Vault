@@ -141,7 +141,7 @@ export default function ScanModal({ onClose, onScanComplete }) {
             type="checkbox"
             checked={force}
             onChange={e => setForce(e.target.checked)}
-            disabled={running}
+            disabled={running && !done}
             style={{ accentColor: 'var(--accent)' }}
           />
           Force full rescan (re-index all models, even unchanged ones)
@@ -170,11 +170,9 @@ export default function ScanModal({ onClose, onScanComplete }) {
           <button className="btn-cancel" onClick={onClose} disabled={running}>
             {done ? 'Close' : 'Cancel'}
           </button>
-          {!done && (
-            <button className="btn-primary" onClick={startScan} disabled={running}>
-              {running ? 'Scanning…' : 'Start Scan'}
-            </button>
-          )}
+          <button className="btn-primary" onClick={() => { setDone(false); startScan(); }} disabled={running}>
+            {running ? 'Scanning…' : done ? 'Rescan' : 'Start Scan'}
+          </button>
           {done && (
             <button className="btn-primary" onClick={onClose}>View Results</button>
           )}

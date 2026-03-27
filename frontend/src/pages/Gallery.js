@@ -211,7 +211,7 @@ function BulkActionBar({ selectedIds, onClearSelection, onBulkStatus, onBulkTag,
   );
 }
 
-export default function Gallery({ filters, onFilterChange, onModelClick, showHidden, onRefreshStats }) {
+export default function Gallery({ filters, onFilterChange, onModelClick, showHidden, onRefreshStats, refreshKey }) {
   const [models, setModels] = useState([]);
   const [total, setTotal] = useState(0);
   const [pages, setPages] = useState(1);
@@ -238,7 +238,7 @@ export default function Gallery({ filters, onFilterChange, onModelClick, showHid
       setPages(data.pages || 1);
     } catch {}
     setLoading(false);
-  }, [filters, page, showHidden]);
+  }, [filters, page, showHidden, refreshKey]);
 
   useEffect(() => { setPage(1); }, [filters, showHidden]);
   useEffect(() => { fetchModels(); }, [fetchModels]);
