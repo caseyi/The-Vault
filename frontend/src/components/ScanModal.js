@@ -11,6 +11,8 @@ export default function ScanModal({ onClose, onScanComplete }) {
   const [checking, setChecking] = useState(true); // loading state while checking scan status
   const [tagging, setTagging] = useState(false);
   const [tagResult, setTagResult] = useState(null);
+  const [apiKey, setApiKey] = useState(() => localStorage.getItem('claude_api_key') || '');
+  const [showKey, setShowKey] = useState(false);
   const esRef = useRef(null);
 
   // Connect (or reconnect) to the SSE stream
@@ -109,7 +111,6 @@ export default function ScanModal({ onClose, onScanComplete }) {
     setTagResult(null);
     setLines(l => [...l, { level: 'info', msg: 'Generating tags with Claude AI…', ts: new Date().toISOString() }]);
     try {
-      const apiKey = localStorage.getItem('claude_api_key') || '';
       const res = await fetch('/api/ai/generate-tags', {
         method: 'POST',
         headers: {
@@ -178,6 +179,38 @@ export default function ScanModal({ onClose, onScanComplete }) {
           />
           Force full rescan (re-index all models, even unchanged ones)
         </label>
+
+        <div style={{ marginTop: 14, display: 'flex', alignItems: 'center', gap: 6 }}>
+          <div style={{ flex: 1, position: 'relative' }}>
+            <input
+              className="modal-input"
+              style={{ margin: 0, paddingRight: 36, fontSize: 11 }}
+              type={showKey ? 'text' : 'password'}
+              value={apiKey}
+              onChange={e => { setApiKey(e.target.value); localStorage.setItem('claude_api_key', e.target.value); }}
+              placeholder="sk-ant-... (Claude API key for AI features)"
+            />
+            <button
+              onClick={() => setShowKey(s => !s)}
+              style={{
+                position: 'absolute', right: 8, top: '50%', transform: 'translateY(-50%)',
+                background: 'none', border: 'none', cursor: 'pointer',
+                color: 'var(--text-faint)', fontSize: 13,
+              }}
+              title={showKey ? 'Hide key' : 'Show key'}
+            >
+              {showKey ? '◉' : '○'}
+            </button>
+          </div>
+          {apiKey && (
+            <span style={{ fontSize: 10, color: 'var(--green)', fontFamily: 'var(--font-mono)', whiteSpace: 'nowrap' }}>
+              ✓ saved
+            </span>
+          )}
+        </div>
+        <div className="modal-hint" style={{ marginTop: 2 }}>
+          Required for Generate Tags and Find Online. Stored in browser only.
+        </div>
 
         <div style={{ marginTop: 14 }}>
           <TaskLog lines={lines} running={running} title="SCAN LOG" height={240} />
