@@ -1068,8 +1068,39 @@ No other text or explanation — just the JSON array.`;
 
 // ── AI Image Finder (SSE) ────────────────────────────────────────────────────
 
+// Score how likely we are to find a match for this model online.
+// Higher = better chance. Models with no useful info get skipped.
+function scoreMatchability(model) {
+  let score = 0;
+  let reasons = [];
+
+  // Already has a source URL — best case, just scrape it
+  if (model.source_url) { score += 50; reasons.push('has source URL'); }
+
+  // Folder name matches a known site pattern (thingiverse ID, printables slug, etc.)
+  const folderName = path.basename(model.folder_path);
+  if (detectUrlFromFolderName(folderName)) { score += 40; reasons.push('folder has site ID'); }
+
+  // Has a real creator name (not just a generic folder name)
+  if (model.creator_name && model.creator_name.length > 1) { score += 15; reasons.push('has creator'); }
+
+  // Model name is descriptive enough to search (not just IDs/hashes)
+  const name = model.name || '';
+  const isGenericName = /^[0-9a-f]{8,}$/i.test(name) || /^(files?|model|thing|download|print)/i.test(name) || name.length < 3;
+  if (!isGenericName && name.length >= 4) { score += 15; reasons.push('descriptive name'); }
+  else { reasons.push('generic/short name'); }
+
+  // Name contains recognizable keywords
+  if (/[A-Z][a-z]+/.test(name)) { score += 5; reasons.push('proper noun'); }
+
+  return { score, reasons };
+}
+
 app.get('/api/ai/find-images', async (req, res) => {
   const apiKey = req.headers['x-claude-key'] || req.query.key || process.env.CLAUDE_API_KEY || '';
+  const trialMode = req.query.trial !== '0'; // trial mode ON by default
+  const TRIAL_LIMIT = 10;
+
   if (!apiKey) { res.status(401).json({ error: 'API key required' }); return; }
 
   res.setHeader('Content-Type', 'text/event-stream');
@@ -1082,25 +1113,60 @@ app.get('/api/ai/find-images', async (req, res) => {
   const done = (data) => { send({ type: 'done', ...data }); res.end(); };
 
   // Get models without thumbnails
-  const models = db.prepare(`
+  const allModels = db.prepare(`
     SELECT m.id, m.uuid, m.name, m.folder_path, m.source_url, m.images, c.name as creator_name
     FROM models m LEFT JOIN creators c ON m.creator_id = c.id
     WHERE m.thumbnail_path IS NULL AND (m.hidden IS NULL OR m.hidden = 0)
     ORDER BY c.name, m.name
   `).all();
 
-  if (models.length === 0) {
+  if (allModels.length === 0) {
     log('info', 'All models already have thumbnails!');
     return done({ success: true, found: 0, scraped: 0, total: 0 });
   }
 
-  log('info', `Found ${models.length} model(s) without thumbnails`);
+  // Score and sort by matchability — best candidates first
+  const scored = allModels.map(m => ({ ...m, ...scoreMatchability(m) }));
+  scored.sort((a, b) => b.score - a.score);
 
-  let scraped = 0, failed = 0;
+  // Partition into tiers
+  const easy = scored.filter(m => m.score >= 40);   // has URL or site ID
+  const good = scored.filter(m => m.score >= 20 && m.score < 40); // has creator + name
+  const poor = scored.filter(m => m.score < 20);     // generic names, no creator
 
-  for (let i = 0; i < models.length; i++) {
-    const model = models[i];
-    const label = `[${i + 1}/${models.length}] ${model.creator_name || '?'} / ${model.name}`;
+  log('info', `Found ${allModels.length} model(s) without thumbnails`);
+  log('info', `Matchability: ${easy.length} easy (have URL/ID) · ${good.length} good (name+creator) · ${poor.length} poor (generic/unknown)`);
+
+  if (poor.length > 0) {
+    const examples = poor.slice(0, 3).map(m => `"${m.name}" by ${m.creator_name || '?'}`).join(', ');
+    log('warn', `Skipping ${poor.length} low-confidence model(s) — e.g. ${examples}`);
+  }
+
+  // Only process easy + good candidates
+  const models = scored.filter(m => m.score >= 20);
+
+  if (models.length === 0) {
+    log('warn', 'No models with enough info to search. Try adding creator names or source URLs first.');
+    return done({ success: true, found: 0, scraped: 0, total: 0, skippedPoor: poor.length });
+  }
+
+  // In trial mode, only do the first 10
+  const batch = trialMode ? models.slice(0, TRIAL_LIMIT) : models;
+  const remaining = trialMode ? models.length - batch.length : 0;
+
+  if (trialMode && models.length > TRIAL_LIMIT) {
+    log('info', `Trial mode: processing ${batch.length} of ${models.length} eligible models`);
+    log('info', 'Run again with trial=0 to process all');
+  } else {
+    log('info', `Processing ${batch.length} model(s)`);
+  }
+
+  let scraped = 0, failed = 0, apiCalls = 0;
+
+  for (let i = 0; i < batch.length; i++) {
+    const model = batch[i];
+    const label = `[${i + 1}/${batch.length}] ${model.creator_name || '?'} / ${model.name}`;
+    const confidence = model.score >= 40 ? '●' : model.score >= 20 ? '◐' : '○';
 
     // Step 1: Try to get a source URL
     let sourceUrl = model.source_url;
@@ -1111,13 +1177,14 @@ app.get('/api/ai/find-images', async (req, res) => {
       const detected = detectUrlFromFolderName(folderName);
       if (detected) {
         sourceUrl = detected.url;
-        log('info', `${label} — auto-detected URL from folder: ${sourceUrl}`);
+        log('info', `${confidence} ${label} — auto-detected URL: ${sourceUrl}`);
       }
     }
 
     // If still no URL, ask Claude to search
     if (!sourceUrl) {
-      log('search', `${label} — searching online…`);
+      log('search', `${confidence} ${label} — searching online…`);
+      apiCalls++;
       try {
         const searchPrompt = `Find the download page for this 3D printable model:
 Model: "${model.name}"
@@ -1140,22 +1207,19 @@ Return ONLY the most likely URL. No explanation, just the URL. If you cannot fin
 
         if (searchResult) {
           sourceUrl = searchResult;
-          log('info', `${label} — found: ${sourceUrl}`);
-          // Save the URL for future use
+          log('info', `${confidence} ${label} — found: ${sourceUrl}`);
           db.prepare('UPDATE models SET source_url = ? WHERE id = ?').run(sourceUrl, model.id);
         } else {
-          log('warn', `${label} — no URL found, skipping`);
+          log('warn', `${confidence} ${label} — no URL found, skipping`);
           failed++;
           continue;
         }
       } catch (e) {
-        log('error', `${label} — search failed: ${e.message}`);
-        // If it's an auth error, no point continuing
+        log('error', `${confidence} ${label} — search failed: ${e.message}`);
         if (e.message.includes('Invalid API key') || e.message.includes('lacks permission')) {
           log('error', 'Stopping — fix your API key and try again.');
-          return done({ success: false, error: e.message, found: models.length, scraped, failed });
+          return done({ success: false, error: e.message, found: batch.length, scraped, failed, apiCalls });
         }
-        // If rate limited, wait and retry this model
         if (e.message.includes('Rate limited')) {
           log('warn', 'Rate limited — waiting 30s before retrying…');
           await new Promise(r => setTimeout(r, 30000));
@@ -1169,7 +1233,7 @@ Return ONLY the most likely URL. No explanation, just the URL. If you cannot fin
 
     // Step 2: Scrape images from the URL
     try {
-      log('img', `${label} — scraping images from ${sourceUrl}`);
+      log('img', `${confidence} ${label} — scraping ${sourceUrl}`);
       const { savedPaths, sourceSite } = await scrapeImagesFromUrl(sourceUrl, model.uuid, (level, msg) => {
         log(level, `  ${msg}`);
       });
@@ -1182,20 +1246,28 @@ Return ONLY the most likely URL. No explanation, just the URL. If you cannot fin
         if (sourceSite && sourceSite !== 'unknown') {
           db.prepare(`UPDATE models SET source_site=? WHERE id=?`).run(sourceSite, model.id);
         }
-        log('success', `${label} — ✓ ${savedPaths.length} image(s) saved`);
+        log('success', `${confidence} ${label} — ✓ ${savedPaths.length} image(s) saved`);
         scraped++;
       } else {
-        log('warn', `${label} — no images downloaded`);
+        log('warn', `${confidence} ${label} — no images downloaded`);
         failed++;
       }
     } catch (e) {
-      log('error', `${label} — scrape failed: ${e.message}`);
+      log('error', `${confidence} ${label} — scrape failed: ${e.message}`);
       failed++;
     }
   }
 
-  log('success', `✓ Done — ${scraped} models scraped, ${failed} failed, ${models.length} total`);
-  done({ success: true, found: models.length, scraped, failed });
+  // Summary
+  const hitRate = batch.length > 0 ? Math.round((scraped / batch.length) * 100) : 0;
+  log('success', `✓ Done — ${scraped}/${batch.length} succeeded (${hitRate}% hit rate) · ${apiCalls} API call(s) used`);
+  if (remaining > 0) {
+    log('info', `${remaining} more eligible model(s) remaining — run Find Images again with trial=0 to process all`);
+  }
+  if (poor.length > 0) {
+    log('info', `${poor.length} model(s) skipped (too little info to search)`);
+  }
+  done({ success: true, found: batch.length, scraped, failed, apiCalls, remaining, skippedPoor: poor.length, hitRate });
 });
 
 // ── STL File Serving ──────────────────────────────────────────────────────────

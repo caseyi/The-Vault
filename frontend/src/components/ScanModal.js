@@ -163,18 +163,23 @@ export default function ScanModal({ onClose, onScanComplete }) {
     };
   };
 
-  const findImages = () => {
-    setFindingImages(true);
-    setLines(l => [...l, { level: 'info', msg: 'Searching for images for models without thumbnails…', ts: new Date().toISOString() }]);
+  const [imgResult, setImgResult] = useState(null); // stores last find-images result for "continue all"
 
-    const keyParam = apiKey ? `?key=${encodeURIComponent(apiKey)}` : '';
-    const es = new EventSource(`/api/ai/find-images${keyParam}`);
+  const findImages = (trial = true) => {
+    setFindingImages(true);
+    setImgResult(null);
+
+    const params = new URLSearchParams();
+    if (apiKey) params.set('key', apiKey);
+    if (!trial) params.set('trial', '0');
+    const es = new EventSource(`/api/ai/find-images?${params.toString()}`);
     imgEsRef.current = es;
 
     es.onmessage = (e) => {
       const data = JSON.parse(e.data);
       if (data.type === 'done') {
         setFindingImages(false);
+        setImgResult(data);
         es.close();
         if (onScanComplete) onScanComplete();
       } else {
@@ -317,13 +322,24 @@ export default function ScanModal({ onClose, onScanComplete }) {
           </button>
           <button
             className="btn-primary"
-            onClick={findImages}
+            onClick={() => findImages(true)}
             disabled={running || tagging || findingImages}
             style={{ background: findingImages ? 'var(--bg-card)' : 'rgba(91,155,213,0.15)', color: '#5b9bd5', border: '1px solid rgba(91,155,213,0.3)' }}
-            title="Use Claude AI to search online and download images for models without thumbnails"
+            title="Trial run: process 10 best candidates first, then decide whether to continue"
           >
-            {findingImages ? 'Finding…' : 'Find Images'}
+            {findingImages ? 'Finding…' : 'Find Images (trial 10)'}
           </button>
+          {imgResult && imgResult.remaining > 0 && (
+            <button
+              className="btn-primary"
+              onClick={() => findImages(false)}
+              disabled={running || tagging || findingImages}
+              style={{ background: 'rgba(91,155,213,0.25)', color: '#5b9bd5', border: '1px solid rgba(91,155,213,0.4)' }}
+              title={`Process all ${imgResult.remaining} remaining eligible models`}
+            >
+              Continue All ({imgResult.remaining})
+            </button>
+          )}
           {done && (
             <button className="btn-primary" onClick={onClose}>View Results</button>
           )}
