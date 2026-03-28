@@ -419,77 +419,86 @@ async function scanLibrary(libraryPath, progressCallback, logger) {
 
       log('creator', `▸ ${creatorName} (${foldersToProcess.length} model${foldersToProcess.length !== 1 ? 's' : ''})`);
 
-      // Process all models for this creator in one transaction
-      db.transaction(() => {
-        for (const model of foldersToProcess) {
-          modelsFound++;
-          if (progressCallback) progressCallback({ stage: 'scanning', creator: creatorName, model: model.name, found: modelsFound });
+      // Process models in small transaction batches (10 at a time) so the
+      // event loop can deliver SSE progress updates between batches.
+      const CHUNK_SIZE = 10;
+      for (let ci = 0; ci < foldersToProcess.length; ci += CHUNK_SIZE) {
+        const chunk = foldersToProcess.slice(ci, ci + CHUNK_SIZE);
 
-          const existing = stmts.getModel.get(model.fullPath);
-          const hash = folderHash(model.fullPath);
+        db.transaction(() => {
+          for (const model of chunk) {
+            modelsFound++;
+            if (progressCallback) progressCallback({ stage: 'scanning', creator: creatorName, model: model.name, found: modelsFound });
 
-          // ── Skip if unchanged ─────────────────────────────────────────────
-          if (existing && existing.folder_hash === hash) {
-            stmts.touchModel.run(existing.id);
-            modelsSkipped++;
-            log('skip', `  ⟳ Unchanged: ${model.name}`);
-            continue;
+            const existing = stmts.getModel.get(model.fullPath);
+            const hash = folderHash(model.fullPath);
+
+            // ── Skip if unchanged ─────────────────────────────────────────────
+            if (existing && existing.folder_hash === hash) {
+              stmts.touchModel.run(existing.id);
+              modelsSkipped++;
+              log('skip', `  ⟳ Unchanged: ${model.name}`);
+              continue;
+            }
+
+            // ── Analyze folder ────────────────────────────────────────────────
+            const analysis = analyzeFolder(model.fullPath, creatorName);
+            const sourceSite = detectSourceSite(model.fullPath) || detectSourceSite(model.name);
+            const modelUuid = existing ? existing.uuid : uuidv4();
+            // Model-level hint overrides creator-level hint
+            const hint = existing?.render_zip_hint || creatorHint || null;
+
+            let allImages = existing ? JSON.parse(existing.images || '[]') : [];
+
+            // Only re-extract images if folder changed
+            const freshImages = [];
+            const renderArchives = pickRenderArchives(analysis, hint);
+            for (const archivePath of renderArchives) {
+              log('zip', `    📦 ${path.basename(archivePath)}`);
+              const imgs = extractImagesFromArchive(archivePath, modelUuid);
+              freshImages.push(...imgs);
+              if (imgs.length) log('img', `       → ${imgs.length} image(s)`);
+            }
+            if (freshImages.length === 0 && analysis.images.length > 0) {
+              freshImages.push(...extractImagesFromFolder(model.fullPath, modelUuid));
+            }
+            // Merge: keep manually-added images, add newly found ones
+            if (freshImages.length > 0) {
+              allImages = [...new Set([...freshImages, ...allImages])];
+            }
+
+            const thumbnail = allImages[0] || null;
+
+            if (existing) {
+              stmts.updateModel.run(
+                inferModelName(model.fullPath), creatorId, sourceSite,
+                analysis.files.length, analysis.hasStl ? 1 : 0,
+                analysis.hasChitubox ? 1 : 0, analysis.hasLychee ? 1 : 0, analysis.hasPlate ? 1 : 0,
+                thumbnail, JSON.stringify(allImages), hash, existing.id
+              );
+              stmts.deleteFiles.run(existing.id);
+              for (const f of analysis.files) stmts.insertFile.run(existing.id, f.filename, f.filepath, fileType(f.filename), f.size, f.release_name || null);
+              const releaseList = [...analysis.releases];
+              log('update', `    ↻ ${model.name} (${analysis.files.length} files${releaseList.length ? `, ${releaseList.length} release${releaseList.length>1?'s':''}` : ''})`);
+              modelsUpdated++;
+            } else {
+              const ins = stmts.insertModel.run(
+                modelUuid, inferModelName(model.fullPath), creatorId, model.fullPath, sourceSite,
+                analysis.files.length, analysis.hasStl ? 1 : 0,
+                analysis.hasChitubox ? 1 : 0, analysis.hasLychee ? 1 : 0, analysis.hasPlate ? 1 : 0,
+                thumbnail, JSON.stringify(allImages), hash
+              );
+              for (const f of analysis.files) stmts.insertFile.run(ins.lastInsertRowid, f.filename, f.filepath, fileType(f.filename), f.size, f.release_name || null);
+              const releaseList = [...analysis.releases];
+              log('add', `    + ${model.name} (${analysis.files.length} files${releaseList.length ? `, ${releaseList.length} release${releaseList.length>1?'s':''}` : ''}${allImages.length ? `, ${allImages.length} img` : ''})`);
+              modelsAdded++;
+            }
           }
+        })(); // end transaction chunk
 
-          // ── Analyze folder ────────────────────────────────────────────────
-          const analysis = analyzeFolder(model.fullPath, creatorName);
-          const sourceSite = detectSourceSite(model.fullPath) || detectSourceSite(model.name);
-          const modelUuid = existing ? existing.uuid : uuidv4();
-          // Model-level hint overrides creator-level hint
-          const hint = existing?.render_zip_hint || creatorHint || null;
-
-          let allImages = existing ? JSON.parse(existing.images || '[]') : [];
-
-          // Only re-extract images if folder changed
-          const freshImages = [];
-          const renderArchives = pickRenderArchives(analysis, hint);
-          for (const archivePath of renderArchives) {
-            log('zip', `    📦 ${path.basename(archivePath)}`);
-            const imgs = extractImagesFromArchive(archivePath, modelUuid);
-            freshImages.push(...imgs);
-            if (imgs.length) log('img', `       → ${imgs.length} image(s)`);
-          }
-          if (freshImages.length === 0 && analysis.images.length > 0) {
-            freshImages.push(...extractImagesFromFolder(model.fullPath, modelUuid));
-          }
-          // Merge: keep manually-added images, add newly found ones
-          if (freshImages.length > 0) {
-            allImages = [...new Set([...freshImages, ...allImages])];
-          }
-
-          const thumbnail = allImages[0] || null;
-
-          if (existing) {
-            stmts.updateModel.run(
-              inferModelName(model.fullPath), creatorId, sourceSite,
-              analysis.files.length, analysis.hasStl ? 1 : 0,
-              analysis.hasChitubox ? 1 : 0, analysis.hasLychee ? 1 : 0, analysis.hasPlate ? 1 : 0,
-              thumbnail, JSON.stringify(allImages), hash, existing.id
-            );
-            stmts.deleteFiles.run(existing.id);
-            for (const f of analysis.files) stmts.insertFile.run(existing.id, f.filename, f.filepath, fileType(f.filename), f.size, f.release_name || null);
-            const releaseList = [...analysis.releases];
-            log('update', `    ↻ ${model.name} (${analysis.files.length} files${releaseList.length ? `, ${releaseList.length} release${releaseList.length>1?'s':''}` : ''})`);
-            modelsUpdated++;
-          } else {
-            const ins = stmts.insertModel.run(
-              modelUuid, inferModelName(model.fullPath), creatorId, model.fullPath, sourceSite,
-              analysis.files.length, analysis.hasStl ? 1 : 0,
-              analysis.hasChitubox ? 1 : 0, analysis.hasLychee ? 1 : 0, analysis.hasPlate ? 1 : 0,
-              thumbnail, JSON.stringify(allImages), hash
-            );
-            for (const f of analysis.files) stmts.insertFile.run(ins.lastInsertRowid, f.filename, f.filepath, fileType(f.filename), f.size, f.release_name || null);
-            const releaseList = [...analysis.releases];
-            log('add', `    + ${model.name} (${analysis.files.length} files${releaseList.length ? `, ${releaseList.length} release${releaseList.length>1?'s':''}` : ''}${allImages.length ? `, ${allImages.length} img` : ''})`);
-            modelsAdded++;
-          }
-        }
-      })(); // end transaction
+        // Yield to event loop so SSE can deliver progress updates
+        await new Promise(resolve => setImmediate(resolve));
+      }
     }
 
     stmts.finishLog.run('complete', modelsFound, modelsAdded, modelsUpdated, modelsSkipped, logId);
