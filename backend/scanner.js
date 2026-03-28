@@ -337,7 +337,7 @@ const stmts = {
   getCreator:    db.prepare('SELECT id, render_zip_hint FROM creators WHERE name = ?'),
   addCreator:    db.prepare('INSERT INTO creators (name, folder_path) VALUES (?, ?)'),
 
-  getModel:      db.prepare('SELECT id, uuid, folder_hash, images, render_zip_hint FROM models WHERE folder_path = ?'),
+  getModel:      db.prepare('SELECT id, uuid, folder_hash, images, render_zip_hint, creator_id FROM models WHERE folder_path = ?'),
   insertModel:   db.prepare(`
     INSERT INTO models (uuid, name, creator_id, folder_path, source_site,
       file_count, has_stl, has_chitubox, has_lychee, has_plate,
@@ -395,13 +395,46 @@ async function scanLibrary(libraryPath, progressCallback, logger) {
   }
 
   try {
-    const allCreatorDirs = fs.readdirSync(libraryPath, { withFileTypes: true }).filter(d => d.isDirectory());
-    const creatorDirs = allCreatorDirs.filter(d => !IGNORED_FOLDERS.has(d.name) && !isJunkFile(d.name));
-    const ignoredCount = allCreatorDirs.length - creatorDirs.length;
-    log('info', `Found ${creatorDirs.length} creator folder(s)${ignoredCount ? ` (${ignoredCount} system folder${ignoredCount > 1 ? 's' : ''} ignored)` : ''}`);
+    // Resolve creator directories — handle pass-through library roots.
+    // If a top-level folder contains ONLY subdirectories (no printable files),
+    // it's likely a library root like "STL Archive" and its children are the
+    // actual creators. We flatten these out so we don't attribute everything
+    // to the library root name.
+    function resolveCreatorDirs(basePath) {
+      const allDirs = fs.readdirSync(basePath, { withFileTypes: true }).filter(d => d.isDirectory());
+      const dirs = allDirs.filter(d => !IGNORED_FOLDERS.has(d.name) && !isJunkFile(d.name));
+      const results = [];
+
+      for (const dir of dirs) {
+        const dirPath = path.join(basePath, dir.name);
+        const entries = fs.readdirSync(dirPath, { withFileTypes: true }).filter(e => !IGNORED_FOLDERS.has(e.name) && !isJunkFile(e.name));
+        const hasFiles = entries.some(e => !e.isDirectory());
+        const hasPrintableFiles = entries.some(e => {
+          if (e.isDirectory()) return false;
+          const ext = path.extname(e.name).toLowerCase();
+          return STL_EXTS.has(ext) || ARCHIVE_EXTS.has(ext) || SLICE_EXTS.has(ext) || PLATE_EXTS.has(ext);
+        });
+        const childDirs = entries.filter(e => e.isDirectory());
+
+        // If this folder has NO printable files and ONLY subdirectories,
+        // treat it as a pass-through — its children are the real creators
+        if (!hasPrintableFiles && childDirs.length > 0 && !hasFiles) {
+          log('info', `"${dir.name}" looks like a library root — using its ${childDirs.length} subfolder(s) as creators`);
+          for (const child of childDirs) {
+            results.push({ name: child.name, path: path.join(dirPath, child.name) });
+          }
+        } else {
+          results.push({ name: dir.name, path: dirPath });
+        }
+      }
+      return results;
+    }
+
+    const creatorDirs = resolveCreatorDirs(libraryPath);
+    log('info', `Found ${creatorDirs.length} creator folder(s)`);
 
     for (const creatorDir of creatorDirs) {
-      const creatorPath = path.join(libraryPath, creatorDir.name);
+      const creatorPath = creatorDir.path;
       const creatorName = creatorDir.name;
       const creatorId = getOrCreateCreator(creatorName, creatorPath);
       const creatorRow = stmts.getCreator.get(creatorName);
@@ -436,6 +469,11 @@ async function scanLibrary(libraryPath, progressCallback, logger) {
             // ── Skip if unchanged ─────────────────────────────────────────────
             if (existing && existing.folder_hash === hash) {
               stmts.touchModel.run(existing.id);
+              // Fix creator attribution even on skip (e.g. "STL Archive" → actual creator)
+              if (existing.creator_id !== model.creatorId) {
+                db.prepare('UPDATE models SET creator_id=?, updated_at=datetime(\'now\') WHERE id=?').run(model.creatorId, existing.id);
+                log('info', `  ↻ Re-attributed: ${model.name} → ${model.creatorName}`);
+              }
               modelsSkipped++;
               log('skip', `  ⟳ Unchanged: ${model.name}`);
               continue;
@@ -500,6 +538,10 @@ async function scanLibrary(libraryPath, progressCallback, logger) {
         await new Promise(resolve => setImmediate(resolve));
       }
     }
+
+    // Clean up orphaned creators (no models left — e.g. "STL Archive" after re-attribution)
+    const orphaned = db.prepare('DELETE FROM creators WHERE id NOT IN (SELECT DISTINCT creator_id FROM models WHERE creator_id IS NOT NULL)').run();
+    if (orphaned.changes > 0) log('info', `Cleaned up ${orphaned.changes} orphaned creator(s)`);
 
     stmts.finishLog.run('complete', modelsFound, modelsAdded, modelsUpdated, modelsSkipped, logId);
     log('info', `Skipped ${modelsSkipped} unchanged model(s)`);
