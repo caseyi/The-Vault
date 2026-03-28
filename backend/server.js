@@ -662,62 +662,34 @@ ${context || ''}`;
   ];
 
   try {
-    const https = require('https');
-    const payload = JSON.stringify({
+    const apiKey = req.headers['x-claude-key'] || process.env.CLAUDE_API_KEY || '';
+    const parsed = await callClaudeAPI(apiKey, {
       model: 'claude-sonnet-4-20250514',
       max_tokens: 1024,
       system: systemPrompt,
       messages
     });
 
-    const options = {
-      hostname: 'api.anthropic.com',
-      path: '/v1/messages',
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': req.headers['x-claude-key'] || process.env.CLAUDE_API_KEY || '',
-        'anthropic-version': '2023-06-01',
-        'Content-Length': Buffer.byteLength(payload)
-      }
-    };
+    const text = parsed.content?.[0]?.text || '';
 
-    const apiReq = https.request(options, (apiRes) => {
-      let data = '';
-      apiRes.on('data', chunk => data += chunk);
-      apiRes.on('end', () => {
-        try {
-          const parsed = JSON.parse(data);
-          if (parsed.error) return res.status(400).json({ error: parsed.error.message });
-          const text = parsed.content?.[0]?.text || '';
+    // Parse structured suggestions out of the response
+    const tagsMatch = text.match(/<tags>([\s\S]*?)<\/tags>/);
+    const statusMatch = text.match(/<status>([\s\S]*?)<\/status>/);
+    const notesMatch = text.match(/<notes>([\s\S]*?)<\/notes>/);
 
-          // Parse structured suggestions out of the response
-          const tagsMatch = text.match(/<tags>([\s\S]*?)<\/tags>/);
-          const statusMatch = text.match(/<status>([\s\S]*?)<\/status>/);
-          const notesMatch = text.match(/<notes>([\s\S]*?)<\/notes>/);
+    let suggestedTags = null, suggestedStatus = null, suggestedNotes = null;
+    if (tagsMatch) { try { suggestedTags = JSON.parse(tagsMatch[1]); } catch {} }
+    if (statusMatch) suggestedStatus = statusMatch[1].trim();
+    if (notesMatch) suggestedNotes = notesMatch[1].trim();
 
-          let suggestedTags = null, suggestedStatus = null, suggestedNotes = null;
-          if (tagsMatch) { try { suggestedTags = JSON.parse(tagsMatch[1]); } catch {} }
-          if (statusMatch) suggestedStatus = statusMatch[1].trim();
-          if (notesMatch) suggestedNotes = notesMatch[1].trim();
+    // Clean display text
+    const displayText = text
+      .replace(/<tags>[\s\S]*?<\/tags>/g, '')
+      .replace(/<status>[\s\S]*?<\/status>/g, '')
+      .replace(/<notes>[\s\S]*?<\/notes>/g, '')
+      .trim();
 
-          // Clean display text
-          const displayText = text
-            .replace(/<tags>[\s\S]*?<\/tags>/g, '')
-            .replace(/<status>[\s\S]*?<\/status>/g, '')
-            .replace(/<notes>[\s\S]*?<\/notes>/g, '')
-            .trim();
-
-          res.json({ text: displayText, suggestedTags, suggestedStatus, suggestedNotes });
-        } catch (e) {
-          res.status(500).json({ error: 'Failed to parse AI response' });
-        }
-      });
-    });
-
-    apiReq.on('error', (e) => res.status(500).json({ error: e.message }));
-    apiReq.write(payload);
-    apiReq.end();
+    res.json({ text: displayText, suggestedTags, suggestedStatus, suggestedNotes });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -773,8 +745,7 @@ ${query ? `Additional search context: ${query}` : ''}
 Search for this model and provide download/purchase links.`;
 
   try {
-    const https = require('https');
-    const payload = JSON.stringify({
+    const parsed = await callClaudeAPI(apiKey, {
       model: 'claude-sonnet-4-20250514',
       max_tokens: 2048,
       system: systemPrompt,
@@ -784,8 +755,48 @@ Search for this model and provide download/purchase links.`;
         max_uses: 3,
       }],
       messages: [{ role: 'user', content: userContent }]
-    });
+    }, { timeoutMs: 60000 });
 
+    // Extract text from response content blocks
+    const textBlocks = (parsed.content || []).filter(b => b.type === 'text');
+    const fullText = textBlocks.map(b => b.text).join('\n');
+
+    // Parse structured results
+    const resultsMatch = fullText.match(/<results>([\s\S]*?)<\/results>/);
+    let searchResults = [];
+    if (resultsMatch) {
+      try { searchResults = JSON.parse(resultsMatch[1]); } catch {}
+    }
+
+    // Clean display text
+    const displayText = fullText
+      .replace(/<results>[\s\S]*?<\/results>/g, '')
+      .trim();
+
+    // Also extract any web search citations from the response
+    const citations = [];
+    for (const block of (parsed.content || [])) {
+      if (block.type === 'text' && block.citations) {
+        for (const cite of block.citations) {
+          if (cite.url && !citations.find(c => c.url === cite.url)) {
+            citations.push({ url: cite.url, title: cite.title || '' });
+          }
+        }
+      }
+    }
+
+    res.json({ text: displayText, results: searchResults, citations });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── Claude API Helper ─────────────────────────────────────────────────────────
+
+function callClaudeAPI(apiKey, body, { timeoutMs = 120000 } = {}) {
+  const https = require('https');
+  return new Promise((resolve, reject) => {
+    const payload = JSON.stringify(body);
     const options = {
       hostname: 'api.anthropic.com',
       path: '/v1/messages',
@@ -802,58 +813,97 @@ Search for this model and provide download/purchase links.`;
       let data = '';
       apiRes.on('data', chunk => data += chunk);
       apiRes.on('end', () => {
+        // Check HTTP status BEFORE trying to parse JSON
+        if (apiRes.statusCode !== 200) {
+          // Try to extract a useful error message
+          let errMsg = `Claude API returned HTTP ${apiRes.statusCode}`;
+          if (apiRes.statusCode === 401) errMsg = 'Invalid API key — check your key at console.anthropic.com';
+          else if (apiRes.statusCode === 403) errMsg = 'API key lacks permission — check your key permissions';
+          else if (apiRes.statusCode === 429) errMsg = 'Rate limited — too many requests, wait a moment and retry';
+          else if (apiRes.statusCode === 500) errMsg = 'Claude API internal error — try again later';
+          else if (apiRes.statusCode === 529) errMsg = 'Claude API overloaded — try again in a few minutes';
+
+          // Try to get more detail from response body
+          try {
+            const parsed = JSON.parse(data);
+            if (parsed.error?.message) errMsg += `: ${parsed.error.message}`;
+          } catch {
+            // Response was HTML or other non-JSON (e.g. Cloudflare error page)
+            const titleMatch = data.match(/<title>(.*?)<\/title>/i);
+            if (titleMatch) errMsg += ` (${titleMatch[1]})`;
+            else if (data.length < 200) errMsg += ` — ${data.substring(0, 100)}`;
+          }
+          return reject(new Error(errMsg));
+        }
+
         try {
           const parsed = JSON.parse(data);
-          if (parsed.error) return res.status(400).json({ error: parsed.error.message });
-
-          // Extract text from response content blocks
-          const textBlocks = (parsed.content || []).filter(b => b.type === 'text');
-          const fullText = textBlocks.map(b => b.text).join('\n');
-
-          // Parse structured results
-          const resultsMatch = fullText.match(/<results>([\s\S]*?)<\/results>/);
-          let searchResults = [];
-          if (resultsMatch) {
-            try { searchResults = JSON.parse(resultsMatch[1]); } catch {}
-          }
-
-          // Clean display text
-          const displayText = fullText
-            .replace(/<results>[\s\S]*?<\/results>/g, '')
-            .trim();
-
-          // Also extract any web search citations from the response
-          const citations = [];
-          for (const block of (parsed.content || [])) {
-            if (block.type === 'text' && block.citations) {
-              for (const cite of block.citations) {
-                if (cite.url && !citations.find(c => c.url === cite.url)) {
-                  citations.push({ url: cite.url, title: cite.title || '' });
-                }
-              }
-            }
-          }
-
-          res.json({ text: displayText, results: searchResults, citations });
+          if (parsed.error) return reject(new Error(`Claude API error: ${parsed.error.message}`));
+          resolve(parsed);
         } catch (e) {
-          res.status(500).json({ error: 'Failed to parse AI response' });
+          reject(new Error(`Failed to parse Claude response as JSON (got ${data.substring(0, 80)}…)`));
         }
       });
     });
 
-    apiReq.on('error', (e) => res.status(500).json({ error: e.message }));
+    // Timeout
+    apiReq.setTimeout(timeoutMs, () => {
+      apiReq.destroy();
+      reject(new Error(`Claude API timed out after ${Math.round(timeoutMs / 1000)}s — the request may have been too large`));
+    });
+
+    apiReq.on('error', (e) => {
+      if (e.code === 'ECONNRESET') reject(new Error('Connection to Claude API was reset — check your network'));
+      else if (e.code === 'ENOTFOUND') reject(new Error('Cannot reach api.anthropic.com — check DNS/network'));
+      else reject(new Error(`Network error calling Claude API: ${e.message}`));
+    });
+
     apiReq.write(payload);
     apiReq.end();
+  });
+}
+
+// ── AI Key Test ──────────────────────────────────────────────────────────────
+
+app.post('/api/ai/test-key', async (req, res) => {
+  const apiKey = req.headers['x-claude-key'] || process.env.CLAUDE_API_KEY || '';
+  if (!apiKey) return res.status(401).json({ ok: false, error: 'No API key provided' });
+  if (!apiKey.startsWith('sk-ant-')) return res.status(400).json({ ok: false, error: 'Key should start with sk-ant- — this doesn\'t look like an Anthropic API key' });
+
+  try {
+    const parsed = await callClaudeAPI(apiKey, {
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 32,
+      messages: [{ role: 'user', content: 'Reply with just the word "ok".' }]
+    }, { timeoutMs: 15000 });
+
+    const text = parsed.content?.[0]?.text || '';
+    res.json({
+      ok: true,
+      model: parsed.model,
+      usage: parsed.usage,
+      message: `Key works! (model: ${parsed.model}, used ${parsed.usage?.input_tokens || '?'} input tokens)`
+    });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    res.status(400).json({ ok: false, error: e.message });
   }
 });
 
-// ── AI Auto-Tagging ──────────────────────────────────────────────────────────
+// ── AI Auto-Tagging (SSE) ────────────────────────────────────────────────────
 
-app.post('/api/ai/generate-tags', async (req, res) => {
-  const apiKey = req.headers['x-claude-key'] || process.env.CLAUDE_API_KEY || '';
-  if (!apiKey) return res.status(401).json({ error: 'API key required' });
+app.get('/api/ai/generate-tags', async (req, res) => {
+  const apiKey = req.query.key || process.env.CLAUDE_API_KEY || '';
+  if (!apiKey) { res.status(401).json({ error: 'API key required' }); return; }
+
+  // SSE setup
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders();
+
+  const send = (data) => res.write(`data: ${JSON.stringify(data)}\n\n`);
+  const log = (level, msg) => send({ level, msg, ts: new Date().toISOString() });
+  const finish = (data) => { send({ type: 'done', ...data }); res.end(); };
 
   // Gather all models with creator names
   const models = db.prepare(`
@@ -863,17 +913,24 @@ app.post('/api/ai/generate-tags', async (req, res) => {
     ORDER BY c.name, m.name
   `).all();
 
-  if (models.length === 0) return res.json({ success: true, tagged: 0 });
+  if (models.length === 0) {
+    log('info', 'No models found to tag.');
+    return finish({ success: true, tagged: 0, total: 0 });
+  }
 
-  // Build a manifest for Claude — batch into chunks of 100 to avoid token limits
-  const BATCH_SIZE = 100;
+  log('info', `Found ${models.length} model(s) to tag`);
+
+  // Build a manifest for Claude — batch into chunks of 50 for better progress visibility
+  const BATCH_SIZE = 50;
   const batches = [];
   for (let i = 0; i < models.length; i += BATCH_SIZE) {
     batches.push(models.slice(i, i + BATCH_SIZE));
   }
 
-  const https = require('https');
+  log('info', `Split into ${batches.length} batch(es) of up to ${BATCH_SIZE}`);
+
   let totalTagged = 0;
+  let totalErrors = 0;
 
   const systemPrompt = `You are a tagging assistant for "The Vault", a 3D print model library.
 Given a list of 3D printable models with their names, creator names, and folder paths, generate up to 5 relevant tags per model.
@@ -891,7 +948,16 @@ Rules:
 Respond with ONLY a JSON array. Each element: {"id": <model_id>, "tags": ["tag1", "tag2", ...]}
 No other text or explanation — just the JSON array.`;
 
-  for (const batch of batches) {
+  for (let b = 0; b < batches.length; b++) {
+    const batch = batches[b];
+    const batchLabel = `Batch ${b + 1}/${batches.length}`;
+    const firstCreator = batch[0]?.creator_name || 'unknown';
+    const lastCreator = batch[batch.length - 1]?.creator_name || 'unknown';
+    const creatorRange = firstCreator === lastCreator ? firstCreator : `${firstCreator} → ${lastCreator}`;
+
+    log('info', `${batchLabel} — ${batch.length} models (${creatorRange})`);
+    log('api', `${batchLabel} — sending to Claude API…`);
+
     const manifest = batch.map(m => ({
       id: m.id,
       name: m.name,
@@ -901,65 +967,100 @@ No other text or explanation — just the JSON array.`;
 
     const userContent = `Tag these 3D models:\n\n${JSON.stringify(manifest, null, 1)}`;
 
-    const payload = JSON.stringify({
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 4096,
-      system: systemPrompt,
-      messages: [{ role: 'user', content: userContent }]
-    });
+    try {
+      const parsed = await callClaudeAPI(apiKey, {
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 4096,
+        system: systemPrompt,
+        messages: [{ role: 'user', content: userContent }]
+      }, { timeoutMs: 180000 }); // 3 min per batch
 
-    const result = await new Promise((resolve, reject) => {
-      const options = {
-        hostname: 'api.anthropic.com',
-        path: '/v1/messages',
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-api-key': apiKey,
-          'anthropic-version': '2023-06-01',
-          'Content-Length': Buffer.byteLength(payload)
-        }
-      };
+      const textBlocks = (parsed.content || []).filter(b => b.type === 'text');
+      const fullText = textBlocks.map(b => b.text).join('\n');
 
-      const apiReq = https.request(options, (apiRes) => {
-        let data = '';
-        apiRes.on('data', chunk => data += chunk);
-        apiRes.on('end', () => {
-          try {
-            const parsed = JSON.parse(data);
-            if (parsed.error) return reject(new Error(parsed.error.message));
-            const textBlocks = (parsed.content || []).filter(b => b.type === 'text');
-            const fullText = textBlocks.map(b => b.text).join('\n');
-            // Extract JSON array — may be wrapped in code fences
-            const jsonMatch = fullText.match(/\[[\s\S]*\]/);
-            if (jsonMatch) resolve(JSON.parse(jsonMatch[0]));
-            else reject(new Error('No JSON array in AI response'));
-          } catch (e) { reject(e); }
-        });
-      });
-
-      apiReq.on('error', reject);
-      apiReq.write(payload);
-      apiReq.end();
-    });
-
-    // Apply tags to DB
-    const updateStmt = db.prepare(`UPDATE models SET tags = ?, updated_at = datetime('now') WHERE id = ?`);
-    const applyBatch = db.transaction((tagResults) => {
-      for (const item of tagResults) {
-        if (!item.id || !Array.isArray(item.tags)) continue;
-        // Merge with existing tags
-        const existing = batch.find(m => m.id === item.id);
-        const existingTags = existing ? JSON.parse(existing.tags || '[]') : [];
-        const merged = [...new Set([...existingTags, ...item.tags.map(t => t.toLowerCase())])].slice(0, 5);
-        updateStmt.run(JSON.stringify(merged), item.id);
-        totalTagged++;
+      // Log token usage
+      if (parsed.usage) {
+        log('info', `${batchLabel} — API responded (${parsed.usage.input_tokens} in / ${parsed.usage.output_tokens} out tokens)`);
       }
-    });
-    applyBatch(result);
+
+      // Extract JSON array — may be wrapped in code fences
+      const jsonMatch = fullText.match(/\[[\s\S]*\]/);
+      if (!jsonMatch) {
+        log('error', `${batchLabel} — Claude didn't return a JSON array. Response preview: "${fullText.substring(0, 120)}…"`);
+        totalErrors++;
+        continue;
+      }
+
+      let result;
+      try {
+        result = JSON.parse(jsonMatch[0]);
+      } catch (parseErr) {
+        log('error', `${batchLabel} — couldn't parse JSON from Claude response: ${parseErr.message}`);
+        totalErrors++;
+        continue;
+      }
+
+      if (!Array.isArray(result)) {
+        log('error', `${batchLabel} — expected array but got ${typeof result}`);
+        totalErrors++;
+        continue;
+      }
+
+      log('info', `${batchLabel} — received tags for ${result.length} model(s), applying…`);
+
+      // Apply tags to DB
+      const updateStmt = db.prepare(`UPDATE models SET tags = ?, updated_at = datetime('now') WHERE id = ?`);
+      let batchTagged = 0;
+      const applyBatch = db.transaction((tagResults) => {
+        for (const item of tagResults) {
+          if (!item.id || !Array.isArray(item.tags)) continue;
+          const existing = batch.find(m => m.id === item.id);
+          const existingTags = existing ? JSON.parse(existing.tags || '[]') : [];
+          const merged = [...new Set([...existingTags, ...item.tags.map(t => t.toLowerCase())])].slice(0, 5);
+          updateStmt.run(JSON.stringify(merged), item.id);
+          batchTagged++;
+        }
+      });
+      applyBatch(result);
+      totalTagged += batchTagged;
+
+      // Show some example tags from this batch
+      const examples = result.slice(0, 3).map(r => {
+        const m = batch.find(bm => bm.id === r.id);
+        return `${m?.name || r.id}: [${r.tags.join(', ')}]`;
+      });
+      for (const ex of examples) {
+        log('tag', `  ${ex}`);
+      }
+      if (result.length > 3) log('tag', `  … and ${result.length - 3} more`);
+
+      log('success', `${batchLabel} — ✓ tagged ${batchTagged} models (${totalTagged} total so far)`);
+
+    } catch (e) {
+      log('error', `${batchLabel} — ✗ ${e.message}`);
+      totalErrors++;
+
+      // If it's an auth error, no point continuing
+      if (e.message.includes('Invalid API key') || e.message.includes('lacks permission')) {
+        log('error', 'Stopping — fix your API key and try again.');
+        return finish({ success: false, error: e.message, tagged: totalTagged, total: models.length });
+      }
+
+      // If rate limited, wait and retry
+      if (e.message.includes('Rate limited')) {
+        log('warn', 'Waiting 30s before retrying…');
+        await new Promise(r => setTimeout(r, 30000));
+        b--; // retry this batch
+        continue;
+      }
+    }
   }
 
-  res.json({ success: true, tagged: totalTagged, total: models.length });
+  const msg = totalErrors > 0
+    ? `Done with ${totalErrors} error(s) — tagged ${totalTagged} of ${models.length} models`
+    : `✓ All done — tagged ${totalTagged} of ${models.length} models`;
+  log(totalErrors > 0 ? 'warn' : 'success', msg);
+  finish({ success: true, tagged: totalTagged, total: models.length, errors: totalErrors });
 });
 
 // ── AI Image Finder (SSE) ────────────────────────────────────────────────────
@@ -992,7 +1093,6 @@ app.get('/api/ai/find-images', async (req, res) => {
 
   log('info', `Found ${models.length} model(s) without thumbnails`);
 
-  const https = require('https');
   let scraped = 0, failed = 0;
 
   for (let i = 0; i < models.length; i++) {
@@ -1016,49 +1116,24 @@ app.get('/api/ai/find-images', async (req, res) => {
     if (!sourceUrl) {
       log('search', `${label} — searching online…`);
       try {
-        const searchResult = await new Promise((resolve, reject) => {
-          const searchPrompt = `Find the download page for this 3D printable model:
+        const searchPrompt = `Find the download page for this 3D printable model:
 Model: "${model.name}"
 ${model.creator_name ? `Creator: "${model.creator_name}"` : ''}
 
 Search Printables, MyMiniFactory, Thingiverse, Cults3D, Patreon, and Gumroad.
 Return ONLY the most likely URL. No explanation, just the URL. If you cannot find it, reply with "NONE".`;
 
-          const payload = JSON.stringify({
-            model: 'claude-sonnet-4-20250514',
-            max_tokens: 256,
-            tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: 2 }],
-            messages: [{ role: 'user', content: searchPrompt }]
-          });
+        const parsed = await callClaudeAPI(apiKey, {
+          model: 'claude-sonnet-4-20250514',
+          max_tokens: 256,
+          tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: 2 }],
+          messages: [{ role: 'user', content: searchPrompt }]
+        }, { timeoutMs: 60000 });
 
-          const options = {
-            hostname: 'api.anthropic.com', path: '/v1/messages', method: 'POST',
-            headers: {
-              'Content-Type': 'application/json', 'x-api-key': apiKey,
-              'anthropic-version': '2023-06-01', 'Content-Length': Buffer.byteLength(payload)
-            }
-          };
-
-          const apiReq = https.request(options, (apiRes) => {
-            let data = '';
-            apiRes.on('data', chunk => data += chunk);
-            apiRes.on('end', () => {
-              try {
-                const parsed = JSON.parse(data);
-                if (parsed.error) return reject(new Error(parsed.error.message));
-                const textBlocks = (parsed.content || []).filter(b => b.type === 'text');
-                const text = textBlocks.map(b => b.text).join('\n').trim();
-                // Extract URL from response
-                const urlMatch = text.match(/https?:\/\/[^\s"<>]+/);
-                if (urlMatch && !text.includes('NONE')) resolve(urlMatch[0]);
-                else resolve(null);
-              } catch (e) { reject(e); }
-            });
-          });
-          apiReq.on('error', reject);
-          apiReq.write(payload);
-          apiReq.end();
-        });
+        const textBlocks = (parsed.content || []).filter(b => b.type === 'text');
+        const text = textBlocks.map(b => b.text).join('\n').trim();
+        const urlMatch = text.match(/https?:\/\/[^\s"<>]+/);
+        const searchResult = (urlMatch && !text.includes('NONE')) ? urlMatch[0] : null;
 
         if (searchResult) {
           sourceUrl = searchResult;
@@ -1072,6 +1147,18 @@ Return ONLY the most likely URL. No explanation, just the URL. If you cannot fin
         }
       } catch (e) {
         log('error', `${label} — search failed: ${e.message}`);
+        // If it's an auth error, no point continuing
+        if (e.message.includes('Invalid API key') || e.message.includes('lacks permission')) {
+          log('error', 'Stopping — fix your API key and try again.');
+          return done({ success: false, error: e.message, found: models.length, scraped, failed });
+        }
+        // If rate limited, wait and retry this model
+        if (e.message.includes('Rate limited')) {
+          log('warn', 'Rate limited — waiting 30s before retrying…');
+          await new Promise(r => setTimeout(r, 30000));
+          i--; // retry
+          continue;
+        }
         failed++;
         continue;
       }

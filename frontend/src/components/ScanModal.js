@@ -14,6 +14,8 @@ export default function ScanModal({ onClose, onScanComplete }) {
   const [findingImages, setFindingImages] = useState(false);
   const [apiKey, setApiKey] = useState(() => localStorage.getItem('claude_api_key') || '');
   const [showKey, setShowKey] = useState(false);
+  const [testingKey, setTestingKey] = useState(false);
+  const [keyStatus, setKeyStatus] = useState(null); // null | 'ok' | 'error'
   const esRef = useRef(null);
   const imgEsRef = useRef(null);
 
@@ -108,33 +110,57 @@ export default function ScanModal({ onClose, onScanComplete }) {
     connectToStream();
   };
 
-  const generateTags = async () => {
-    setTagging(true);
-    setTagResult(null);
-    setLines(l => [...l, { level: 'info', msg: 'Generating tags with Claude AI…', ts: new Date().toISOString() }]);
+  const testApiKey = async () => {
+    setTestingKey(true);
+    setKeyStatus(null);
     try {
-      const res = await fetch('/api/ai/generate-tags', {
+      const res = await fetch('/api/ai/test-key', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(apiKey && { 'x-claude-key': apiKey }),
-        },
+        headers: { 'Content-Type': 'application/json', ...(apiKey && { 'x-claude-key': apiKey }) },
       });
       const data = await res.json();
-      if (!res.ok) {
-        setLines(l => [...l, { level: 'error', msg: data.error || 'Tag generation failed', ts: new Date().toISOString() }]);
-        setTagResult({ success: false, error: data.error });
+      if (data.ok) {
+        setKeyStatus('ok');
+        setLines(l => [...l, { level: 'success', msg: `API key test: ${data.message}`, ts: new Date().toISOString() }]);
       } else {
-        setLines(l => [...l, { level: 'success', msg: `✓ Tagged ${data.tagged} of ${data.total} models`, ts: new Date().toISOString() }]);
-        setTagResult(data);
-        if (onScanComplete) onScanComplete(); // refresh gallery
+        setKeyStatus('error');
+        setLines(l => [...l, { level: 'error', msg: `API key test failed: ${data.error}`, ts: new Date().toISOString() }]);
       }
     } catch (e) {
-      setLines(l => [...l, { level: 'error', msg: e.message, ts: new Date().toISOString() }]);
-      setTagResult({ success: false, error: e.message });
+      setKeyStatus('error');
+      setLines(l => [...l, { level: 'error', msg: `API key test failed: ${e.message}`, ts: new Date().toISOString() }]);
     } finally {
-      setTagging(false);
+      setTestingKey(false);
     }
+  };
+
+  const tagEsRef = useRef(null);
+
+  const generateTags = () => {
+    setTagging(true);
+    setTagResult(null);
+
+    const keyParam = apiKey ? `?key=${encodeURIComponent(apiKey)}` : '';
+    const es = new EventSource(`/api/ai/generate-tags${keyParam}`);
+    tagEsRef.current = es;
+
+    es.onmessage = (e) => {
+      const data = JSON.parse(e.data);
+      if (data.type === 'done') {
+        setTagging(false);
+        setTagResult(data);
+        es.close();
+        if (onScanComplete) onScanComplete(); // refresh gallery
+      } else {
+        setLines(l => [...l, data]);
+      }
+    };
+
+    es.onerror = () => {
+      setLines(l => [...l, { level: 'error', msg: 'Tag generation connection lost — check the server logs', ts: new Date().toISOString() }]);
+      setTagging(false);
+      es.close();
+    };
   };
 
   const findImages = () => {
@@ -163,8 +189,8 @@ export default function ScanModal({ onClose, onScanComplete }) {
     };
   };
 
-  // Cleanup image finder SSE on unmount
-  useEffect(() => () => imgEsRef.current?.close(), []);
+  // Cleanup SSE connections on unmount
+  useEffect(() => () => { imgEsRef.current?.close(); tagEsRef.current?.close(); }, []);
 
   if (checking) {
     return (
@@ -234,9 +260,20 @@ export default function ScanModal({ onClose, onScanComplete }) {
             </button>
           </div>
           {apiKey && (
-            <span style={{ fontSize: 10, color: 'var(--green)', fontFamily: 'var(--font-mono)', whiteSpace: 'nowrap' }}>
-              ✓ saved
-            </span>
+            <button
+              onClick={testApiKey}
+              disabled={testingKey}
+              style={{
+                background: keyStatus === 'ok' ? 'rgba(76,175,125,0.15)' : keyStatus === 'error' ? 'rgba(207,114,114,0.15)' : 'rgba(255,255,255,0.05)',
+                border: `1px solid ${keyStatus === 'ok' ? 'rgba(76,175,125,0.4)' : keyStatus === 'error' ? 'rgba(207,114,114,0.4)' : 'rgba(255,255,255,0.1)'}`,
+                color: keyStatus === 'ok' ? 'var(--green)' : keyStatus === 'error' ? 'var(--red)' : 'var(--text-muted)',
+                fontSize: 10, fontFamily: 'var(--font-mono)', padding: '4px 8px',
+                borderRadius: 4, cursor: 'pointer', whiteSpace: 'nowrap',
+              }}
+              title="Test your API key against the Claude API"
+            >
+              {testingKey ? '…' : keyStatus === 'ok' ? '✓ works' : keyStatus === 'error' ? '✗ failed' : 'Test'}
+            </button>
           )}
         </div>
         <div className="modal-hint" style={{ marginTop: 2 }}>
