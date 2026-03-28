@@ -905,9 +905,9 @@ app.get('/api/ai/generate-tags', async (req, res) => {
   const log = (level, msg) => send({ level, msg, ts: new Date().toISOString() });
   const finish = (data) => { send({ type: 'done', ...data }); res.end(); };
 
-  // Gather all models with creator names
+  // Gather all models with creator names and slicer info
   const models = db.prepare(`
-    SELECT m.id, m.name, m.tags, m.folder_path, c.name as creator_name
+    SELECT m.id, m.name, m.tags, m.folder_path, m.has_chitubox, m.has_lychee, c.name as creator_name
     FROM models m LEFT JOIN creators c ON m.creator_id = c.id
     WHERE (m.hidden IS NULL OR m.hidden = 0)
     ORDER BY c.name, m.name
@@ -933,14 +933,16 @@ app.get('/api/ai/generate-tags', async (req, res) => {
   let totalErrors = 0;
 
   const systemPrompt = `You are a tagging assistant for "The Vault", a 3D print model library.
-Given a list of 3D printable models with their names, creator names, and folder paths, generate up to 5 relevant tags per model.
+Given a list of 3D printable models with their names, creator names, folder paths, and slicer format, generate up to 5 relevant tags per model.
 
 Rules:
 - Max 5 tags per model. Fewer is fine if there aren't 5 meaningful tags.
-- The creator name should ALWAYS be included as a tag (exactly as given).
+- The creator name should ALWAYS be included as a tag (exactly as given, lowercase).
 - Tags should be lowercase.
 - Tags should describe the model's franchise, category, character, or theme.
-- Examples: "star wars", "marvel", "thundercats", "dragon", "miniature", "terrain", "bust", "vehicle", "droid", "rebel", "empire", "fantasy", "sci-fi", "anime", "warhammer", "dnd"
+- If slicer is "resin" (Chitubox/Lychee files present), include "resin" as a tag.
+- If slicer is "fdm" (no resin slicer files), include "fdm" as a tag. This is important for filtering by print technology.
+- Examples: "star wars", "marvel", "thundercats", "dragon", "miniature", "terrain", "bust", "vehicle", "droid", "rebel", "empire", "fantasy", "sci-fi", "anime", "warhammer", "dnd", "resin", "fdm"
 - Use broad franchise tags (e.g. "star wars") AND specific tags (e.g. "rebel", "x-wing")
 - Use the folder path structure for context clues (e.g. "Star Wars/Vehicles/X-wing" → tags: ["star wars", "vehicle", "x-wing"])
 - If a model name suggests a known character or IP, tag appropriately (e.g. "Cheetara" → ["thundercats", "cheetara"])
@@ -962,7 +964,8 @@ No other text or explanation — just the JSON array.`;
       id: m.id,
       name: m.name,
       creator: m.creator_name,
-      path: m.folder_path.replace(/^\/library\/?/, '')
+      path: m.folder_path.replace(/^\/library\/?/, ''),
+      slicer: (m.has_chitubox || m.has_lychee) ? 'resin' : 'fdm'
     }));
 
     const userContent = `Tag these 3D models:\n\n${JSON.stringify(manifest, null, 1)}`;
