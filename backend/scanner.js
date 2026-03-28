@@ -382,6 +382,18 @@ async function scanLibrary(libraryPath, progressCallback, logger) {
 
   let modelsFound = 0, modelsAdded = 0, modelsUpdated = 0, modelsSkipped = 0;
 
+  // Clean up any creators/models from Synology system folders left over from earlier scans
+  const junkCreators = db.prepare(
+    `SELECT id, name FROM creators WHERE ${[...IGNORED_FOLDERS].map(() => 'name = ?').join(' OR ')}`
+  ).all(...IGNORED_FOLDERS);
+  if (junkCreators.length > 0) {
+    const junkIds = junkCreators.map(c => c.id);
+    const placeholders = junkIds.map(() => '?').join(',');
+    const deletedModels = db.prepare(`DELETE FROM models WHERE creator_id IN (${placeholders})`).run(...junkIds).changes;
+    const deletedCreators = db.prepare(`DELETE FROM creators WHERE id IN (${placeholders})`).run(...junkIds).changes;
+    log('info', `Cleaned up ${deletedCreators} system folder creator(s) and ${deletedModels} model(s) (${junkCreators.map(c => c.name).join(', ')})`);
+  }
+
   try {
     const allCreatorDirs = fs.readdirSync(libraryPath, { withFileTypes: true }).filter(d => d.isDirectory());
     const creatorDirs = allCreatorDirs.filter(d => !IGNORED_FOLDERS.has(d.name) && !isJunkFile(d.name));

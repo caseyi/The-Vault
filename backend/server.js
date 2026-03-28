@@ -327,7 +327,7 @@ app.get('/api/stats', (req, res) => {
 // ── Tags ──────────────────────────────────────────────────────────────────────
 
 app.get('/api/tags', (req, res) => {
-  const models = db.prepare('SELECT tags FROM models WHERE tags != \'[]\'').all();
+  const models = db.prepare('SELECT tags FROM models WHERE tags IS NOT NULL AND tags != \'[]\' AND tags != \'null\' AND tags != \'\'').all();
   const tagCount = {};
   for (const m of models) {
     try {

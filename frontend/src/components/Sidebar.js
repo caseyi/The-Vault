@@ -101,7 +101,7 @@ export default function Sidebar({ open, onToggle, stats, creators, tags, filters
 
             {/* Tag Cloud */}
             {tags && tags.length > 0 && (
-              <div className="sidebar-section" style={{ flex: 1, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
+              <div className="sidebar-section">
                 <div className="sidebar-section-label" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                   Tags
                   {activeTags.length > 0 && (
@@ -111,7 +111,7 @@ export default function Sidebar({ open, onToggle, stats, creators, tags, filters
                     </button>
                   )}
                 </div>
-                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, overflowY: 'auto', padding: '2px 0' }}>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, maxHeight: showAllTags ? 'none' : 160, overflowY: 'auto', padding: '2px 0' }}>
                   {(showAllTags ? tags : tags.slice(0, 30)).map(t => {
                     const isActive = activeTags.includes(t.tag);
                     return (
