@@ -1,7 +1,7 @@
 # The Vault — Project Specification
 
-**Version:** 0.1.0 (build auto-incremented via pre-commit hook)
-**Last Updated:** 2026-03-10
+**Version:** 0.2.0 (build auto-incremented via pre-commit hook)
+**Last Updated:** 2026-03-31
 **Maintainer:** Casey (caseyi@uw.edu)
 **Repository:** github.com/caseyi/stlvault
 **Host:** Synology NAS "Dagobah"
@@ -20,6 +20,9 @@ The Vault is a self-hosted 3D print library manager designed to run on a Synolog
 - **Model detail:** Full metadata view, thumbnail management, STL 3D preview, file listing by release
 - **Print status tracking:** Per-model lifecycle (unprinted → sliced → printing → printed → painted → failed)
 - **AI assistant:** Claude-powered tag suggestions, organization advice, print notes, and **web search** for finding model sources online
+- **AI batch tagging:** Auto-generate up to 5 tags per model (creator name, franchise, category, FDM/resin) via Claude Sonnet, streamed per-batch via SSE
+- **AI image finder:** Smart matchability scoring + trial mode — finds and scrapes images for models without thumbnails, skipping low-confidence candidates
+- **Tag cloud:** Clickable tag chips in sidebar with AND-logic filtering
 - **Render archive hints:** Creator-level and model-level wildcard patterns for identifying render archives (ZIP + RAR)
 - **Junk file filtering:** Automatically skips Synology metadata (@SynoEAStream, @SynoResource), macOS (._*, .DS_Store), and Windows (Thumbs.db) junk files
 - **Scan persistence:** Scan progress survives page reloads — reconnects to running scan via SSE
@@ -214,6 +217,15 @@ try { db.exec(`ALTER TABLE tablename ADD COLUMN col_name TYPE DEFAULT val`); } c
 |---|---|---|
 | POST | `/api/ai/assist` | Proxy to Claude API. Body: `{ modelId, action?, userMessage?, history[] }`. Requires `x-claude-key` header. |
 | POST | `/api/ai/search` | Web search via Claude with `web_search` tool. Body: `{ modelId?, query? }`. Returns `{ text, results[], citations[] }`. Requires `x-claude-key` header. |
+| GET | `/api/ai/generate-tags` | **SSE** — Batch AI tagging. Query: `key` (API key). Batches models in groups of 50, streams per-batch progress with token usage, example tags, hit rate. Auto-retries rate limits, stops on auth errors. |
+| GET | `/api/ai/find-images` | **SSE** — AI image finder. Query: `key`, `trial` (default `1`). Scores models by matchability, skips poor candidates (<20 pts), processes trial batch of 10 first. Streams per-model progress with confidence indicators. |
+| POST | `/api/ai/test-key` | Quick API key validation. Requires `x-claude-key` header. Returns `{ ok, model, usage, message }`. |
+
+### Tags
+
+| Method | Path | Description |
+|---|---|---|
+| GET | `/api/tags` | List all tags with counts, sorted by frequency. Excludes NULL, empty, and `'[]'` entries. |
 
 ### Health & Version
 
@@ -261,7 +273,11 @@ The scanner supports both flat and deeply nested folder structures:
         dragon.stl
 ```
 
-Level 1 dirs are always **creators**. Below that, the `discoverModelFolders()` function recursively walks directories until it finds folders containing printable files (STL, ZIP, RAR, slicer files, gcode). Folders that only contain subdirectories are treated as categories and traversed further. Maximum recursion depth: 5 levels.
+**Pass-through detection:** If a top-level folder contains ONLY subdirectories (no printable files), it's treated as a library root (e.g., "STL Archive") and its children become the creators. This handles the Docker mount pattern `/volume1/STL Archive:/library/STL Archive:ro` where scanning `/library` would otherwise attribute everything to "STL Archive".
+
+Below the creator level, the `discoverModelFolders()` function recursively walks directories until it finds folders containing printable files (STL, ZIP, RAR, slicer files, gcode). Folders that only contain subdirectories are treated as categories and traversed further. Maximum recursion depth: 5 levels.
+
+**Transaction chunking:** Models are processed in transaction batches of 10 with `setImmediate()` yields between batches, allowing SSE progress to stream in real time (better-sqlite3 transactions are synchronous and block the event loop).
 
 Nested models get breadcrumb-style names: `"Star Wars / Vehicles / X-wing"`.
 
@@ -358,6 +374,8 @@ Supported archive formats: `.zip` (via adm-zip), `.rar` (via node-unrar-js, pure
 - Library stats display (total models, status breakdown)
 - Status filter buttons
 - Show Hidden toggle (appears when hidden models exist)
+- Has Thumbnail filter toggle with count
+- **Tag cloud:** Clickable chips sorted by frequency (first 30, expandable), AND-logic filtering, CLEAR button
 - Creator list with model counts
 - Render hint ⚙ config button per creator
 - Scan library button
@@ -367,8 +385,11 @@ Supported archive formats: `.zip` (via adm-zip), `.rar` (via node-unrar-js, pure
 
 - Path input (defaults to library path)
 - Force full rescan checkbox
+- **API key input** with show/hide toggle, saved to localStorage, "Test" button for validation
 - SSE-connected progress display via TaskLog
 - **Scan persistence:** On mount, checks `/api/scan/status` and auto-reconnects to running scan
+- **Generate Tags** button — SSE-streamed AI batch tagging with per-batch progress
+- **Find Images (trial 10)** button — AI image finder with matchability scoring, trial mode, "Continue All" after trial
 - Shows "Checking scan status…" loading state while detecting state
 - Start/close controls
 
@@ -422,7 +443,7 @@ Supported archive formats: `.zip` (via adm-zip), `.rar` (via node-unrar-js, pure
 
 ```nginx
 # SSE endpoints — streaming proxy
-location ~ /api/(scan/stream|models/\d+/scrape-stream|creators/\d+/reextract) {
+location ~ /api/(scan/stream|models/\d+/scrape-stream|creators/\d+/reextract|ai/generate-tags|ai/find-images) {
     proxy_pass http://backend:3001;
     proxy_http_version 1.1;
     proxy_set_header Host $host;
@@ -476,7 +497,7 @@ Rollback: `./update.sh rollback` re-tags `:rollback` as `:latest` and restarts.
 
 ### Version Tracking
 
-`backend/version.json` contains `{"version": "0.1.0", "build": N}` where the build number auto-increments on every git commit via a `.git/hooks/pre-commit` hook. The version is:
+`backend/version.json` contains `{"version": "0.2.0", "build": N}` where the build number auto-increments on every git commit via a `.git/hooks/pre-commit` hook. The version is:
 - Displayed in the sidebar footer
 - Returned by `/api/health`
 - Logged at server startup
@@ -542,19 +563,20 @@ Creates directory structure, downloads `docker-compose.yml`, runs initial pull a
 ```
 stlvault/
 ├── .gitignore
+├── CLAUDE.md                # AI assistant context file
 ├── SPEC.md                  # This file
 ├── backend/
 │   ├── Dockerfile
 │   ├── package.json
 │   ├── version.json         # Auto-incremented build number
 │   ├── db.js                # Schema + migrations
-│   ├── server.js            # Express API (~860 lines)
-│   ├── scanner.js           # Library indexer (~475 lines)
+│   ├── server.js            # Express API (~1296 lines)
+│   ├── scanner.js           # Library indexer (~556 lines)
 │   ├── scraper.js           # Web scraper (~258 lines)
 │   └── tests/
-│       ├── scanner.test.js  # 69 tests (utility + discovery)
-│       ├── api.test.js      # API endpoint tests
-│       └── scraper.test.js  # Scraper tests
+│       ├── scanner.test.js  # 47 tests (utility + discovery)
+│       ├── api.test.js      # 17 tests (API endpoints)
+│       └── scraper.test.js  # 7 tests (web scrapers)
 ├── frontend/
 │   ├── Dockerfile
 │   ├── package.json
@@ -562,13 +584,13 @@ stlvault/
 │   └── src/
 │       ├── App.js
 │       ├── App.test.js
-│       ├── App.css           # All styles (~777 lines)
+│       ├── App.css           # All styles (~776 lines)
 │       ├── index.js
 │       ├── pages/
 │       │   ├── Gallery.js
 │       │   ├── Gallery.test.js    # 13 tests
-│       │   ├── ModelDetail.js
-│       │   └── ModelDetail.test.js # 15 tests
+│       │   ├── ModelDetail.js     # (~425 lines)
+│       │   └── ModelDetail.test.js # 14 tests
 │       └── components/
 │           ├── Sidebar.js
 │           ├── Sidebar.test.js
@@ -589,15 +611,15 @@ stlvault/
 
 ## 12. Test Suite
 
-**112 tests total** (69 backend + 43 frontend)
+**118 tests total** (71 backend + 47 frontend)
 
 ### Backend Tests (Jest)
 
 | File | Tests | Coverage |
 |---|---|---|
-| scanner.test.js | 69 | matchesHint, pickRenderArchives, analyzeFolder, inferReleaseName, discoverModelFolders |
-| api.test.js | — | API endpoint integration tests |
-| scraper.test.js | — | Web scraper tests |
+| scanner.test.js | 47 | matchesHint, pickRenderArchives, analyzeFolder, inferReleaseName, discoverModelFolders |
+| api.test.js | 17 | API endpoint integration tests |
+| scraper.test.js | 7 | Web scraper tests |
 
 Run: `cd backend && npx jest`
 
@@ -606,9 +628,9 @@ Run: `cd backend && npx jest`
 | File | Tests | Coverage |
 |---|---|---|
 | Gallery.test.js | 13 | Cards, count, empty state, badges, click, search, bulk, hidden |
-| ModelDetail.test.js | 15 | Loading, metadata, status, tags, notes, images, save, Claude, hide |
-| Sidebar.test.js | — | Sidebar rendering and filters |
-| App.test.js | — | Root component rendering |
+| ModelDetail.test.js | 14 | Loading, metadata, status, tags, notes, images, save, Claude, hide |
+| Sidebar.test.js | 15 | Sidebar rendering, filters, tag cloud |
+| App.test.js | 5 | Root component rendering |
 
 Run: `cd frontend && npx react-scripts test --watchAll=false`
 

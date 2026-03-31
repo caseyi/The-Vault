@@ -56,6 +56,11 @@ and prints the URL when it's done.
 Files inside each release folder are grouped by release name in the UI.
 ZIPs named with "render/preview/photo" keywords are auto-extracted for images.
 
+The scanner supports deeply nested archive structures too (e.g., `Creator/Category/Subcategory/Model`
+up to 5 levels deep). If your Docker mount places creators under a root folder like
+`/volume1/STL Archive`, the scanner auto-detects this "pass-through" directory and treats
+its children as the real creators.
+
 ---
 
 ## Development (local build)
@@ -86,6 +91,28 @@ at `.github/workflows/docker-publish.yml`, which:
 3. Also tags each image with `sha-<commit>` for rollback
 
 The images are public and require no authentication to pull.
+
+---
+
+## AI features (Claude API)
+
+The Vault integrates with the Claude API (Anthropic) for smart library management.
+Enter your API key in the Scan modal — it's stored in your browser's localStorage and
+never saved on the server.
+
+**Batch auto-tagging** — Generates up to 5 tags per model (creator, franchise, category,
+FDM/resin) by analysing folder names, file types, and slicer presence. Streams progress
+in real time via SSE. Models with resin slicer files (Chitubox, Lychee) are tagged "resin";
+models with FDM slicer files are tagged "fdm".
+
+**Image finder** — Scores each model's "matchability" based on available metadata
+(source URL, creator name, folder naming patterns) and uses Claude with web search
+to find missing thumbnails. Trial mode processes the top 10 candidates first so you
+can check hit rate before spending more credits.
+
+**Per-model assistant** — Chat with Claude about any model. Quick actions include
+"Find Online" (web search across Printables, MMF, Thingiverse, Cults3D), tag suggestions,
+print notes, and organization advice.
 
 ---
 
