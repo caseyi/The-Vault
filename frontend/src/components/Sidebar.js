@@ -111,7 +111,7 @@ export default function Sidebar({ open, onToggle, stats, creators, tags, filters
                     </button>
                   )}
                 </div>
-                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, maxHeight: showAllTags ? 'none' : 160, overflowY: 'auto', padding: '2px 0' }}>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, maxHeight: showAllTags ? 400 : 160, overflowY: 'auto', padding: '2px 0' }}>
                   {(showAllTags ? tags : tags.slice(0, 30)).map(t => {
                     const isActive = activeTags.includes(t.tag);
                     return (

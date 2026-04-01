@@ -933,10 +933,10 @@ app.get('/api/ai/generate-tags', async (req, res) => {
   let totalErrors = 0;
 
   const systemPrompt = `You are a tagging assistant for "The Vault", a 3D print model library.
-Given a list of 3D printable models with their names, creator names, folder paths, and slicer format, generate up to 5 relevant tags per model.
+Given a list of 3D printable models with their names, creator names, folder paths, and slicer format, generate up to 7 relevant tags per model.
 
 Rules:
-- Max 5 tags per model. Fewer is fine if there aren't 5 meaningful tags.
+- Max 7 tags per model. Fewer is fine if there aren't 7 meaningful tags.
 - The creator name should ALWAYS be included as a tag (exactly as given, lowercase).
 - Tags should be lowercase.
 - Tags should describe the model's franchise, category, character, or theme.
@@ -1019,7 +1019,7 @@ No other text or explanation — just the JSON array.`;
           if (!item.id || !Array.isArray(item.tags)) continue;
           const existing = batch.find(m => m.id === item.id);
           const existingTags = existing ? JSON.parse(existing.tags || '[]') : [];
-          const merged = [...new Set([...existingTags, ...item.tags.map(t => t.toLowerCase())])].slice(0, 5);
+          const merged = [...new Set([...existingTags, ...item.tags.map(t => t.toLowerCase())])].slice(0, 7);
           updateStmt.run(JSON.stringify(merged), item.id);
           batchTagged++;
         }

@@ -408,7 +408,6 @@ async function scanLibrary(libraryPath, progressCallback, logger) {
       for (const dir of dirs) {
         const dirPath = path.join(basePath, dir.name);
         const entries = fs.readdirSync(dirPath, { withFileTypes: true }).filter(e => !IGNORED_FOLDERS.has(e.name) && !isJunkFile(e.name));
-        const hasFiles = entries.some(e => !e.isDirectory());
         const hasPrintableFiles = entries.some(e => {
           if (e.isDirectory()) return false;
           const ext = path.extname(e.name).toLowerCase();
@@ -416,9 +415,10 @@ async function scanLibrary(libraryPath, progressCallback, logger) {
         });
         const childDirs = entries.filter(e => e.isDirectory());
 
-        // If this folder has NO printable files and ONLY subdirectories,
-        // treat it as a pass-through — its children are the real creators
-        if (!hasPrintableFiles && childDirs.length > 0 && !hasFiles) {
+        // If this folder has NO printable files and has subdirectories,
+        // treat it as a pass-through — its children are the real creators.
+        // Non-printable files (READMEs, images, etc.) don't disqualify it.
+        if (!hasPrintableFiles && childDirs.length > 0) {
           log('info', `"${dir.name}" looks like a library root — using its ${childDirs.length} subfolder(s) as creators`);
           for (const child of childDirs) {
             results.push({ name: child.name, path: path.join(dirPath, child.name) });
