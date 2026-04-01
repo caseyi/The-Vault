@@ -270,15 +270,15 @@ body {
 
 .model-card-img {
   width: 100%;
-  aspect-ratio: 1;
-  object-fit: cover;
+  aspect-ratio: 4/3;
+  object-fit: contain;
   background: var(--bg3);
   display: block;
 }
 
 .model-card-no-img {
   width: 100%;
-  aspect-ratio: 1;
+  aspect-ratio: 4/3;
   background: var(--bg3);
   display: flex;
   align-items: center;
@@ -406,7 +406,7 @@ body {
 .detail-main-img {
   width: 100%;
   aspect-ratio: 4/3;
-  object-fit: cover;
+  object-fit: contain;
   display: block;
   background: var(--bg3);
 }
