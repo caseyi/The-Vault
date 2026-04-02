@@ -5,6 +5,7 @@ const fs = require('fs');
 const db = require('./db');
 const { scanLibrary, LIBRARY_PATH, matchesHint, pickRenderArchives, analyzeFolder, inferReleaseName } = require('./scanner');
 const { scrapeImagesFromUrl, detectUrlFromFolderName } = require('./scraper');
+const organizeRouter = require('./organize');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -15,8 +16,9 @@ let APP_VERSION = { version: '0.0.0', build: 0 };
 try { APP_VERSION = JSON.parse(fs.readFileSync(path.join(__dirname, 'version.json'), 'utf8')); } catch {}
 
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
 app.use('/images', express.static(IMAGES_DIR));
+app.use('/api/organize', organizeRouter);
 
 // ── Scan ──────────────────────────────────────────────────────────────────────
 
@@ -664,7 +666,7 @@ ${context || ''}`;
   try {
     const apiKey = req.headers['x-claude-key'] || process.env.CLAUDE_API_KEY || '';
     const parsed = await callClaudeAPI(apiKey, {
-      model: 'claude-sonnet-4-20250514',
+      model: process.env.CLAUDE_MODEL || 'claude-haiku-4-5-20251001',
       max_tokens: 1024,
       system: systemPrompt,
       messages
@@ -746,7 +748,7 @@ Search for this model and provide download/purchase links.`;
 
   try {
     const parsed = await callClaudeAPI(apiKey, {
-      model: 'claude-sonnet-4-20250514',
+      model: process.env.CLAUDE_MODEL || 'claude-haiku-4-5-20251001',
       max_tokens: 2048,
       system: systemPrompt,
       tools: [{
@@ -872,7 +874,7 @@ app.post('/api/ai/test-key', async (req, res) => {
 
   try {
     const parsed = await callClaudeAPI(apiKey, {
-      model: 'claude-sonnet-4-20250514',
+      model: process.env.CLAUDE_MODEL || 'claude-haiku-4-5-20251001',
       max_tokens: 32,
       messages: [{ role: 'user', content: 'Reply with just the word "ok".' }]
     }, { timeoutMs: 15000 });
@@ -972,7 +974,7 @@ No other text or explanation — just the JSON array.`;
 
     try {
       const parsed = await callClaudeAPI(apiKey, {
-        model: 'claude-sonnet-4-20250514',
+        model: process.env.CLAUDE_MODEL || 'claude-haiku-4-5-20251001',
         max_tokens: 4096,
         system: systemPrompt,
         messages: [{ role: 'user', content: userContent }]
@@ -1194,7 +1196,7 @@ Search Printables, MyMiniFactory, Thingiverse, Cults3D, Patreon, and Gumroad.
 Return ONLY the most likely URL. No explanation, just the URL. If you cannot find it, reply with "NONE".`;
 
         const parsed = await callClaudeAPI(apiKey, {
-          model: 'claude-sonnet-4-20250514',
+          model: process.env.CLAUDE_MODEL || 'claude-haiku-4-5-20251001',
           max_tokens: 256,
           tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: 2 }],
           messages: [{ role: 'user', content: searchPrompt }]

@@ -3,6 +3,7 @@ import Gallery from './pages/Gallery';
 import ModelDetail from './pages/ModelDetail';
 import Sidebar from './components/Sidebar';
 import ScanModal from './components/ScanModal';
+import OrganizeModal from './components/OrganizeModal';
 import './App.css';
 
 const API = '';
@@ -15,6 +16,7 @@ export default function App() {
   const [filters, setFilters] = useState({ search: '', creator: '', status: '', tags: '', has_thumbnail: false })
   const [tags, setTags] = useState([]);
   const [showScan, setShowScan] = useState(false);
+  const [showOrganize, setShowOrganize] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [showHidden, setShowHidden] = useState(false);
   const [appVersion, setAppVersion] = useState(null);
@@ -56,6 +58,7 @@ export default function App() {
         filters={filters}
         onFilterChange={setFilters}
         onScanClick={() => setShowScan(true)}
+        onOrganizeClick={() => setShowOrganize(true)}
         onHomeClick={closeModel}
         showHidden={showHidden}
         onToggleHidden={() => setShowHidden(h => !h)}
@@ -84,6 +87,11 @@ export default function App() {
         <ScanModal
           onClose={() => { setShowScan(false); fetchStats(); setRefreshKey(k => k + 1); }}
           onScanComplete={() => { fetchStats(); setRefreshKey(k => k + 1); }}
+        />
+      )}
+      {showOrganize && (
+        <OrganizeModal
+          onClose={() => { setShowOrganize(false); fetchStats(); }}
         />
       )}
     </div>

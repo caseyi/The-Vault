@@ -11,7 +11,7 @@ const STATUS_OPTIONS = [
   { value: 'failed', label: 'Failed', dot: '#cf7272' },
 ];
 
-export default function Sidebar({ open, onToggle, stats, creators, tags, filters, onFilterChange, onScanClick, onHomeClick, showHidden, onToggleHidden, appVersion }) {
+export default function Sidebar({ open, onToggle, stats, creators, tags, filters, onFilterChange, onScanClick, onOrganizeClick, onHomeClick, showHidden, onToggleHidden, appVersion }) {
   const [hintCreator, setHintCreator] = useState(null); // { id, name, render_zip_hint }
   const [showAllTags, setShowAllTags] = useState(false);
 
@@ -188,6 +188,7 @@ export default function Sidebar({ open, onToggle, stats, creators, tags, filters
             </div>
 
             <button className="scan-btn" onClick={onScanClick}>⟳ SCAN LIBRARY</button>
+            <button className="scan-btn" onClick={onOrganizeClick} style={{ background: 'rgba(193,127,58,0.12)', color: 'var(--accent)', marginTop: 4 }}>🗂 ORGANIZE</button>
             {appVersion && (
               <div style={{ padding: '8px 16px', fontFamily: 'var(--font-mono)', fontSize: 9, color: 'var(--text-faint)', letterSpacing: 1, textAlign: 'center' }}>
                 v{appVersion}
@@ -199,6 +200,7 @@ export default function Sidebar({ open, onToggle, stats, creators, tags, filters
         {!open && (
           <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '16px', padding: '16px 0' }}>
             <button onClick={onScanClick} title="Scan Library" style={{ background: 'none', border: 'none', color: 'var(--accent)', cursor: 'pointer', fontSize: '18px' }}>⟳</button>
+            <button onClick={onOrganizeClick} title="Organize Library" style={{ background: 'none', border: 'none', color: 'var(--accent)', cursor: 'pointer', fontSize: '18px' }}>🗂</button>
             <button onClick={onHomeClick} title="Gallery" style={{ background: 'none', border: 'none', color: 'var(--text-muted)', cursor: 'pointer', fontSize: '16px' }}>⊞</button>
           </div>
         )}

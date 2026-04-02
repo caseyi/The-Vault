@@ -31,6 +31,10 @@ services:
       - LIBRARY_PATH=/library
       - DB_PATH=/data/vault.db
       - IMAGES_DIR=/data/images
+      # Claude API key — loaded from .env file (never commit that file)
+      - CLAUDE_API_KEY=${CLAUDE_API_KEY}
+      # Optional: override the Claude model used for AI features (default: claude-haiku-4-5-20251001)
+      # - CLAUDE_MODEL=claude-haiku-4-5-20251001
 
   frontend:
     image: ghcr.io/caseyi/stlvault-frontend:latest
