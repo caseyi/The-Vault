@@ -3,7 +3,7 @@ import React, { useState, useRef, useEffect, useCallback } from 'react';
 // ── shared helpers ────────────────────────────────────────────────────────────
 
 function getApiKey() {
-  return localStorage.getItem('vault_claude_key') || '';
+  return localStorage.getItem('claude_api_key') || '';
 }
 
 function ModalOverlay({ onClose, children }) {

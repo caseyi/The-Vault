@@ -780,7 +780,7 @@ body {
 .organize-overlay {
   position: fixed;
   inset: 0;
-  background: rgba(0,0,0,0.72);
+  background: rgba(0,0,0,0.85);
   z-index: 500;
   display: flex;
   align-items: center;
@@ -789,7 +789,7 @@ body {
 }
 
 .organize-modal {
-  background: var(--bg-card);
+  background: var(--bg2, #141417);
   border: 1px solid var(--border-bright);
   border-radius: 10px;
   width: 680px;
@@ -798,7 +798,7 @@ body {
   display: flex;
   flex-direction: column;
   overflow: hidden;
-  box-shadow: 0 24px 64px rgba(0,0,0,0.7);
+  box-shadow: 0 24px 64px rgba(0,0,0,0.9);
 }
 
 .org-header {
