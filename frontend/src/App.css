@@ -1324,3 +1324,166 @@ body {
   text-transform: uppercase;
   margin-bottom: 12px;
 }
+
+/* ── Unpack (Loose File Grouper) Tab ─────────────────────────────────────── */
+.org-loose-summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 12px;
+  margin-bottom: 12px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+.org-loose-stat { color: var(--text); }
+.org-loose-stat b { color: var(--accent); }
+.org-loose-stat-sep { color: var(--text-faint); }
+.org-loose-stat-existing {
+  margin-left: auto;
+  color: var(--text-muted);
+}
+.org-loose-groups {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 340px;
+  overflow-y: auto;
+  margin-bottom: 4px;
+}
+.org-loose-group {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg3);
+  overflow: hidden;
+}
+.org-loose-group.org-loose-conflict {
+  border-color: #c17f3a55;
+}
+.org-loose-group-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  cursor: pointer;
+  user-select: none;
+}
+.org-loose-group-header:hover { background: rgba(255,255,255,0.04); }
+.org-loose-expand {
+  font-size: 9px;
+  color: var(--text-faint);
+  width: 10px;
+  flex-shrink: 0;
+}
+.org-loose-group-name {
+  flex: 1;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.org-loose-name-input {
+  flex: 1;
+  background: var(--bg4);
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  color: var(--text);
+  font-size: 13px;
+  padding: 2px 6px;
+  font-family: var(--font-body);
+}
+.org-loose-file-count {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-faint);
+  flex-shrink: 0;
+}
+.org-loose-conflict-badge {
+  font-size: 10px;
+  color: var(--warning);
+  font-family: var(--font-mono);
+  flex-shrink: 0;
+}
+.org-loose-rename-btn {
+  background: none;
+  border: none;
+  color: var(--text-faint);
+  cursor: pointer;
+  font-size: 12px;
+  padding: 0 2px;
+  flex-shrink: 0;
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+.org-loose-group-header:hover .org-loose-rename-btn { opacity: 1; }
+.org-loose-rename-btn:hover { color: var(--accent); }
+.org-loose-files {
+  border-top: 1px solid var(--border);
+  padding: 4px 10px 6px 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.org-loose-file {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 0;
+}
+.org-loose-filename {
+  flex: 1;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.org-loose-remove-btn {
+  background: none;
+  border: none;
+  color: var(--text-faint);
+  cursor: pointer;
+  font-size: 10px;
+  padding: 0 2px;
+  flex-shrink: 0;
+  opacity: 0;
+}
+.org-loose-file:hover .org-loose-remove-btn { opacity: 1; }
+.org-loose-remove-btn:hover { color: var(--error); }
+
+/* Script output panel */
+.org-loose-script-panel {
+  margin-top: 16px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.org-loose-script-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  background: var(--bg3);
+  border-bottom: 1px solid var(--border);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-muted);
+  gap: 8px;
+}
+.org-loose-script {
+  background: #0a0a0c;
+  color: #8ec07c;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.6;
+  padding: 12px 14px;
+  margin: 0;
+  max-height: 280px;
+  overflow-y: auto;
+  white-space: pre;
+}

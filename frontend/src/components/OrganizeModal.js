@@ -1085,12 +1085,250 @@ function BatchTab() {
 
 // ── Main OrganizeModal ────────────────────────────────────────────────────────
 
+// ── Loose File Grouper tab ────────────────────────────────────────────────────
+
+function LooseTab() {
+  const [creators, setCreators] = useState([]);
+  const [creatorId, setCreatorId] = useState('');
+  const [manualPath, setManualPath] = useState('');
+  const [scanning, setScanning] = useState(false);
+  const [scanResult, setScanResult] = useState(null); // { path, groups, existingFolders, looseFileCount }
+  const [groups, setGroups] = useState([]); // editable copy of groups
+  const [editingIdx, setEditingIdx] = useState(null);
+  const [editName, setEditName] = useState('');
+  const [expanded, setExpanded] = useState(new Set());
+  const [scriptResult, setScriptResult] = useState(null); // { script, summary, errors }
+  const [executing, setExecuting] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    fetch('/api/creators').then(r => r.json()).then(setCreators).catch(() => {});
+  }, []);
+
+  // Resolve path: creator folder_path or manual override
+  const activePath = (() => {
+    if (manualPath.trim()) return manualPath.trim();
+    const c = creators.find(c => String(c.id) === creatorId);
+    return c?.folder_path || '';
+  })();
+
+  const scan = async () => {
+    if (!activePath) { setError('Select a creator or enter a folder path'); return; }
+    setError(''); setScanResult(null); setScriptResult(null); setGroups([]);
+    setScanning(true);
+    try {
+      const res = await fetch(`/api/organize/loose-files?path=${encodeURIComponent(activePath)}`);
+      const d = await res.json();
+      if (!res.ok) { setError(d.error || `Error ${res.status}`); setScanning(false); return; }
+      setScanResult(d);
+      setGroups(d.groups.map(g => ({ name: g.suggestedName, files: g.files, conflicts: g.conflicts })));
+      setExpanded(new Set()); // collapse all by default
+    } catch (e) { setError(e.message); }
+    setScanning(false);
+  };
+
+  const renameGroup = (idx, newName) => {
+    setGroups(gs => gs.map((g, i) => i === idx ? { ...g, name: newName } : g));
+  };
+
+  const removeFileFromGroup = (gIdx, fileIdx) => {
+    setGroups(gs => gs.map((g, i) => {
+      if (i !== gIdx) return g;
+      const files = g.files.filter((_, fi) => fi !== fileIdx);
+      return { ...g, files };
+    }).filter(g => g.files.length > 0));
+  };
+
+  const toggleExpanded = (idx) => {
+    setExpanded(ex => {
+      const next = new Set(ex);
+      next.has(idx) ? next.delete(idx) : next.add(idx);
+      return next;
+    });
+  };
+
+  const generateScript = async (dryRun = true) => {
+    setError(''); setScriptResult(null);
+    if (dryRun) setScanning(true); else setExecuting(true);
+    try {
+      const res = await fetch('/api/organize/group-files', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: activePath, groups, dryRun }),
+      });
+      const d = await res.json();
+      if (!res.ok) { setError(d.error || `Error ${res.status}`); }
+      else { setScriptResult(d); }
+    } catch (e) { setError(e.message); }
+    if (dryRun) setScanning(false); else setExecuting(false);
+  };
+
+  const copyScript = () => {
+    if (!scriptResult?.script) return;
+    navigator.clipboard.writeText(scriptResult.script).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    }).catch(() => {});
+  };
+
+  const totalFiles = groups.reduce((s, g) => s + g.files.length, 0);
+
+  return (
+    <div className="org-tab-body">
+      {/* ── Step 1: Pick folder ── */}
+      <div className="org-section-title">📂 UNPACK LOOSE FILES</div>
+      <p className="org-hint">
+        Finds loose files in a creator folder and groups them into model subfolders.
+        Useful after bulk-downloading from Gumroad or Google Drive.
+      </p>
+
+      <div style={{ display: 'flex', gap: 8, marginBottom: 8, alignItems: 'flex-end' }}>
+        <div style={{ flex: 1 }}>
+          <label className="org-label">Creator (auto-fills path)</label>
+          <select className="org-select" value={creatorId} onChange={e => { setCreatorId(e.target.value); setManualPath(''); }}>
+            <option value="">— pick a creator —</option>
+            {creators.filter(c => c.folder_path).map(c => (
+              <option key={c.id} value={c.id}>{c.name} ({c.model_count} models)</option>
+            ))}
+          </select>
+        </div>
+      </div>
+      <div style={{ marginBottom: 12 }}>
+        <label className="org-label">…or enter a folder path directly</label>
+        <input
+          className="org-input"
+          placeholder="/library/STL Archive/CA 3D"
+          value={manualPath}
+          onChange={e => { setManualPath(e.target.value); setCreatorId(''); }}
+        />
+      </div>
+      {activePath && <div className="org-hint" style={{ marginBottom: 8 }}>Path: <code style={{ color: 'var(--accent)' }}>{activePath}</code></div>}
+
+      <button className="org-btn org-btn-primary" onClick={scan} disabled={scanning || !activePath} style={{ marginBottom: 16 }}>
+        {scanning ? '⏳ Scanning…' : '🔍 Scan for Loose Files'}
+      </button>
+
+      {error && <div className="org-error">{error}</div>}
+
+      {/* ── Results ── */}
+      {scanResult && (
+        <>
+          <div className="org-loose-summary">
+            <span className="org-loose-stat"><b>{scanResult.looseFileCount}</b> loose files</span>
+            <span className="org-loose-stat-sep">→</span>
+            <span className="org-loose-stat"><b>{groups.length}</b> proposed groups</span>
+            {scanResult.existingFolders.length > 0 && (
+              <span className="org-loose-stat-existing">{scanResult.existingFolders.length} existing folders</span>
+            )}
+          </div>
+
+          {groups.length === 0 && (
+            <div className="org-empty">No loose files found — folder is already organized.</div>
+          )}
+
+          <div className="org-loose-groups">
+            {groups.map((g, idx) => (
+              <div key={idx} className={`org-loose-group ${g.conflicts ? 'org-loose-conflict' : ''}`}>
+                <div className="org-loose-group-header" onClick={() => toggleExpanded(idx)}>
+                  <span className="org-loose-expand">{expanded.has(idx) ? '▼' : '▶'}</span>
+                  {editingIdx === idx ? (
+                    <input
+                      className="org-loose-name-input"
+                      value={editName}
+                      autoFocus
+                      onClick={e => e.stopPropagation()}
+                      onChange={e => setEditName(e.target.value)}
+                      onBlur={() => { renameGroup(idx, editName); setEditingIdx(null); }}
+                      onKeyDown={e => { if (e.key === 'Enter') { renameGroup(idx, editName); setEditingIdx(null); } if (e.key === 'Escape') setEditingIdx(null); }}
+                    />
+                  ) : (
+                    <span className="org-loose-group-name">{g.name}</span>
+                  )}
+                  <span className="org-loose-file-count">{g.files.length} file{g.files.length !== 1 ? 's' : ''}</span>
+                  {g.conflicts && <span className="org-loose-conflict-badge">⚠ folder exists</span>}
+                  <button
+                    className="org-loose-rename-btn"
+                    onClick={e => { e.stopPropagation(); setEditingIdx(idx); setEditName(g.name); }}
+                    title="Rename group"
+                  >✏</button>
+                </div>
+
+                {expanded.has(idx) && (
+                  <div className="org-loose-files">
+                    {g.files.map((f, fi) => (
+                      <div key={fi} className="org-loose-file">
+                        <span className="org-loose-filename">{f}</span>
+                        <button
+                          className="org-loose-remove-btn"
+                          onClick={() => removeFileFromGroup(idx, fi)}
+                          title="Remove from group"
+                        >✕</button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+
+          {groups.length > 0 && !scriptResult && (
+            <div style={{ display: 'flex', gap: 8, marginTop: 16 }}>
+              <button className="org-btn org-btn-primary" onClick={() => generateScript(true)} disabled={scanning}>
+                📋 Generate Script
+              </button>
+              <button className="org-btn" onClick={() => generateScript(false)} disabled={executing} style={{ opacity: 0.7 }}
+                title="Requires the library to be mounted read-write in docker-compose.yml">
+                {executing ? '⏳ Moving…' : '⚡ Try Direct Move'}
+              </button>
+            </div>
+          )}
+        </>
+      )}
+
+      {/* ── Script output ── */}
+      {scriptResult && (
+        <div className="org-loose-script-panel">
+          <div className="org-loose-script-header">
+            <span>
+              {scriptResult.dryRun
+                ? `📋 Bash script — ${scriptResult.summary.groups} folders, ${scriptResult.summary.files} files`
+                : `${scriptResult.errors.length ? '⚠' : '✓'} Direct move — ${scriptResult.summary.executed} files moved, ${scriptResult.summary.errors} errors`}
+            </span>
+            <div style={{ display: 'flex', gap: 8 }}>
+              <button className="org-btn org-btn-small" onClick={copyScript}>
+                {copied ? '✓ Copied!' : '📋 Copy'}
+              </button>
+              <button className="org-btn org-btn-small" onClick={() => setScriptResult(null)}>Reset</button>
+            </div>
+          </div>
+
+          {scriptResult.dryRun && (
+            <div className="org-hint" style={{ marginBottom: 8 }}>
+              SSH into Dagobah and paste this script to move the files. After running, trigger a library rescan.
+            </div>
+          )}
+
+          {scriptResult.errors.length > 0 && (
+            <div className="org-error" style={{ marginBottom: 8 }}>
+              {scriptResult.errors.map((e, i) => <div key={i}>{e.type}: {e.file || e.name} — {e.error}</div>)}
+            </div>
+          )}
+
+          <pre className="org-loose-script">{scriptResult.script}</pre>
+        </div>
+      )}
+    </div>
+  );
+}
+
 const TABS = [
   { id: 'annotate',  label: 'Annotate',  icon: '✦' },
   { id: 'health',    label: 'Health',    icon: '⚕' },
   { id: 'franchise', label: 'Franchise', icon: '🗂' },
   { id: 'batch',     label: 'Batch',     icon: '⚡' },
   { id: 'gaps',      label: 'Gaps',      icon: '🔍' },
+  { id: 'unpack',    label: 'Unpack',    icon: '📦' },
 ];
 
 export default function OrganizeModal({ onClose }) {
@@ -1108,7 +1346,7 @@ export default function OrganizeModal({ onClose }) {
       <div className="org-header">
         <div>
           <div className="org-title">🗂 ORGANIZE LIBRARY</div>
-          <div className="org-subtitle">AI annotation · Health · Franchise · Batch actions · Gap analysis</div>
+          <div className="org-subtitle">AI annotation · Health · Franchise · Batch · Gap analysis · Unpack</div>
         </div>
         <button className="org-close" onClick={onClose}>✕</button>
       </div>
@@ -1120,6 +1358,7 @@ export default function OrganizeModal({ onClose }) {
       {tab === 'franchise' && <FranchiseTab onAnnotateThese={handleAnnotateThese} />}
       {tab === 'batch'     && <BatchTab />}
       {tab === 'gaps'      && <GapTab />}
+      {tab === 'unpack'    && <LooseTab />}
     </ModalOverlay>
   );
 }

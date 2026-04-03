@@ -769,4 +769,210 @@ router.post('/fix-thumbnails', (req, res) => {
   res.json({ fixed, total: models.length });
 });
 
+// ── loose file grouper ────────────────────────────────────────────────────────
+
+const GROUPABLE_EXTS = new Set(['.zip', '.rar', '.7z', '.stl', '.obj', '.3mf', '.lys', '.chitubox', '.gcode', '.pdf', '.png', '.jpg', '.jpeg']);
+
+function isGroupableFile(filename) {
+  const lower = filename.toLowerCase();
+  if (lower === '.ds_store' || lower === 'thumbs.db') return false;
+  if (lower.startsWith('._') || lower.startsWith('@') || lower.startsWith('#')) return false;
+  const ext = path.extname(lower);
+  return GROUPABLE_EXTS.has(ext);
+}
+
+/**
+ * Extract a model/character name from a filename by stripping:
+ *  - file extension
+ *  - Google Drive timestamp suffix (e.g. -20250109T000437Z-003)
+ *  - scale prefix (e.g. "1_12 scale", "1-6 scale", "1-9scale")
+ *  - common modifiers (pre-support, uncut, NSFW, painted, …)
+ *  - creator slug (CA3D, CA 3D)
+ */
+function extractModelName(filename) {
+  let name = filename;
+
+  // Strip extension
+  name = name.replace(/\.(zip|rar|7z|stl|obj|3mf|lys|chitubox|gcode|pdf|png|jpe?g)$/i, '');
+
+  // Strip Google Drive timestamp: -20250109T000437Z-003  (with optional leading space/dash)
+  name = name.replace(/\s*-\s*\d{8}T\d{6}Z-\d+\s*$/, '');
+
+  // Strip scale prefix: "1_12 scale ", "1-9scale ", "1_6 Scale " etc.
+  name = name.replace(/^\d+[-_]\d+\s*[Ss]cale\s*/i, '');
+
+  // Strip common variant modifiers (word-boundary aware)
+  name = name.replace(/\bpre[-\s]?support(?:s|ed)?\b/gi, '');
+  name = name.replace(/\buncut\b/gi, '');
+  name = name.replace(/\bNSFW\b/gi, '');
+  name = name.replace(/\bpainted\b/gi, '');
+
+  // Strip creator slug at word boundary
+  name = name.replace(/\bCA[-\s]?3D\b/gi, '');
+
+  // Clean up leftover separators and whitespace
+  name = name.replace(/\s*[-–—]\s*$/, '').trim();
+  name = name.replace(/^\s*[-–—]\s*/, '').trim();
+  name = name.replace(/\s+/g, ' ').trim();
+
+  return name;
+}
+
+function normalizeKey(name) {
+  return name.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+}
+
+function groupFilesByName(files) {
+  const groups = new Map(); // normalizedKey → { suggestedName, files }
+
+  for (const filename of files) {
+    const extracted = extractModelName(filename);
+    if (!extracted) continue;
+    const key = normalizeKey(extracted);
+    if (!groups.has(key)) groups.set(key, { suggestedName: extracted, files: [] });
+    groups.get(key).files.push(filename);
+  }
+
+  return Array.from(groups.entries())
+    .map(([key, g]) => ({ key, suggestedName: g.suggestedName, files: g.files.sort() }))
+    .sort((a, b) => a.suggestedName.localeCompare(b.suggestedName));
+}
+
+/**
+ * GET /api/organize/loose-files?path=<folder_path>
+ *
+ * Reads a directory and groups all loose (non-subfolder) files by inferred model name.
+ * Returns: { path, groups, existingFolders, looseFileCount, unmatched }
+ */
+router.get('/loose-files', (req, res) => {
+  const folderPath = req.query.path;
+  if (!folderPath) return res.status(400).json({ error: 'path query param required' });
+
+  let entries;
+  try {
+    entries = fs.readdirSync(folderPath);
+  } catch (e) {
+    return res.status(404).json({ error: `Cannot read directory: ${e.message}` });
+  }
+
+  const looseFiles = [];
+  const existingFolders = [];
+  const unmatched = [];
+
+  for (const entry of entries) {
+    let stat;
+    try { stat = fs.statSync(path.join(folderPath, entry)); } catch { continue; }
+    if (stat.isDirectory()) {
+      existingFolders.push(entry);
+    } else if (isGroupableFile(entry)) {
+      looseFiles.push(entry);
+    } else {
+      unmatched.push(entry);
+    }
+  }
+
+  const groups = groupFilesByName(looseFiles);
+
+  // Flag groups whose suggested name conflicts with an existing folder
+  const existingKeys = new Set(existingFolders.map(normalizeKey));
+  for (const g of groups) {
+    g.conflicts = existingKeys.has(normalizeKey(g.suggestedName));
+  }
+
+  res.json({
+    path: folderPath,
+    groups,
+    existingFolders,
+    looseFileCount: looseFiles.length,
+    unmatched,
+  });
+});
+
+/**
+ * POST /api/organize/group-files
+ * Body: { path, groups: [{name, files}], dryRun? }
+ *
+ * Creates subfolders and moves loose files into them.
+ * dryRun=true (default) only returns the plan + bash script without touching the filesystem.
+ * Always returns a bash script the user can run on the NAS directly.
+ */
+router.post('/group-files', (req, res) => {
+  const { path: folderPath, groups, dryRun = true } = req.body || {};
+  if (!folderPath) return res.status(400).json({ error: 'path required' });
+  if (!Array.isArray(groups) || !groups.length) return res.status(400).json({ error: 'groups array required' });
+
+  const moves = [];
+  const errors = [];
+  const foldersCreated = [];
+
+  for (const group of groups) {
+    const { name, files } = group;
+    if (!name || !Array.isArray(files) || !files.length) continue;
+
+    const targetDir = path.join(folderPath, name);
+
+    if (!dryRun) {
+      try {
+        if (!fs.existsSync(targetDir)) {
+          fs.mkdirSync(targetDir, { recursive: true });
+          foldersCreated.push(name);
+        }
+      } catch (e) {
+        errors.push({ type: 'mkdir', name, error: e.message });
+        continue;
+      }
+    } else {
+      foldersCreated.push(name);
+    }
+
+    for (const filename of files) {
+      const from = path.join(folderPath, filename);
+      const to   = path.join(targetDir, filename);
+      moves.push({ file: filename, group: name, from, to });
+      if (!dryRun) {
+        try { fs.renameSync(from, to); }
+        catch (e) { errors.push({ type: 'move', file: filename, group: name, error: e.message }); }
+      }
+    }
+  }
+
+  // Build bash script (uses the NAS-side path: /library/... → /volume1/...)
+  const nasPath = folderPath.replace(/^\/library\//, '/volume1/');
+  const scriptLines = [
+    '#!/bin/bash',
+    `# STL Vault — Loose File Organizer`,
+    `# Run this on your NAS via SSH: ssh casey@dagobah`,
+    `# Generated: ${new Date().toISOString()}`,
+    '',
+    `cd "${nasPath}" || { echo "Folder not found: ${nasPath}"; exit 1; }`,
+    '',
+  ];
+
+  for (const group of groups) {
+    if (!group.name || !group.files?.length) continue;
+    scriptLines.push(`# ── ${group.name} (${group.files.length} file${group.files.length !== 1 ? 's' : ''}) ──`);
+    scriptLines.push(`mkdir -p "${group.name}"`);
+    for (const filename of group.files) {
+      scriptLines.push(`mv "${filename}" "${group.name}/"`);
+    }
+    scriptLines.push('');
+  }
+
+  const script = scriptLines.join('\n');
+
+  res.json({
+    dryRun,
+    moves,
+    foldersCreated,
+    errors,
+    script,
+    summary: {
+      groups: groups.length,
+      files: moves.length,
+      executed: dryRun ? 0 : moves.length - errors.filter(e => e.type === 'move').length,
+      errors: errors.length,
+    },
+  });
+});
+
 module.exports = router;
