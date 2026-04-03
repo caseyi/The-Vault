@@ -21,10 +21,10 @@ function formatBytes(bytes) {
 
 // Persist API key in localStorage
 function getStoredApiKey() {
-  try { return localStorage.getItem('vault_claude_key') || ''; } catch { return ''; }
+  try { return localStorage.getItem('claude_api_key') || ''; } catch { return ''; }
 }
 function setStoredApiKey(key) {
-  try { localStorage.setItem('vault_claude_key', key); } catch {}
+  try { localStorage.setItem('claude_api_key', key); } catch {}
 }
 
 export default function ModelDetail({ modelId, onBack, onSaved }) {
@@ -50,10 +50,35 @@ export default function ModelDetail({ modelId, onBack, onSaved }) {
   const [notes, setNotes] = useState('');
   const [sourceUrl, setSourceUrl] = useState('');
   const [activeImg, setActiveImg] = useState(0);
+  const [printMode, setPrintMode] = useState(false);
 
   const handleApiKeyChange = (key) => {
     setApiKey(key);
     setStoredApiKey(key);
+  };
+
+  const PRINTABLE_FILE_TYPES = new Set(['stl', 'slicer', 'zip']);
+
+  const handleTogglePrinted = async (file) => {
+    try {
+      const res = await fetch(`/api/files/${file.id}/printed`, { method: 'PATCH' });
+      const { printed_at } = await res.json();
+      // Update file in model state locally
+      setModel(m => {
+        const updatedFiles = m.files.map(f => f.id === file.id ? { ...f, printed_at } : f);
+        // Auto-advance print status based on printable files
+        const printable = updatedFiles.filter(f => PRINTABLE_FILE_TYPES.has(f.filetype));
+        const doneCnt = printable.filter(f => f.printed_at).length;
+        if (printable.length > 0) {
+          if (doneCnt === 0) setStatus('unprinted');
+          else if (doneCnt < printable.length) setStatus('printing');
+          else setStatus('printed');
+        }
+        return { ...m, files: updatedFiles };
+      });
+    } catch (e) {
+      console.error('Toggle printed failed', e);
+    }
   };
 
   const loadModel = () => {
@@ -337,21 +362,62 @@ export default function ModelDetail({ modelId, onBack, onSaved }) {
             </div>
 
             {/* Files grouped by release */}
-            {model.files && model.files.length > 0 && (
-              <div className="detail-card">
-                <div className="detail-card-title">
-                  Files
-                  <span style={{ marginLeft: 8, color: 'var(--text-faint)', fontWeight: 'normal' }}>
-                    {model.file_count} total
-                  </span>
+            {model.files && model.files.length > 0 && (() => {
+              const printableFiles = model.files.filter(f => PRINTABLE_FILE_TYPES.has(f.filetype));
+              const printedCount = printableFiles.filter(f => f.printed_at).length;
+              const printProgress = printableFiles.length > 0 ? printedCount / printableFiles.length : 0;
+              return (
+                <div className="detail-card">
+                  <div className="detail-card-title" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                    <span>
+                      Files
+                      <span style={{ marginLeft: 8, color: 'var(--text-faint)', fontWeight: 'normal' }}>
+                        {model.file_count} total
+                      </span>
+                    </span>
+                    {printableFiles.length > 0 && (
+                      <button
+                        onClick={() => setPrintMode(p => !p)}
+                        style={{
+                          padding: '3px 10px', borderRadius: 4, fontSize: 11,
+                          background: printMode ? 'rgba(76,175,125,0.15)' : 'var(--bg4)',
+                          border: `1px solid ${printMode ? '#4caf7d' : 'var(--border)'}`,
+                          color: printMode ? '#4caf7d' : 'var(--text-muted)',
+                          cursor: 'pointer', fontFamily: 'var(--font-mono)',
+                        }}>
+                        🖨 {printMode ? 'Exit Print Mode' : 'Print Pieces'}
+                      </button>
+                    )}
+                  </div>
+                  {printMode && printableFiles.length > 0 && (
+                    <div style={{ marginBottom: 10 }}>
+                      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
+                        <span style={{ fontSize: 11, color: 'var(--text-muted)', fontFamily: 'var(--font-mono)' }}>
+                          {printedCount} / {printableFiles.length} pieces printed
+                        </span>
+                        <span style={{ fontSize: 11, color: printProgress === 1 ? '#4caf7d' : 'var(--text-faint)', fontFamily: 'var(--font-mono)' }}>
+                          {Math.round(printProgress * 100)}%
+                        </span>
+                      </div>
+                      <div style={{ height: 4, background: 'var(--bg4)', borderRadius: 2, overflow: 'hidden' }}>
+                        <div style={{
+                          height: '100%', borderRadius: 2, transition: 'width 0.3s ease',
+                          width: `${printProgress * 100}%`,
+                          background: printProgress === 1 ? '#4caf7d' : 'var(--accent)',
+                        }} />
+                      </div>
+                    </div>
+                  )}
+                  <ReleaseFileList
+                    files={model.files.filter(f => f.filetype !== 'image')}
+                    onView3D={f => setViewingStl(viewingStl?.id === f.id ? null : { id: f.id, filename: f.filename })}
+                    viewingStlId={viewingStl?.id}
+                    printMode={printMode}
+                    onTogglePrinted={handleTogglePrinted}
+                  />
                 </div>
-                <ReleaseFileList
-                  files={model.files.filter(f => f.filetype !== 'image')}
-                  onView3D={f => setViewingStl(viewingStl?.id === f.id ? null : { id: f.id, filename: f.filename })}
-                  viewingStlId={viewingStl?.id}
-                />
-              </div>
-            )}
+              );
+            })()}
           </div>
 
           {/* Middle: metadata panel */}
@@ -359,6 +425,8 @@ export default function ModelDetail({ modelId, onBack, onSaved }) {
             <div className="detail-card">
               <div className="detail-card-title">Info</div>
               <div className="meta-row"><span className="meta-label">Creator</span><span className="meta-val">{model.creator_name || '—'}</span></div>
+              {model.franchise && <div className="meta-row"><span className="meta-label">Franchise</span><span className="meta-val">{model.franchise}</span></div>}
+              {model.team && <div className="meta-row"><span className="meta-label">Team</span><span className="meta-val">{model.team}</span></div>}
               <div className="meta-row"><span className="meta-label">Files</span><span className="meta-val">{model.file_count}</span></div>
               <div className="meta-row"><span className="meta-label">Has STL</span><span className="meta-val">{model.has_stl ? '✓' : '✗'}</span></div>
               <div className="meta-row"><span className="meta-label">Chitubox</span><span className="meta-val">{model.has_chitubox ? '✓' : '✗'}</span></div>

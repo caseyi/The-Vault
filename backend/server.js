@@ -177,7 +177,7 @@ app.get('/api/models/:id', (req, res) => {
 });
 
 app.patch('/api/models/:id', (req, res) => {
-  const { print_status, tags, notes, source_url, name, thumbnail_path, hidden } = req.body;
+  const { print_status, tags, notes, source_url, name, thumbnail_path, hidden, franchise, team } = req.body;
   const model = db.prepare('SELECT id FROM models WHERE id = ?').get(req.params.id);
   if (!model) return res.status(404).json({ error: 'Not found' });
 
@@ -190,6 +190,8 @@ app.patch('/api/models/:id', (req, res) => {
   if (name !== undefined) { updates.push('name = ?'); params.push(name); }
   if (thumbnail_path !== undefined) { updates.push('thumbnail_path = ?'); params.push(thumbnail_path); }
   if (hidden !== undefined) { updates.push('hidden = ?'); params.push(hidden ? 1 : 0); }
+  if (franchise !== undefined) { updates.push('franchise = ?'); params.push(franchise || null); }
+  if (team !== undefined) { updates.push('team = ?'); params.push(team || null); }
 
   if (updates.length === 0) return res.status(400).json({ error: 'Nothing to update' });
   updates.push("updated_at = datetime('now')");
@@ -197,6 +199,15 @@ app.patch('/api/models/:id', (req, res) => {
 
   db.prepare(`UPDATE models SET ${updates.join(', ')} WHERE id = ?`).run(...params);
   res.json({ success: true });
+});
+
+// Toggle a single file as printed/unprinted
+app.patch('/api/files/:fileId/printed', (req, res) => {
+  const file = db.prepare('SELECT id, printed_at FROM model_files WHERE id = ?').get(req.params.fileId);
+  if (!file) return res.status(404).json({ error: 'Not found' });
+  const newVal = file.printed_at ? null : new Date().toISOString();
+  db.prepare('UPDATE model_files SET printed_at = ? WHERE id = ?').run(newVal, file.id);
+  res.json({ printed_at: newVal });
 });
 
 // ── Creators ──────────────────────────────────────────────────────────────────

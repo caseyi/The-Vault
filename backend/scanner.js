@@ -341,14 +341,14 @@ const stmts = {
   insertModel:   db.prepare(`
     INSERT INTO models (uuid, name, creator_id, folder_path, source_site,
       file_count, has_stl, has_chitubox, has_lychee, has_plate,
-      thumbnail_path, images, folder_hash, last_scanned)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'))
+      thumbnail_path, images, folder_hash, franchise, team, last_scanned)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'))
   `),
   updateModel:   db.prepare(`
     UPDATE models SET
       name=?, creator_id=?, source_site=?,
       file_count=?, has_stl=?, has_chitubox=?, has_lychee=?, has_plate=?,
-      thumbnail_path=?, images=?, folder_hash=?,
+      thumbnail_path=?, images=?, folder_hash=?, franchise=?, team=?,
       last_scanned=datetime('now'), updated_at=datetime('now')
     WHERE id=?
   `),
@@ -483,6 +483,12 @@ async function scanLibrary(libraryPath, progressCallback, logger) {
             const analysis = analyzeFolder(model.fullPath, creatorName);
             const sourceSite = detectSourceSite(model.fullPath) || detectSourceSite(model.name);
             const modelUuid = existing ? existing.uuid : uuidv4();
+
+            // Extract franchise/team from path relative to creator folder
+            // e.g. creator/Marvel/X-Men/Cable → franchise=Marvel, team=X-Men
+            const relParts = path.relative(creatorPath, model.fullPath).split(path.sep).filter(Boolean);
+            const pathFranchise = relParts.length >= 2 ? relParts[0] : null;
+            const pathTeam      = relParts.length >= 3 ? relParts[1] : null;
             // Model-level hint overrides creator-level hint
             const hint = existing?.render_zip_hint || creatorHint || null;
 
@@ -512,7 +518,7 @@ async function scanLibrary(libraryPath, progressCallback, logger) {
                 inferModelName(model.fullPath), creatorId, sourceSite,
                 analysis.files.length, analysis.hasStl ? 1 : 0,
                 analysis.hasChitubox ? 1 : 0, analysis.hasLychee ? 1 : 0, analysis.hasPlate ? 1 : 0,
-                thumbnail, JSON.stringify(allImages), hash, existing.id
+                thumbnail, JSON.stringify(allImages), hash, pathFranchise, pathTeam, existing.id
               );
               stmts.deleteFiles.run(existing.id);
               for (const f of analysis.files) stmts.insertFile.run(existing.id, f.filename, f.filepath, fileType(f.filename), f.size, f.release_name || null);
@@ -524,7 +530,7 @@ async function scanLibrary(libraryPath, progressCallback, logger) {
                 modelUuid, inferModelName(model.fullPath), creatorId, model.fullPath, sourceSite,
                 analysis.files.length, analysis.hasStl ? 1 : 0,
                 analysis.hasChitubox ? 1 : 0, analysis.hasLychee ? 1 : 0, analysis.hasPlate ? 1 : 0,
-                thumbnail, JSON.stringify(allImages), hash
+                thumbnail, JSON.stringify(allImages), hash, pathFranchise, pathTeam
               );
               for (const f of analysis.files) stmts.insertFile.run(ins.lastInsertRowid, f.filename, f.filepath, fileType(f.filename), f.size, f.release_name || null);
               const releaseList = [...analysis.releases];

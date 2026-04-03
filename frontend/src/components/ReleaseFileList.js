@@ -57,23 +57,41 @@ function RoleBadge({ name }) {
   );
 }
 
-function FileRow({ file, onView3D, viewing3D }) {
+const PRINTABLE_TYPES = new Set(['stl', 'slicer', 'zip']);
+
+function FileRow({ file, onView3D, viewing3D, printMode, onTogglePrinted }) {
+  const isPrinted = !!file.printed_at;
+  const isPrintable = PRINTABLE_TYPES.has(file.filetype);
+
   return (
-    <div style={{
-      display: 'flex', alignItems: 'center', gap: 7,
-      padding: '5px 8px',
-      borderRadius: 4,
-      background: viewing3D ? 'rgba(193,127,58,0.06)' : 'transparent',
-      transition: 'background 0.1s',
-    }}
-      onMouseEnter={e => { if (!viewing3D) e.currentTarget.style.background = 'rgba(255,255,255,0.03)'; }}
-      onMouseLeave={e => { if (!viewing3D) e.currentTarget.style.background = 'transparent'; }}
+    <div
+      className={printMode && isPrintable ? `print-file-row${isPrinted ? ' is-printed' : ''}` : ''}
+      style={{
+        display: 'flex', alignItems: 'center', gap: 7,
+        padding: '5px 8px',
+        borderRadius: 4,
+        background: viewing3D ? 'rgba(193,127,58,0.06)' : 'transparent',
+        transition: 'background 0.1s',
+        opacity: printMode && isPrintable && isPrinted ? 0.5 : 1,
+      }}
+      onMouseEnter={e => { if (!viewing3D && !(printMode && isPrintable)) e.currentTarget.style.background = 'rgba(255,255,255,0.03)'; }}
+      onMouseLeave={e => { if (!viewing3D && !(printMode && isPrintable)) e.currentTarget.style.background = 'transparent'; }}
     >
+      {printMode && isPrintable ? (
+        <button
+          onClick={() => onTogglePrinted && onTogglePrinted(file)}
+          className={`print-checkbox${isPrinted ? ' checked' : ''}`}
+          title={isPrinted ? `Printed ${new Date(file.printed_at).toLocaleDateString()}` : 'Mark as printed'}
+        >
+          {isPrinted ? '✓' : ''}
+        </button>
+      ) : null}
       <FileBadge type={file.filetype} />
       <span style={{
         flex: 1, fontSize: 11, color: 'var(--text)',
         whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
         fontFamily: 'var(--font-mono)',
+        textDecoration: printMode && isPrintable && isPrinted ? 'line-through' : 'none',
       }} title={file.filename}>
         {file.filename}
       </span>
@@ -81,7 +99,7 @@ function FileRow({ file, onView3D, viewing3D }) {
       <span style={{ fontFamily: 'var(--font-mono)', fontSize: 9, color: 'var(--text-faint)', flexShrink: 0 }}>
         {formatBytes(file.filesize)}
       </span>
-      {file.filetype === 'stl' && onView3D && (
+      {!printMode && file.filetype === 'stl' && onView3D && (
         <button onClick={() => onView3D(file)}
           style={{
             background: viewing3D ? 'rgba(193,127,58,0.2)' : 'var(--bg4)',
@@ -97,7 +115,7 @@ function FileRow({ file, onView3D, viewing3D }) {
   );
 }
 
-function ReleaseSection({ releaseName, files, defaultOpen = true, onView3D, viewingStlId }) {
+function ReleaseSection({ releaseName, files, defaultOpen = true, onView3D, viewingStlId, printMode, onTogglePrinted }) {
   const [open, setOpen] = useState(defaultOpen);
   const role = detectRole(releaseName || '');
   const stlCount  = files.filter(f => f.filetype === 'stl').length;
@@ -173,6 +191,8 @@ function ReleaseSection({ releaseName, files, defaultOpen = true, onView3D, view
               file={f}
               onView3D={onView3D}
               viewing3D={viewingStlId === f.id}
+              printMode={printMode}
+              onTogglePrinted={onTogglePrinted}
             />
           ))}
         </div>
@@ -181,7 +201,7 @@ function ReleaseSection({ releaseName, files, defaultOpen = true, onView3D, view
   );
 }
 
-export default function ReleaseFileList({ files = [], onView3D, viewingStlId }) {
+export default function ReleaseFileList({ files = [], onView3D, viewingStlId, printMode, onTogglePrinted }) {
   // Group by release_name (null = ungrouped, goes last)
   const groups = new Map();
   for (const f of files) {
@@ -210,7 +230,8 @@ export default function ReleaseFileList({ files = [], onView3D, viewingStlId }) 
     return (
       <div>
         {groups.get(null).map(f => (
-          <FileRow key={f.id} file={f} onView3D={onView3D} viewing3D={viewingStlId === f.id} />
+          <FileRow key={f.id} file={f} onView3D={onView3D} viewing3D={viewingStlId === f.id}
+            printMode={printMode} onTogglePrinted={onTogglePrinted} />
         ))}
       </div>
     );
@@ -226,6 +247,8 @@ export default function ReleaseFileList({ files = [], onView3D, viewingStlId }) 
           defaultOpen={i === 0 || groups.size <= 3}
           onView3D={onView3D}
           viewingStlId={viewingStlId}
+          printMode={printMode}
+          onTogglePrinted={onTogglePrinted}
         />
       ))}
     </div>
