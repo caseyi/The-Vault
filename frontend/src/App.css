@@ -1215,3 +1215,112 @@ body {
   border-color: #4caf7d;
   background: rgba(76, 175, 125, 0.18);
 }
+
+/* ── Franchise Browser ───────────────────────────────────────────────────── */
+.org-franchise-list {
+  max-height: 380px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.org-franchise-group {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.org-franchise-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  background: var(--bg3);
+  cursor: pointer;
+  user-select: none;
+  transition: background 0.1s;
+}
+.org-franchise-header:hover { background: var(--bg4); }
+.org-franchise-count {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 10px;
+  background: rgba(193,127,58,0.15);
+  color: var(--accent);
+}
+.org-franchise-model {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 10px;
+  cursor: pointer;
+  border-bottom: 1px solid #13131a;
+  transition: background 0.08s;
+}
+.org-franchise-model:last-child { border-bottom: none; }
+.org-franchise-model:hover { background: rgba(255,255,255,0.03); }
+.org-franchise-model.selected { background: rgba(193,127,58,0.08); }
+.org-franchise-check { font-size: 13px; color: var(--text-faint); flex-shrink: 0; width: 14px; }
+.org-franchise-model.selected .org-franchise-check { color: var(--accent); }
+.org-franchise-thumb {
+  width: 28px;
+  height: 28px;
+  object-fit: cover;
+  border-radius: 3px;
+  flex-shrink: 0;
+}
+.org-franchise-thumb-ph {
+  width: 28px;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+  background: var(--bg4);
+  border-radius: 3px;
+  flex-shrink: 0;
+}
+.org-franchise-model-name {
+  flex: 1;
+  font-size: 11px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.org-franchise-model-creator {
+  font-size: 10px;
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+  flex-shrink: 0;
+}
+/* Sticky action bar */
+.org-franchise-actions {
+  position: sticky;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 0 2px;
+  background: var(--bg2, #141417);
+  border-top: 1px solid var(--border);
+  margin-top: 8px;
+}
+
+/* ── Batch Tab ────────────────────────────────────────────────────────────── */
+.org-batch-section {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 14px;
+  margin-bottom: 12px;
+}
+.org-batch-section-title {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 1px;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  margin-bottom: 12px;
+}

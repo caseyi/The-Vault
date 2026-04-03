@@ -242,6 +242,23 @@ app.patch('/api/creators/:id/render-hint', (req, res) => {
   res.json({ success: true });
 });
 
+// Merge one creator into another (moves all models, deletes source)
+app.post('/api/creators/:id/merge', (req, res) => {
+  const sourceId = parseInt(req.params.id);
+  const targetId = parseInt(req.body?.targetCreatorId);
+  if (!targetId || isNaN(targetId) || sourceId === targetId)
+    return res.status(400).json({ error: 'Invalid targetCreatorId' });
+  const source = db.prepare('SELECT id, name FROM creators WHERE id = ?').get(sourceId);
+  const target = db.prepare('SELECT id, name FROM creators WHERE id = ?').get(targetId);
+  if (!source || !target) return res.status(404).json({ error: 'Creator not found' });
+  const moved = db.transaction(() => {
+    const n = db.prepare('UPDATE models SET creator_id = ? WHERE creator_id = ?').run(targetId, sourceId).changes;
+    db.prepare('DELETE FROM creators WHERE id = ?').run(sourceId);
+    return n;
+  })();
+  res.json({ moved, sourceCreator: source.name, targetCreator: target.name });
+});
+
 // Re-extract renders for all models belonging to a creator, using the current hint
 app.post('/api/creators/:id/reextract', async (req, res) => {
   const creator = db.prepare('SELECT * FROM creators WHERE id = ?').get(req.params.id);

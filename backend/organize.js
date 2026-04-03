@@ -114,10 +114,10 @@ function claudeStream(apiKey, payload, onChunk) {
  * Returns a text/JSON snapshot of all models, suitable for pasting into Claude.
  */
 router.get('/snapshot', (req, res) => {
-  const { creator, format = 'txt' } = req.query;
+  const { creator, pathFilter, format = 'txt' } = req.query;
 
   let query = `
-    SELECT m.id, m.name, m.folder_path, m.file_count, m.has_stl, m.franchise,
+    SELECT m.id, m.name, m.folder_path, m.file_count, m.has_stl, m.franchise, m.team,
            m.tags, m.thumbnail_path, m.source_url, m.notes,
            c.name AS creator_name
     FROM models m
@@ -129,6 +129,10 @@ router.get('/snapshot', (req, res) => {
   if (creator) {
     query += ' AND c.name LIKE ?';
     params.push(`%${creator}%`);
+  }
+  if (pathFilter) {
+    query += ' AND m.folder_path LIKE ?';
+    params.push(`%${pathFilter}%`);
   }
 
   query += ' ORDER BY c.name, m.name';
@@ -152,9 +156,10 @@ router.get('/snapshot', (req, res) => {
     lines.push(`## ${cname} (${cmodels.length} models)`);
     for (const m of cmodels) {
       const tags = (() => { try { return JSON.parse(m.tags || '[]').join(', '); } catch { return ''; } })();
-      const franchise = m.franchise ? ` [franchise: ${m.franchise}]` : '';
+      const franchise = m.franchise ? ` [franchise: ${m.franchise}]` : ' [franchise: none]';
+      const team = m.team ? ` [team: ${m.team}]` : '';
       const thumb = m.thumbnail_path ? ' ✓thumb' : ' ✗thumb';
-      lines.push(`  - ${m.name}${franchise}${thumb} | files:${m.file_count} | tags:${tags || 'none'}`);
+      lines.push(`  - ${m.name}${franchise}${team}${thumb} | files:${m.file_count} | tags:${tags || 'none'}`);
     }
     lines.push('');
   }
@@ -179,9 +184,9 @@ router.post('/auto-annotate', async (req, res) => {
   // Build snapshot from DB if not provided
   let snapshot = req.body?.snapshot;
   if (!snapshot) {
-    const { creator } = req.body || {};
+    const { creator, pathFilter, modelIds } = req.body || {};
     let query = `
-      SELECT m.name, m.folder_path, m.file_count, m.franchise, m.tags,
+      SELECT m.id, m.name, m.folder_path, m.file_count, m.franchise, m.team, m.tags,
              c.name AS creator_name
       FROM models m
       LEFT JOIN creators c ON m.creator_id = c.id
@@ -189,6 +194,11 @@ router.post('/auto-annotate', async (req, res) => {
     `;
     const params = [];
     if (creator) { query += ' AND c.name LIKE ?'; params.push(`%${creator}%`); }
+    if (pathFilter) { query += ' AND m.folder_path LIKE ?'; params.push(`%${pathFilter}%`); }
+    if (Array.isArray(modelIds) && modelIds.length) {
+      query += ` AND m.id IN (${modelIds.map(() => '?').join(',')})`;
+      params.push(...modelIds);
+    }
     query += ' ORDER BY c.name, m.name';
 
     const models = db.prepare(query).all(...params);
@@ -204,7 +214,9 @@ router.post('/auto-annotate', async (req, res) => {
       lines.push(`## ${cname}`);
       for (const m of cmodels) {
         const tags = (() => { try { return JSON.parse(m.tags || '[]').join(', '); } catch { return ''; } })();
-        lines.push(`  - ${m.name} | files:${m.file_count} | tags:${tags || 'none'}`);
+        const franchise = m.franchise ? ` [franchise: ${m.franchise}]` : ' [franchise: none]';
+        const team = m.team ? ` [team: ${m.team}]` : '';
+        lines.push(`  - ${m.name}${franchise}${team} | files:${m.file_count} | tags:${tags || 'none'}`);
       }
       lines.push('');
     }
@@ -212,10 +224,12 @@ router.post('/auto-annotate', async (req, res) => {
   }
 
   const systemPrompt = `You are a 3D print library organizer. You are given a snapshot of a library of 3D-printable model folders.
+Each model entry shows its current franchise assignment and existing tags.
+
 Your job is to output a list of organizational directives — one per line — using these formats:
 
 FRANCHISE: <model name> -> <franchise name>
-  (assign a model to a franchise/universe group, e.g. "Star Wars", "Warhammer 40K", "Marvel")
+  (assign or correct a model's franchise/universe group, e.g. "Star Wars", "Warhammer 40K", "Marvel", "TMNT")
 
 RENAME: <old name> -> <new name>
   (suggest a cleaner folder name — fix typos, standardise abbreviations)
@@ -224,17 +238,20 @@ MERGE: <model name> -> <target model name>
   (flag potential duplicates that could be merged)
 
 TAG: <model name> -> <tag1>, <tag2>, ...
-  (suggest relevant tags: scale, type, faction, game system, style)
+  (suggest ADDITIONAL tags to add — only suggest tags not already present)
+  (useful tags: bust, full-figure, terrain, scenic, presupported, fdm, resin, character, vehicle, diorama, creature)
 
 Rules:
-- Only output directives, no explanation
-- Be conservative with RENAME — only rename if clearly wrong
-- Be generous with FRANCHISE — most models belong to a recognisable franchise
-- Output TAG for models with no tags or very generic tags
-- Skip models that already look well-organised
-- One directive per line`;
+- Only output directives, no explanation, no commentary
+- Be conservative with RENAME — only rename if clearly wrong or truncated
+- Be generous with FRANCHISE — most character/IP models belong to a recognisable franchise
+- For TAG: only emit if you have useful tags to ADD beyond what's already there
+- For FRANCHISE: if [franchise: none] and you can identify one, always emit a directive
+- Skip models that already look well-organised (have a franchise and good tags)
+- One directive per line
+- Use the exact model name from the snapshot in your directives`;
 
-  const userContent = `Here is my 3D print library snapshot. Please generate organisational directives for it:\n\n${snapshot}`;
+  const userContent = `Here is my 3D print library snapshot. Generate organisational directives — focusing on franchise assignment for unassigned models and adding missing tags:\n\n${snapshot}`;
 
   // Set up SSE
   res.setHeader('Content-Type', 'text/event-stream');
@@ -631,6 +648,125 @@ router.get('/franchises', (req, res) => {
     ORDER BY count DESC, franchise
   `).all();
   res.json(rows);
+});
+
+// ── franchise browser ─────────────────────────────────────────────────────────
+
+/**
+ * GET /api/organize/franchise-browser
+ * Returns { total, unassigned: model[], franchises: [{name,count,models}] }
+ */
+router.get('/franchise-browser', (req, res) => {
+  const models = db.prepare(`
+    SELECT m.id, m.name, m.franchise, m.tags, m.thumbnail_path,
+           c.name AS creator_name, c.id AS creator_id
+    FROM models m
+    LEFT JOIN creators c ON m.creator_id = c.id
+    WHERE (m.hidden IS NULL OR m.hidden = 0)
+    ORDER BY m.franchise, c.name, m.name
+  `).all();
+
+  const unassigned = models.filter(m => !m.franchise);
+  const byFranchise = {};
+  for (const m of models) {
+    if (!m.franchise) continue;
+    if (!byFranchise[m.franchise]) byFranchise[m.franchise] = [];
+    byFranchise[m.franchise].push(m);
+  }
+  const franchises = Object.entries(byFranchise)
+    .map(([name, mods]) => ({ name, count: mods.length, models: mods }))
+    .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
+
+  res.json({ total: models.length, unassigned, franchises });
+});
+
+// ── bulk update ───────────────────────────────────────────────────────────────
+
+/**
+ * POST /api/organize/bulk-update
+ * Body: { modelIds?, creatorId?, franchise?, tags?, tagsMode? }
+ * Applies franchise and/or tags to all targeted models. Tags are merged by default.
+ */
+router.post('/bulk-update', (req, res) => {
+  const { modelIds, creatorId, franchise, tags, tagsMode = 'merge' } = req.body || {};
+
+  let targetIds = Array.isArray(modelIds) ? modelIds : [];
+  if (!targetIds.length && creatorId) {
+    targetIds = db.prepare('SELECT id FROM models WHERE creator_id = ?').all(creatorId).map(r => r.id);
+  }
+  if (!targetIds.length) return res.status(400).json({ error: 'No models targeted' });
+
+  let updated = 0;
+  db.transaction(() => {
+    for (const id of targetIds) {
+      const model = db.prepare('SELECT id, tags FROM models WHERE id = ?').get(id);
+      if (!model) continue;
+      const updates = [];
+      const params = [];
+      if (franchise !== undefined) {
+        updates.push('franchise = ?');
+        params.push(franchise || null);
+      }
+      if (tags && tags.length) {
+        let existing = [];
+        if (tagsMode === 'merge') { try { existing = JSON.parse(model.tags || '[]'); } catch {} }
+        const merged = [...new Set([...existing, ...tags])];
+        updates.push('tags = ?');
+        params.push(JSON.stringify(merged));
+      }
+      if (updates.length) {
+        updates.push("updated_at = datetime('now')");
+        params.push(id);
+        db.prepare(`UPDATE models SET ${updates.join(', ')} WHERE id = ?`).run(...params);
+        updated++;
+      }
+    }
+  })();
+  res.json({ updated, total: targetIds.length });
+});
+
+// ── thumbnail stats / fix ─────────────────────────────────────────────────────
+
+/**
+ * GET /api/organize/thumbnail-stats
+ */
+router.get('/thumbnail-stats', (req, res) => {
+  const total   = db.prepare(`SELECT COUNT(*) as n FROM models WHERE hidden IS NULL OR hidden = 0`).get().n;
+  const noThumb = db.prepare(`SELECT COUNT(*) as n FROM models WHERE (hidden IS NULL OR hidden = 0) AND (thumbnail_path IS NULL OR thumbnail_path = '')`).get().n;
+  const fixable = db.prepare(`
+    SELECT COUNT(*) as n FROM models
+    WHERE (hidden IS NULL OR hidden = 0)
+      AND (thumbnail_path IS NULL OR thumbnail_path = '')
+      AND images IS NOT NULL AND images != '[]' AND images != ''
+  `).get().n;
+  res.json({ total, noThumb, fixable });
+});
+
+/**
+ * POST /api/organize/fix-thumbnails
+ * For every model that has images[] in DB but no thumbnail, set the first image.
+ */
+router.post('/fix-thumbnails', (req, res) => {
+  const models = db.prepare(`
+    SELECT id, images FROM models
+    WHERE (hidden IS NULL OR hidden = 0)
+      AND (thumbnail_path IS NULL OR thumbnail_path = '')
+      AND images IS NOT NULL AND images != '[]' AND images != ''
+  `).all();
+
+  let fixed = 0;
+  db.transaction(() => {
+    for (const m of models) {
+      try {
+        const imgs = JSON.parse(m.images);
+        if (imgs && imgs.length) {
+          db.prepare(`UPDATE models SET thumbnail_path = ?, updated_at = datetime('now') WHERE id = ?`).run(imgs[0], m.id);
+          fixed++;
+        }
+      } catch {}
+    }
+  })();
+  res.json({ fixed, total: models.length });
 });
 
 module.exports = router;

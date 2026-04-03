@@ -41,18 +41,72 @@ function TabBar({ tabs, active, onChange }) {
 
 // ── Annotate tab ──────────────────────────────────────────────────────────────
 
-function AnnotateTab() {
+const ANNOTATE_STORAGE_KEY = 'vault_annotate_session';
+
+const EXPORT_PREAMBLE = `You are helping organize a 3D printing STL file library called "The Vault".
+
+Analyze the library snapshot below and generate directives to improve organization.
+
+DIRECTIVE FORMAT (one per line, no extra text):
+  FRANCHISE: "Model Name" → franchise_name
+  TAG: "Model Name" → tag1, tag2, tag3
+  RENAME: "Old Name" → "New Name"
+  MERGE: "Duplicate Model" → "Keep This One"
+
+GUIDELINES:
+- Assign FRANCHISE for named characters/universes (Marvel, DC, Star Wars, Warhammer, TMNT, etc.)
+- Use lowercase TAG values: bust, full-figure, terrain, scenic, presupported, fdm, resin, etc.
+- RENAME only when the name is ambiguous, truncated, or poorly formatted
+- MERGE only when two entries appear to be the exact same model
+- Emit only directive lines — no commentary, no headers, no explanations
+
+After Claude replies, copy the directive lines and paste them into The Vault's Annotate tab.
+
+--- LIBRARY SNAPSHOT ---
+`;
+
+function AnnotateTab({ target, onClearTarget }) {
   const [creator, setCreator] = useState('');
+  const [pathFilter, setPathFilter] = useState('');
   const [creators, setCreators] = useState([]);
   const [running, setRunning] = useState(false);
+  const [statusMsg, setStatusMsg] = useState('');
   const [directives, setDirectives] = useState([]);
   const [selected, setSelected] = useState(new Set());
   const [preview, setPreview] = useState(null);
   const [applying, setApplying] = useState(false);
   const [applyResult, setApplyResult] = useState(null);
   const [error, setError] = useState('');
+  const [savedAt, setSavedAt] = useState(null);
+  const [exporting, setExporting] = useState(false);
   const esRef = useRef(null);
   const logRef = useRef(null);
+
+  // Restore saved session from localStorage on mount
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(ANNOTATE_STORAGE_KEY);
+      if (raw) {
+        const { directives: saved, creator: savedCreator, savedAt: ts } = JSON.parse(raw);
+        if (saved?.length) {
+          setDirectives(saved);
+          setSelected(new Set(saved.map((_, i) => i)));
+          if (savedCreator) setCreator(savedCreator);
+          setSavedAt(ts);
+        }
+      }
+    } catch {}
+  }, []);
+
+  // Persist directives to localStorage whenever they change
+  useEffect(() => {
+    if (directives.length === 0) return;
+    try {
+      const ts = new Date().toISOString();
+      localStorage.setItem(ANNOTATE_STORAGE_KEY, JSON.stringify({ directives, creator, savedAt: ts }));
+      setSavedAt(ts);
+    } catch {}
+  }, [directives]);
 
   useEffect(() => {
     fetch('/api/creators').then(r => r.json()).then(setCreators).catch(() => {});
@@ -63,6 +117,17 @@ function AnnotateTab() {
     if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
   }, [directives.length]);
 
+  const clearSession = () => {
+    try { localStorage.removeItem(ANNOTATE_STORAGE_KEY); } catch {}
+    setDirectives([]);
+    setSelected(new Set());
+    setPreview(null);
+    setApplyResult(null);
+    setStatusMsg('');
+    setSavedAt(null);
+    setError('');
+  };
+
   const run = useCallback(async () => {
     const apiKey = getApiKey();
     if (!apiKey) { setError('No Claude API key — set it in Settings first'); return; }
@@ -72,7 +137,10 @@ function AnnotateTab() {
     setSelected(new Set());
     setPreview(null);
     setApplyResult(null);
+    setSavedAt(null);
     setRunning(true);
+    setStatusMsg('Connecting to Claude…');
+    try { localStorage.removeItem(ANNOTATE_STORAGE_KEY); } catch {}
 
     if (esRef.current) esRef.current.close();
 
@@ -80,14 +148,20 @@ function AnnotateTab() {
       const res = await fetch('/api/organize/auto-annotate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'x-claude-key': apiKey },
-        body: JSON.stringify({ creator: creator || undefined }),
+        body: JSON.stringify({
+        creator: creator || undefined,
+        pathFilter: pathFilter || undefined,
+        modelIds: target?.modelIds?.length ? target.modelIds : undefined,
+      }),
       });
 
-      if (!res.ok) { setError(`Error ${res.status}: ${await res.text()}`); setRunning(false); return; }
+      if (!res.ok) { setError(`Error ${res.status}: ${await res.text()}`); setRunning(false); setStatusMsg(''); return; }
 
+      setStatusMsg('Streaming directives from Claude…');
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
       let buf = '';
+      let count = 0;
 
       while (true) {
         const { done, value } = await reader.read();
@@ -100,11 +174,17 @@ function AnnotateTab() {
           try {
             const ev = JSON.parse(line.slice(6));
             if (ev.type === 'directive' && ev.text) {
+              count++;
               setDirectives(d => [...d, ev.text]);
+              setStatusMsg(`Received ${count} directive${count !== 1 ? 's' : ''}…`);
             } else if (ev.type === 'done') {
+              setStatusMsg(`✓ Done — ${count} directive${count !== 1 ? 's' : ''} generated`);
               setRunning(false);
+              // Auto-select all
+              setSelected(new Set(Array.from({ length: count }, (_, i) => i)));
             } else if (ev.type === 'error') {
               setError(ev.message);
+              setStatusMsg('');
               setRunning(false);
             }
           } catch {}
@@ -112,9 +192,49 @@ function AnnotateTab() {
       }
     } catch (e) {
       setError(e.message);
+      setStatusMsg('');
     }
     setRunning(false);
-  }, [creator]);
+  }, [creator, pathFilter]);
+
+  const exportForClaude = useCallback(async () => {
+    setExporting(true);
+    setError('');
+    try {
+      const qp = new URLSearchParams();
+      if (creator) qp.set('creator', creator);
+      if (pathFilter) qp.set('pathFilter', pathFilter);
+      const qs = qp.toString() ? `?${qp}` : '';
+      const res = await fetch(`/api/organize/snapshot${qs}`);
+      if (!res.ok) throw new Error(`Snapshot error ${res.status}`);
+      const snapshot = await res.text();
+      const fullText = EXPORT_PREAMBLE + snapshot + '\n--- END SNAPSHOT ---\n';
+      const blob = new Blob([fullText], { type: 'text/plain' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      const suffix = (creator || pathFilter) ? '-' + (creator || pathFilter).replace(/\s+/g, '_').replace(/[^a-zA-Z0-9_-]/g, '') : '';
+      a.download = `vault-annotate-prompt${suffix}.txt`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      setError(`Export failed: ${e.message}`);
+    }
+    setExporting(false);
+  }, [creator, pathFilter]);
+
+  const pasteDirectives = useCallback((text) => {
+    const lines = text.split('\n')
+      .map(l => l.trim())
+      .filter(l => /^(FRANCHISE|TAG|RENAME|MERGE):/i.test(l));
+    if (!lines.length) { setError('No valid directives found in pasted text'); return; }
+    setDirectives(lines);
+    setSelected(new Set(lines.map((_, i) => i)));
+    setPreview(null);
+    setApplyResult(null);
+    setError('');
+    setStatusMsg(`Loaded ${lines.length} directive${lines.length !== 1 ? 's' : ''} from paste`);
+  }, []);
 
   const selectAll = () => setSelected(new Set(directives.map((_, i) => i)));
   const selectNone = () => setSelected(new Set());
@@ -160,19 +280,93 @@ function AnnotateTab() {
     <div className="org-tab-body">
       <p className="org-desc">
         Generate Claude AI directives to franchise-tag, rename, merge, and tag your entire library — then apply selectively.
+        Or export a prompt to paste into Claude manually and import the response.
       </p>
 
-      <div className="org-row">
-        <label className="org-label">Filter by creator (optional)</label>
-        <select className="org-select" value={creator} onChange={e => setCreator(e.target.value)}>
-          <option value="">All creators</option>
-          {creators.map(c => <option key={c.id} value={c.name}>{c.name}</option>)}
-        </select>
+      {/* Target banner from health/franchise tab */}
+      {target?.modelIds?.length > 0 && (
+        <div style={{
+          display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px',
+          background: 'rgba(193,127,58,0.08)', border: '1px solid rgba(193,127,58,0.3)',
+          borderRadius: 6, marginBottom: 10,
+        }}>
+          <span style={{ fontSize: 12, color: 'var(--accent)', flex: 1 }}>
+            🎯 Targeting: <b>{target.label}</b>
+          </span>
+          <button className="org-btn org-btn-sm" onClick={onClearTarget}
+            style={{ color: 'var(--text-faint)' }}>✕ Clear</button>
+        </div>
+      )}
+
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+        <div className="org-row" style={{ marginBottom: 0 }}>
+          <label className="org-label">Filter by creator</label>
+          <select className="org-select" value={creator} onChange={e => { setCreator(e.target.value); setPathFilter(''); }}>
+            <option value="">All creators</option>
+            {creators.map(c => <option key={c.id} value={c.name}>{c.name}</option>)}
+          </select>
+        </div>
+        <div className="org-row" style={{ marginBottom: 0 }}>
+          <label className="org-label">Filter by subfolder / path</label>
+          <input
+            className="org-select"
+            placeholder="e.g. Marvel, Star Wars, X-Men…"
+            value={pathFilter}
+            onChange={e => { setPathFilter(e.target.value); setCreator(''); }}
+            style={{ fontFamily: 'var(--font-mono)', fontSize: 11 }}
+          />
+        </div>
       </div>
 
-      <button className="org-btn org-btn-primary" onClick={run} disabled={running}>
-        {running ? '⏳ Generating directives…' : '✦ Generate Directives with AI'}
-      </button>
+      {/* Action buttons */}
+      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+        <button className="org-btn org-btn-primary" onClick={run} disabled={running} style={{ flex: '1 1 auto' }}>
+          {running ? `⏳ ${statusMsg || 'Generating…'}` : '✦ Generate with AI'}
+        </button>
+        <button className="org-btn org-btn-secondary" onClick={exportForClaude} disabled={exporting} title="Download a .txt file to paste into Claude manually">
+          {exporting ? '⏳' : '📄'} Export for Claude
+        </button>
+      </div>
+
+      {/* Paste-back area (shown when no directives loaded yet or as an alternative) */}
+      {!running && directives.length === 0 && (
+        <div style={{ marginTop: 10 }}>
+          <label className="org-label">Paste Claude's response here to import directives</label>
+          <textarea
+            className="org-textarea"
+            rows={5}
+            placeholder={"Paste Claude's output here — lines starting with FRANCHISE:, TAG:, RENAME:, or MERGE: will be imported automatically"}
+            onPaste={e => {
+              e.preventDefault();
+              pasteDirectives(e.clipboardData.getData('text'));
+            }}
+            onChange={e => { if (e.target.value.trim()) pasteDirectives(e.target.value); }}
+          />
+        </div>
+      )}
+
+      {/* Status line */}
+      {statusMsg && !error && (
+        <div style={{
+          fontSize: 11, fontFamily: 'var(--font-mono)', padding: '6px 10px',
+          background: 'rgba(193,127,58,0.06)', border: '1px solid rgba(193,127,58,0.2)',
+          borderRadius: 4, color: 'var(--accent)', marginTop: 4,
+        }}>
+          {statusMsg}
+        </div>
+      )}
+
+      {/* Saved indicator */}
+      {savedAt && directives.length > 0 && !running && (
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: 4 }}>
+          <span style={{ fontSize: 10, color: 'var(--text-faint)', fontFamily: 'var(--font-mono)' }}>
+            💾 Auto-saved {new Date(savedAt).toLocaleTimeString()}
+          </span>
+          <button className="org-btn org-btn-sm" onClick={clearSession} style={{ color: '#cf7272', borderColor: '#cf727240' }}>
+            ✕ Clear
+          </button>
+        </div>
+      )}
 
       {error && <div className="org-error">{error}</div>}
 
@@ -186,8 +380,6 @@ function AnnotateTab() {
               <button className="org-btn org-btn-sm" onClick={selectAll}>All</button>
               <button className="org-btn org-btn-sm" onClick={selectNone}>None</button>
               <button className="org-btn org-btn-sm" onClick={() => {
-                const byType = t => directives.filter(d => directiveType(d) === t).map((_, i) => directives.indexOf(directives.filter(d => directiveType(d) === t)[i]));
-                // Toggle only FRANCHISE + TAG
                 const keep = new Set();
                 directives.forEach((d, i) => { if (['FRANCHISE','TAG'].includes(directiveType(d))) keep.add(i); });
                 setSelected(keep);
@@ -261,15 +453,16 @@ function AnnotateTab() {
 
 // ── Health tab ────────────────────────────────────────────────────────────────
 
-function HealthTab() {
+function HealthTab({ onAnnotateThese }) {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [activeSection, setActiveSection] = useState('duplicates');
+  const [thumbFixing, setThumbFixing] = useState(false);
+  const [thumbResult, setThumbResult] = useState('');
 
   const run = useCallback(async () => {
-    setLoading(true);
-    setError('');
+    setLoading(true); setError('');
     try {
       const res = await fetch('/api/organize/health');
       if (!res.ok) { setError(`Error ${res.status}`); setLoading(false); return; }
@@ -279,6 +472,17 @@ function HealthTab() {
   }, []);
 
   useEffect(() => { run(); }, [run]);
+
+  const fixThumbnails = async () => {
+    setThumbFixing(true); setThumbResult('');
+    try {
+      const res = await fetch('/api/organize/fix-thumbnails', { method: 'POST' });
+      const d = await res.json();
+      setThumbResult(`✓ Fixed ${d.fixed} thumbnails`);
+      run();
+    } catch (e) { setError(e.message); }
+    setThumbFixing(false);
+  };
 
   const sections = [
     { id: 'duplicates',  label: 'Duplicates',    icon: '⧉', count: data?.summary?.duplicatePairs },
@@ -297,6 +501,52 @@ function HealthTab() {
         {extra && <div className="org-health-extra">{extra}</div>}
       </div>
     );
+  }
+
+  // Quick-fix action bar for the current section
+  function SectionActions() {
+    if (!data) return null;
+    if (activeSection === 'noFranchise' && data.noFranchise.length > 0 && onAnnotateThese) {
+      return (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '6px 0', marginBottom: 6 }}>
+          <span style={{ fontSize: 11, color: 'var(--text-faint)' }}>
+            {data.noFranchise.length} models without franchise assignment
+          </span>
+          <button className="org-btn org-btn-sm" style={{ color: 'var(--accent)', borderColor: 'rgba(193,127,58,0.4)' }}
+            onClick={() => onAnnotateThese(data.noFranchise.map(m => m.id), `${data.noFranchise.length} unfranchised models`)}>
+            ✦ Annotate These
+          </button>
+        </div>
+      );
+    }
+    if (activeSection === 'noTags' && data.noTags.length > 0 && onAnnotateThese) {
+      return (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '6px 0', marginBottom: 6 }}>
+          <span style={{ fontSize: 11, color: 'var(--text-faint)' }}>
+            {data.noTags.length} models without tags
+          </span>
+          <button className="org-btn org-btn-sm" style={{ color: 'var(--accent)', borderColor: 'rgba(193,127,58,0.4)' }}
+            onClick={() => onAnnotateThese(data.noTags.map(m => m.id), `${data.noTags.length} untagged models`)}>
+            ✦ Annotate These
+          </button>
+        </div>
+      );
+    }
+    if (activeSection === 'noThumbnail' && data.noThumbnail.length > 0) {
+      return (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '6px 0', marginBottom: 6 }}>
+          <span style={{ fontSize: 11, color: 'var(--text-faint)' }}>
+            {data.noThumbnail.length} models missing thumbnails
+          </span>
+          <button className="org-btn org-btn-sm" onClick={fixThumbnails} disabled={thumbFixing}
+            style={{ color: '#5b9bd5', borderColor: 'rgba(91,155,213,0.4)' }}>
+            {thumbFixing ? '⏳' : '🖼'} Auto-Fix Thumbnails
+          </button>
+          {thumbResult && <span style={{ fontSize: 11, color: '#4caf7d' }}>{thumbResult}</span>}
+        </div>
+      );
+    }
+    return null;
   }
 
   function renderSection() {
@@ -340,7 +590,7 @@ function HealthTab() {
   return (
     <div className="org-tab-body">
       <p className="org-desc">
-        Scan your library for issues: duplicate models, missing thumbnails, empty folders, and untagged entries.
+        Scan your library for issues. Use the quick-fix buttons to jump directly to action.
       </p>
 
       <button className="org-btn org-btn-secondary" onClick={run} disabled={loading} style={{ marginBottom: 12 }}>
@@ -361,16 +611,16 @@ function HealthTab() {
 
           <div className="org-health-sections">
             {sections.map(s => (
-              <button
-                key={s.id}
+              <button key={s.id}
                 className={`org-health-section-btn ${activeSection === s.id ? 'active' : ''}`}
-                onClick={() => setActiveSection(s.id)}
-              >
+                onClick={() => setActiveSection(s.id)}>
                 {s.icon} {s.label}
                 <span className={`org-health-badge ${s.count > 0 ? 'warn' : 'ok'}`}>{s.count ?? '…'}</span>
               </button>
             ))}
           </div>
+
+          <SectionActions />
 
           <div className="org-health-list">
             {renderSection()}
@@ -498,32 +748,378 @@ function GapTab() {
   );
 }
 
+// ── Franchise Browser tab ─────────────────────────────────────────────────────
+
+function FranchiseTab({ onAnnotateThese }) {
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const [selected, setSelected] = useState(new Set());
+  const [franchiseInput, setFranchiseInput] = useState('');
+  const [filterText, setFilterText] = useState('');
+  const [applying, setApplying] = useState(false);
+  const [result, setResult] = useState('');
+  const [expanded, setExpanded] = useState(new Set(['__unassigned__']));
+
+  const load = useCallback(async () => {
+    setLoading(true); setError('');
+    try {
+      const res = await fetch('/api/organize/franchise-browser');
+      if (!res.ok) throw new Error(`Error ${res.status}`);
+      setData(await res.json());
+    } catch (e) { setError(e.message); }
+    setLoading(false);
+  }, []);
+
+  useEffect(() => { load(); }, [load]);
+
+  const toggleExpand = (key) =>
+    setExpanded(s => { const n = new Set(s); n.has(key) ? n.delete(key) : n.add(key); return n; });
+  const toggleModel = (id) =>
+    setSelected(s => { const n = new Set(s); n.has(id) ? n.delete(id) : n.add(id); return n; });
+  const selectGroup = (models) =>
+    setSelected(s => new Set([...s, ...models.map(m => m.id)]));
+
+  const applyFranchise = async () => {
+    if (!selected.size || !franchiseInput.trim()) return;
+    setApplying(true); setError(''); setResult('');
+    try {
+      const res = await fetch('/api/organize/bulk-update', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ modelIds: [...selected], franchise: franchiseInput.trim() }),
+      });
+      const d = await res.json();
+      setResult(`✓ Assigned "${franchiseInput.trim()}" to ${d.updated} model${d.updated !== 1 ? 's' : ''}`);
+      setSelected(new Set()); setFranchiseInput(''); load();
+    } catch (e) { setError(e.message); }
+    setApplying(false);
+  };
+
+  const filter = filterText.toLowerCase();
+  const filterModels = (mods) => !filter ? mods
+    : mods.filter(m => m.name.toLowerCase().includes(filter) || (m.creator_name || '').toLowerCase().includes(filter));
+
+  const unassignedFiltered = data ? filterModels(data.unassigned) : [];
+
+  function ModelRow({ m }) {
+    const isSel = selected.has(m.id);
+    return (
+      <div className={`org-franchise-model${isSel ? ' selected' : ''}`} onClick={() => toggleModel(m.id)}>
+        <span className="org-franchise-check">{isSel ? '☑' : '☐'}</span>
+        {m.thumbnail_path
+          ? <img src={m.thumbnail_path} className="org-franchise-thumb" alt="" />
+          : <span className="org-franchise-thumb-ph">🧩</span>}
+        <span className="org-franchise-model-name">{m.name}</span>
+        <span className="org-franchise-model-creator">{m.creator_name}</span>
+      </div>
+    );
+  }
+
+  function GroupSection({ groupKey, label, labelColor, models, badgeColor }) {
+    const filtered = filterModels(models);
+    if (filter && !filtered.length) return null;
+    const isOpen = expanded.has(groupKey);
+    return (
+      <div className="org-franchise-group">
+        <div className="org-franchise-header" onClick={() => toggleExpand(groupKey)}>
+          <span style={{ color: labelColor || 'var(--accent)', fontFamily: 'var(--font-mono)', fontSize: 12 }}>{label}</span>
+          <span className="org-franchise-count" style={{ background: badgeColor || 'rgba(193,127,58,0.15)', color: badgeColor ? '#fff' : 'var(--accent)' }}>
+            {models.length}
+          </span>
+          <button className="org-btn org-btn-sm" style={{ marginLeft: 'auto', marginRight: 6, fontSize: 9 }}
+            onClick={e => { e.stopPropagation(); selectGroup(filtered); }}>
+            + Select all
+          </button>
+          {onAnnotateThese && groupKey === '__unassigned__' && (
+            <button className="org-btn org-btn-sm" style={{ marginRight: 6, fontSize: 9, color: 'var(--accent)', borderColor: 'var(--accent)' }}
+              onClick={e => { e.stopPropagation(); onAnnotateThese(filtered.map(m => m.id), `${filtered.length} unassigned models`); }}>
+              ✦ Annotate
+            </button>
+          )}
+          <span style={{ fontSize: 10, color: 'var(--text-faint)' }}>{isOpen ? '▾' : '▸'}</span>
+        </div>
+        {isOpen && (
+          <div>
+            {filtered.slice(0, 60).map(m => <ModelRow key={m.id} m={m} />)}
+            {filtered.length > 60 && (
+              <div style={{ fontSize: 11, color: 'var(--text-faint)', padding: '4px 12px' }}>
+                +{filtered.length - 60} more — use filter to narrow down
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  return (
+    <div className="org-tab-body" style={{ paddingBottom: selected.size ? 60 : 0 }}>
+      <p className="org-desc">
+        Browse models by franchise. Select unassigned models and bulk-assign them, or select across franchises to reassign.
+      </p>
+
+      {data && (
+        <div style={{ display: 'flex', gap: 16, marginBottom: 10, fontSize: 12 }}>
+          <span style={{ color: 'var(--text-muted)' }}>Total <b style={{ color: 'var(--text)' }}>{data.total}</b></span>
+          <span style={{ color: '#cf7272' }}>Unassigned <b>{data.unassigned.length}</b></span>
+          <span style={{ color: '#4caf7d' }}>Franchises <b>{data.franchises.length}</b></span>
+          <button className="org-btn org-btn-sm" style={{ marginLeft: 'auto' }} onClick={load}>↻ Refresh</button>
+        </div>
+      )}
+
+      <input className="org-select" placeholder="Filter by model name or creator…" value={filterText}
+        onChange={e => setFilterText(e.target.value)}
+        style={{ marginBottom: 10, fontFamily: 'var(--font-mono)', fontSize: 11 }} />
+
+      {error && <div className="org-error">{error}</div>}
+      {loading && <div style={{ color: 'var(--text-faint)', fontSize: 12, padding: 8 }}>⏳ Loading…</div>}
+
+      {data && (
+        <div className="org-franchise-list">
+          {/* Unassigned always first */}
+          {data.unassigned.length > 0 && (
+            <GroupSection groupKey="__unassigned__" label="⚠ Unassigned"
+              labelColor="#cf7272" models={data.unassigned} badgeColor="#cf727288" />
+          )}
+          {data.franchises.map(f => (
+            <GroupSection key={f.name} groupKey={f.name} label={f.name} models={f.models} />
+          ))}
+          {data.total === 0 && <div className="org-empty">No models found</div>}
+        </div>
+      )}
+
+      {result && <div className="org-success-box" style={{ marginTop: 8 }}>{result}</div>}
+
+      {/* Sticky action bar */}
+      {selected.size > 0 && (
+        <div className="org-franchise-actions">
+          <span style={{ fontSize: 12, color: 'var(--text-muted)', whiteSpace: 'nowrap' }}>{selected.size} selected</span>
+          <input className="org-select" placeholder="Franchise name…" value={franchiseInput}
+            onChange={e => setFranchiseInput(e.target.value)}
+            onKeyDown={e => { if (e.key === 'Enter') applyFranchise(); }}
+            style={{ flex: 1, fontFamily: 'var(--font-mono)', fontSize: 11 }} />
+          <button className="org-btn org-btn-success" onClick={applyFranchise}
+            disabled={applying || !franchiseInput.trim()}>
+            {applying ? '⏳' : '✓'} Assign
+          </button>
+          <button className="org-btn org-btn-sm" onClick={() => setSelected(new Set())}
+            style={{ color: '#cf7272' }}>✕</button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Batch Actions tab ─────────────────────────────────────────────────────────
+
+function BatchTab() {
+  const [creators, setCreators] = useState([]);
+  const [thumbStats, setThumbStats] = useState(null);
+  // Bulk tag/franchise
+  const [bulkCreatorId, setBulkCreatorId] = useState('');
+  const [bulkFranchise, setBulkFranchise] = useState('');
+  const [bulkTags, setBulkTags] = useState('');
+  const [bulkApplying, setBulkApplying] = useState(false);
+  const [bulkResult, setBulkResult] = useState('');
+  // Creator merge
+  const [srcCreator, setSrcCreator] = useState('');
+  const [dstCreator, setDstCreator] = useState('');
+  const [merging, setMerging] = useState(false);
+  const [mergeResult, setMergeResult] = useState('');
+  // Thumbnails
+  const [thumbFixing, setThumbFixing] = useState(false);
+  const [thumbResult, setThumbResult] = useState('');
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    fetch('/api/creators').then(r => r.json()).then(setCreators).catch(() => {});
+    fetch('/api/organize/thumbnail-stats').then(r => r.json()).then(setThumbStats).catch(() => {});
+  }, []);
+
+  const applyBulk = async () => {
+    if (!bulkCreatorId) { setError('Select a creator first'); return; }
+    const tags = bulkTags.split(',').map(t => t.trim().toLowerCase()).filter(Boolean);
+    if (!bulkFranchise && !tags.length) { setError('Enter a franchise and/or tags to apply'); return; }
+    setBulkApplying(true); setError(''); setBulkResult('');
+    try {
+      const body = { creatorId: parseInt(bulkCreatorId) };
+      if (bulkFranchise) body.franchise = bulkFranchise.trim();
+      if (tags.length) body.tags = tags;
+      const res = await fetch('/api/organize/bulk-update', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+      });
+      const d = await res.json();
+      setBulkResult(`✓ Updated ${d.updated} of ${d.total} models`);
+    } catch (e) { setError(e.message); }
+    setBulkApplying(false);
+  };
+
+  const mergeCreators = async () => {
+    if (!srcCreator || !dstCreator || srcCreator === dstCreator) {
+      setError('Select two different creators'); return;
+    }
+    setMerging(true); setError(''); setMergeResult('');
+    try {
+      const res = await fetch(`/api/creators/${srcCreator}/merge`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ targetCreatorId: parseInt(dstCreator) }),
+      });
+      const d = await res.json();
+      setMergeResult(`✓ Merged "${d.sourceCreator}" → "${d.targetCreator}" (${d.moved} models moved)`);
+      setSrcCreator(''); setDstCreator('');
+      fetch('/api/creators').then(r => r.json()).then(setCreators);
+    } catch (e) { setError(e.message); }
+    setMerging(false);
+  };
+
+  const fixThumbnails = async () => {
+    setThumbFixing(true); setError(''); setThumbResult('');
+    try {
+      const res = await fetch('/api/organize/fix-thumbnails', { method: 'POST' });
+      const d = await res.json();
+      setThumbResult(`✓ Fixed ${d.fixed} thumbnails from existing images`);
+      fetch('/api/organize/thumbnail-stats').then(r => r.json()).then(setThumbStats);
+    } catch (e) { setError(e.message); }
+    setThumbFixing(false);
+  };
+
+  const Section = ({ title, children }) => (
+    <div className="org-batch-section">
+      <div className="org-batch-section-title">{title}</div>
+      {children}
+    </div>
+  );
+
+  return (
+    <div className="org-tab-body">
+      <p className="org-desc">
+        Bulk operations: apply franchise and tags to an entire creator's library, merge duplicate creators, and fix missing thumbnails.
+      </p>
+
+      {error && <div className="org-error">{error}</div>}
+
+      {/* Bulk apply to creator */}
+      <Section title="⚡ Bulk Apply to Creator">
+        <div className="org-row">
+          <label className="org-label">Creator</label>
+          <select className="org-select" value={bulkCreatorId} onChange={e => setBulkCreatorId(e.target.value)}>
+            <option value="">Select creator…</option>
+            {creators.map(c => <option key={c.id} value={c.id}>{c.name} ({c.model_count} models)</option>)}
+          </select>
+        </div>
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+          <div className="org-row" style={{ marginBottom: 0 }}>
+            <label className="org-label">Set franchise (optional)</label>
+            <input className="org-select" placeholder="e.g. Marvel" value={bulkFranchise}
+              onChange={e => setBulkFranchise(e.target.value)}
+              style={{ fontFamily: 'var(--font-mono)', fontSize: 11 }} />
+          </div>
+          <div className="org-row" style={{ marginBottom: 0 }}>
+            <label className="org-label">Add tags (comma-separated, optional)</label>
+            <input className="org-select" placeholder="e.g. 28mm, resin, presupported" value={bulkTags}
+              onChange={e => setBulkTags(e.target.value)}
+              style={{ fontFamily: 'var(--font-mono)', fontSize: 11 }} />
+          </div>
+        </div>
+        <button className="org-btn org-btn-primary" onClick={applyBulk} disabled={bulkApplying || !bulkCreatorId} style={{ marginTop: 10 }}>
+          {bulkApplying ? '⏳ Applying…' : '⚡ Apply to All Models'}
+        </button>
+        {bulkResult && <div className="org-success-box" style={{ marginTop: 6 }}>{bulkResult}</div>}
+      </Section>
+
+      {/* Fix thumbnails */}
+      <Section title="🖼 Fix Missing Thumbnails">
+        {thumbStats ? (
+          <div style={{ display: 'flex', gap: 16, fontSize: 12, marginBottom: 10 }}>
+            <span style={{ color: 'var(--text-muted)' }}>No thumbnail: <b style={{ color: '#cf7272' }}>{thumbStats.noThumb}</b></span>
+            <span style={{ color: 'var(--text-muted)' }}>Auto-fixable: <b style={{ color: '#4caf7d' }}>{thumbStats.fixable}</b></span>
+            <span style={{ color: 'var(--text-faint)', fontSize: 11 }}>(have images already extracted, just need linking)</span>
+          </div>
+        ) : (
+          <div style={{ color: 'var(--text-faint)', fontSize: 12, marginBottom: 10 }}>Loading stats…</div>
+        )}
+        <button className="org-btn org-btn-secondary" onClick={fixThumbnails}
+          disabled={thumbFixing || (thumbStats && thumbStats.fixable === 0)}>
+          {thumbFixing ? '⏳ Fixing…' : `🖼 Auto-Fix ${thumbStats?.fixable ?? '…'} Thumbnails`}
+        </button>
+        {thumbResult && <div className="org-success-box" style={{ marginTop: 6 }}>{thumbResult}</div>}
+        <div style={{ fontSize: 11, color: 'var(--text-faint)', marginTop: 6 }}>
+          For models with no images at all, use the ZIP extractor in the model detail view.
+        </div>
+      </Section>
+
+      {/* Creator merge */}
+      <Section title="🔀 Merge Creators">
+        <div style={{ fontSize: 12, color: 'var(--text-faint)', marginBottom: 8 }}>
+          Combine two creator entries into one. All models from the source move to the target; the source creator is deleted.
+        </div>
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr auto 1fr', gap: 8, alignItems: 'center' }}>
+          <div>
+            <div className="org-label" style={{ marginBottom: 4 }}>Merge FROM (will be deleted)</div>
+            <select className="org-select" value={srcCreator} onChange={e => setSrcCreator(e.target.value)}>
+              <option value="">Source creator…</option>
+              {creators.map(c => <option key={c.id} value={c.id}>{c.name} ({c.model_count})</option>)}
+            </select>
+          </div>
+          <span style={{ color: 'var(--text-faint)', fontSize: 18, textAlign: 'center' }}>→</span>
+          <div>
+            <div className="org-label" style={{ marginBottom: 4 }}>Merge INTO (kept)</div>
+            <select className="org-select" value={dstCreator} onChange={e => setDstCreator(e.target.value)}>
+              <option value="">Target creator…</option>
+              {creators.filter(c => c.id !== parseInt(srcCreator)).map(c => (
+                <option key={c.id} value={c.id}>{c.name} ({c.model_count})</option>
+              ))}
+            </select>
+          </div>
+        </div>
+        <button className="org-btn org-btn-secondary" onClick={mergeCreators}
+          disabled={merging || !srcCreator || !dstCreator}
+          style={{ marginTop: 10, borderColor: '#cf727240', color: '#cf7272' }}>
+          {merging ? '⏳ Merging…' : '🔀 Merge Creators'}
+        </button>
+        {mergeResult && <div className="org-success-box" style={{ marginTop: 6 }}>{mergeResult}</div>}
+      </Section>
+    </div>
+  );
+}
+
 // ── Main OrganizeModal ────────────────────────────────────────────────────────
 
 const TABS = [
-  { id: 'annotate', label: 'Annotate', icon: '✦' },
-  { id: 'health',   label: 'Health',   icon: '⚕' },
-  { id: 'gaps',     label: 'Gap Analysis', icon: '🔍' },
+  { id: 'annotate',  label: 'Annotate',  icon: '✦' },
+  { id: 'health',    label: 'Health',    icon: '⚕' },
+  { id: 'franchise', label: 'Franchise', icon: '🗂' },
+  { id: 'batch',     label: 'Batch',     icon: '⚡' },
+  { id: 'gaps',      label: 'Gaps',      icon: '🔍' },
 ];
 
 export default function OrganizeModal({ onClose }) {
   const [tab, setTab] = useState('annotate');
+  // Shared target for health → annotate "Annotate These" flow
+  const [annotateTarget, setAnnotateTarget] = useState(null); // { modelIds, label }
+
+  const handleAnnotateThese = useCallback((modelIds, label) => {
+    setAnnotateTarget({ modelIds, label });
+    setTab('annotate');
+  }, []);
 
   return (
     <ModalOverlay onClose={onClose}>
       <div className="org-header">
         <div>
           <div className="org-title">🗂 ORGANIZE LIBRARY</div>
-          <div className="org-subtitle">AI-powered annotation · Health scan · Gap analysis</div>
+          <div className="org-subtitle">AI annotation · Health · Franchise · Batch actions · Gap analysis</div>
         </div>
         <button className="org-close" onClick={onClose}>✕</button>
       </div>
 
       <TabBar tabs={TABS} active={tab} onChange={setTab} />
 
-      {tab === 'annotate' && <AnnotateTab />}
-      {tab === 'health'   && <HealthTab />}
-      {tab === 'gaps'     && <GapTab />}
+      {tab === 'annotate'  && <AnnotateTab target={annotateTarget} onClearTarget={() => setAnnotateTarget(null)} />}
+      {tab === 'health'    && <HealthTab onAnnotateThese={handleAnnotateThese} />}
+      {tab === 'franchise' && <FranchiseTab onAnnotateThese={handleAnnotateThese} />}
+      {tab === 'batch'     && <BatchTab />}
+      {tab === 'gaps'      && <GapTab />}
     </ModalOverlay>
   );
 }
