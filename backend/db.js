@@ -102,4 +102,17 @@ try { db.exec(`ALTER TABLE models ADD COLUMN team TEXT`); } catch {}
 try { db.exec(`CREATE INDEX IF NOT EXISTS idx_models_team ON models(team)`); } catch {}
 try { db.exec(`ALTER TABLE model_files ADD COLUMN printed_at TEXT`); } catch {}
 
+// Status history log
+try { db.exec(`
+  CREATE TABLE IF NOT EXISTS status_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    model_id INTEGER NOT NULL REFERENCES models(id) ON DELETE CASCADE,
+    from_status TEXT,
+    to_status TEXT NOT NULL,
+    note TEXT,
+    changed_at TEXT DEFAULT (datetime('now'))
+  )
+`); } catch {}
+try { db.exec(`CREATE INDEX IF NOT EXISTS idx_status_log_model ON status_log(model_id)`); } catch {}
+
 module.exports = db;

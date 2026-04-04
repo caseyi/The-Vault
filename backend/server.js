@@ -230,12 +230,20 @@ app.get('/api/models/:id', (req, res) => {
 
 app.patch('/api/models/:id', (req, res) => {
   const { print_status, tags, notes, source_url, name, thumbnail_path, hidden, franchise, team } = req.body;
-  const model = db.prepare('SELECT id FROM models WHERE id = ?').get(req.params.id);
+  const model = db.prepare('SELECT id, print_status FROM models WHERE id = ?').get(req.params.id);
   if (!model) return res.status(404).json({ error: 'Not found' });
 
   const updates = [];
   const params = [];
-  if (print_status !== undefined) { updates.push('print_status = ?'); params.push(print_status); }
+  if (print_status !== undefined) {
+    // Log the status transition if it actually changed
+    if (print_status !== model.print_status) {
+      db.prepare(`INSERT INTO status_log (model_id, from_status, to_status) VALUES (?, ?, ?)`).run(
+        req.params.id, model.print_status, print_status
+      );
+    }
+    updates.push('print_status = ?'); params.push(print_status);
+  }
   if (tags !== undefined) { updates.push('tags = ?'); params.push(JSON.stringify(tags)); }
   if (notes !== undefined) { updates.push('notes = ?'); params.push(notes); }
   if (source_url !== undefined) { updates.push('source_url = ?'); params.push(source_url); }
@@ -251,6 +259,31 @@ app.patch('/api/models/:id', (req, res) => {
 
   db.prepare(`UPDATE models SET ${updates.join(', ')} WHERE id = ?`).run(...params);
   res.json({ success: true });
+});
+
+// Status history for a model
+app.get('/api/models/:id/status-log', (req, res) => {
+  const log = db.prepare(
+    `SELECT id, from_status, to_status, note, changed_at FROM status_log WHERE model_id = ? ORDER BY id DESC`
+  ).all(req.params.id);
+  res.json(log);
+});
+
+// Common tags across a set of models (for bulk tag editor)
+app.get('/api/models/common-tags', (req, res) => {
+  const raw = req.query.ids || '';
+  const ids = raw.split(',').map(Number).filter(Boolean);
+  if (!ids.length) return res.json({ allTags: [], commonTags: [] });
+
+  const placeholders = ids.map(() => '?').join(',');
+  const rows = db.prepare(`SELECT tags FROM models WHERE id IN (${placeholders})`).all(...ids);
+  const tagSets = rows.map(r => { try { return new Set(JSON.parse(r.tags || '[]')); } catch { return new Set(); } });
+  if (!tagSets.length) return res.json({ allTags: [], commonTags: [] });
+
+  // allTags: union; commonTags: intersection (present in every selected model)
+  const allTags = [...new Set(tagSets.flatMap(s => [...s]))].sort();
+  const commonTags = allTags.filter(t => tagSets.every(s => s.has(t)));
+  res.json({ allTags, commonTags });
 });
 
 // Toggle a single file as printed/unprinted

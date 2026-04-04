@@ -485,20 +485,38 @@ function HealthTab({ onAnnotateThese }) {
   };
 
   const sections = [
-    { id: 'duplicates',  label: 'Duplicates',    icon: '⧉', count: data?.summary?.duplicatePairs },
-    { id: 'emptyFolders',label: 'Empty Folders', icon: '📂', count: data?.summary?.emptyFolders },
-    { id: 'noThumbnail', label: 'No Thumbnail',  icon: '🖼', count: data?.summary?.noThumbnail },
-    { id: 'noTags',      label: 'No Tags',        icon: '🏷', count: data?.summary?.noTags },
-    { id: 'noFranchise', label: 'No Franchise',   icon: '🗂', count: data?.summary?.noFranchise },
-    { id: 'noSource',    label: 'No Source URL',  icon: '🔗', count: data?.summary?.noSource },
+    { id: 'crossCreator', label: 'X-Creator Dupes', icon: '🔀', count: data?.summary?.crossCreatorDupes },
+    { id: 'duplicates',   label: 'Similar Names',   icon: '⧉', count: data?.summary?.duplicatePairs },
+    { id: 'emptyFolders', label: 'Empty Folders',   icon: '📂', count: data?.summary?.emptyFolders },
+    { id: 'noThumbnail',  label: 'No Thumbnail',    icon: '🖼', count: data?.summary?.noThumbnail },
+    { id: 'noTags',       label: 'No Tags',          icon: '🏷', count: data?.summary?.noTags },
+    { id: 'noFranchise',  label: 'No Franchise',     icon: '🗂', count: data?.summary?.noFranchise },
+    { id: 'noSource',     label: 'No Source URL',    icon: '🔗', count: data?.summary?.noSource },
   ];
 
-  function ModelRow({ m, extra }) {
+  function ModelRow({ m, extra, onHide }) {
+    const [hidden, setHidden] = useState(false);
+    if (hidden) return null;
     return (
       <div className="org-health-row">
         <div className="org-health-name">{m.name}</div>
         {m.creator_name && <div className="org-health-creator">{m.creator_name}</div>}
         {extra && <div className="org-health-extra">{extra}</div>}
+        {onHide && (
+          <button
+            onClick={async () => {
+              await fetch('/api/models/bulk', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ ids: [m.id], hidden: true }),
+              });
+              setHidden(true);
+              if (onHide) onHide(m.id);
+            }}
+            style={{ marginLeft: 'auto', background: 'none', border: '1px solid #3f3f4d', borderRadius: 3, color: '#7a7a8c', cursor: 'pointer', fontSize: 10, fontFamily: 'var(--font-mono)', padding: '2px 7px', flexShrink: 0 }}
+            title="Hide this model (keep the other)">
+            🙈 Hide
+          </button>
+        )}
       </div>
     );
   }
@@ -552,9 +570,22 @@ function HealthTab({ onAnnotateThese }) {
   function renderSection() {
     if (!data) return null;
     switch (activeSection) {
+      case 'crossCreator':
+        return !data.crossCreatorDupes || data.crossCreatorDupes.length === 0
+          ? <div className="org-empty">No cross-creator duplicates found 🎉</div>
+          : data.crossCreatorDupes.map((group, i) => (
+            <div key={i} className="org-dupe-pair">
+              <div className="org-dupe-score" style={{ color: '#5b9bd5' }}>
+                "{group.key}" — {group.models.length} copies across {new Set(group.models.map(m => m.creator_name)).size} creators
+              </div>
+              {group.models.map(m => (
+                <ModelRow key={m.id} m={m} extra={`${m.file_count} files`} onHide={() => {}} />
+              ))}
+            </div>
+          ));
       case 'duplicates':
         return data.duplicates.length === 0
-          ? <div className="org-empty">No duplicate pairs found 🎉</div>
+          ? <div className="org-empty">No similar-name pairs found 🎉</div>
           : data.duplicates.map((pair, i) => (
             <div key={i} className="org-dupe-pair">
               <div className="org-dupe-score">{Math.round(pair.score * 100)}% similar</div>
@@ -603,7 +634,10 @@ function HealthTab({ onAnnotateThese }) {
         <>
           <div className="org-health-summary">
             <div className="org-health-stat"><span className="org-health-stat-num">{data.summary.total}</span><span>Total</span></div>
-            <div className="org-health-stat org-health-warn"><span className="org-health-stat-num">{data.summary.duplicatePairs}</span><span>Dupes</span></div>
+            <div className="org-health-stat org-health-warn" style={{ cursor: 'pointer' }} onClick={() => setActiveSection('crossCreator')}>
+              <span className="org-health-stat-num" style={{ color: data.summary.crossCreatorDupes > 0 ? '#5b9bd5' : undefined }}>{data.summary.crossCreatorDupes ?? 0}</span><span>X-Dupes</span>
+            </div>
+            <div className="org-health-stat org-health-warn"><span className="org-health-stat-num">{data.summary.duplicatePairs}</span><span>Similar</span></div>
             <div className="org-health-stat org-health-warn"><span className="org-health-stat-num">{data.summary.noTags}</span><span>No Tags</span></div>
             <div className="org-health-stat org-health-warn"><span className="org-health-stat-num">{data.summary.noThumbnail}</span><span>No Thumb</span></div>
             <div className="org-health-stat org-health-warn"><span className="org-health-stat-num">{data.summary.noFranchise}</span><span>No Franchise</span></div>

@@ -46,6 +46,27 @@ function normName(s) {
   return String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
 }
 
+/**
+ * Deep-normalise a model name for cross-creator duplicate detection.
+ * Strips noise (timestamps, scale prefixes, common modifiers) but keeps
+ * meaningful variant words (bust, statue, diorama) so "Spider-Man Bust"
+ * and "Spider-Man Statue" are NOT collapsed together.
+ */
+function deepNorm(s) {
+  let n = String(s || '').toLowerCase();
+  // Google Drive batch-download timestamps: -20250109T000437Z-003
+  n = n.replace(/-\d{8}t\d{6}z(-\d+)?/gi, '');
+  // Scale prefixes: "1_12 scale", "1:12", "1/12 scale"
+  n = n.replace(/\b\d+[\:_\/x]\d+\s*scale\b/gi, '');
+  // Common noise-only modifiers (not bust/statue/diorama — those are meaningful)
+  n = n.replace(/\b(nsfw|presupported|pre[-\s]?support(?:s|ed)?|unsupported|fdm|remix|fan[-\s]?art|fanart|painted|uncut)\b/gi, '');
+  // Creator slug suffixes: CA3D, MMF, TGA, etc.
+  n = n.replace(/\b([A-Z]{2,4}\d*)\b/g, '');
+  // Collapse non-alphanumeric to single space
+  n = n.replace(/[^a-z0-9]+/g, ' ').trim();
+  return n;
+}
+
 /** Similarity ratio 0-1 (higher = more similar) */
 function similarity(a, b) {
   const na = normName(a), nb = normName(b);
@@ -501,6 +522,23 @@ router.get('/health', (req, res) => {
   const noTags        = models.filter(m => { try { return !JSON.parse(m.tags || '[]').length; } catch { return true; } });
   const noFranchise   = models.filter(m => !m.franchise);
 
+  // Cross-creator duplicates: same deep-normalized name, different creators
+  const byDeepKey = new Map();
+  for (const m of models) {
+    const key = deepNorm(m.name);
+    if (!key || key.length < 4) continue; // skip too-short keys
+    if (!byDeepKey.has(key)) byDeepKey.set(key, []);
+    byDeepKey.get(key).push(m);
+  }
+  const crossCreatorDupes = [];
+  for (const [key, group] of byDeepKey) {
+    const creatorIds = new Set(group.map(m => m.creator_id).filter(Boolean));
+    if (creatorIds.size > 1) {
+      crossCreatorDupes.push({ key, models: group });
+    }
+  }
+  crossCreatorDupes.sort((a, b) => b.models.length - a.models.length);
+
   res.json({
     summary: {
       total: models.length,
@@ -510,8 +548,10 @@ router.get('/health', (req, res) => {
       noSource: noSource.length,
       noTags: noTags.length,
       noFranchise: noFranchise.length,
+      crossCreatorDupes: crossCreatorDupes.length,
     },
     duplicates,
+    crossCreatorDupes,
     emptyFolders,
     noThumbnail,
     noSource,
