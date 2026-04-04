@@ -18,6 +18,7 @@ const https    = require('https');
 const fs       = require('fs');
 const path     = require('path');
 const db       = require('./db');
+const { pickRenderArchives, analyzeFolder, extractImagesFromArchive } = require('./scanner');
 
 const router = express.Router();
 
@@ -787,7 +788,8 @@ router.get('/thumbnail-stats', (req, res) => {
  * For every model that has images[] in DB but no thumbnail, set the first image.
  */
 router.post('/fix-thumbnails', (req, res) => {
-  const models = db.prepare(`
+  // Pass 1: models that already have images[] in DB but no thumbnail_path
+  const withImages = db.prepare(`
     SELECT id, images FROM models
     WHERE (hidden IS NULL OR hidden = 0)
       AND (thumbnail_path IS NULL OR thumbnail_path = '')
@@ -796,7 +798,7 @@ router.post('/fix-thumbnails', (req, res) => {
 
   let fixed = 0;
   db.transaction(() => {
-    for (const m of models) {
+    for (const m of withImages) {
       try {
         const imgs = JSON.parse(m.images);
         if (imgs && imgs.length) {
@@ -806,7 +808,71 @@ router.post('/fix-thumbnails', (req, res) => {
       } catch {}
     }
   })();
-  res.json({ fixed, total: models.length });
+
+  // Pass 2: models with no images at all — try to extract from render archives
+  const noImages = db.prepare(`
+    SELECT m.id, m.uuid, m.folder_path, m.render_zip_hint,
+           c.render_zip_hint AS creator_hint
+    FROM models m LEFT JOIN creators c ON c.id = m.creator_id
+    WHERE (m.hidden IS NULL OR m.hidden = 0)
+      AND (m.thumbnail_path IS NULL OR m.thumbnail_path = '')
+      AND (m.images IS NULL OR m.images = '[]' OR m.images = '')
+      AND m.folder_path IS NOT NULL
+  `).all();
+
+  let extracted = 0;
+  for (const m of noImages) {
+    try {
+      if (!fs.existsSync(m.folder_path)) continue;
+      const hint = m.render_zip_hint || m.creator_hint || null;
+      const analysis = analyzeFolder(m.folder_path, null);
+      const archives = pickRenderArchives(analysis, hint);
+      const imgs = [];
+      for (const archPath of archives) {
+        imgs.push(...extractImagesFromArchive(archPath, m.uuid));
+        if (imgs.length) break;
+      }
+      if (imgs.length) {
+        db.prepare(`UPDATE models SET images = ?, thumbnail_path = ?, updated_at = datetime('now') WHERE id = ?`)
+          .run(JSON.stringify(imgs), imgs[0], m.id);
+        extracted++;
+      }
+    } catch {}
+  }
+
+  res.json({ fixed, extracted, total: withImages.length + noImages.length });
+});
+
+/**
+ * GET /api/organize/integrity
+ * Checks which model folder paths no longer exist on disk.
+ * Fast (filesystem stat only, no ZIP parsing).
+ */
+router.get('/integrity', (req, res) => {
+  const models = db.prepare(`
+    SELECT m.id, m.name, m.folder_path, m.file_count,
+           c.name AS creator_name
+    FROM models m LEFT JOIN creators c ON c.id = m.creator_id
+    WHERE (m.hidden IS NULL OR m.hidden = 0)
+  `).all();
+
+  const missingFolders = [];
+  const missingFiles = [];
+  const checked = { folders: 0, ok: 0 };
+
+  for (const m of models) {
+    checked.folders++;
+    if (!m.folder_path || !fs.existsSync(m.folder_path)) {
+      missingFolders.push({ id: m.id, name: m.name, creator_name: m.creator_name, folder_path: m.folder_path });
+    } else {
+      checked.ok++;
+    }
+  }
+
+  res.json({
+    summary: { checked: checked.folders, ok: checked.ok, missingFolders: missingFolders.length },
+    missingFolders,
+  });
 });
 
 // ── loose file grouper ────────────────────────────────────────────────────────

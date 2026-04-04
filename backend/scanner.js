@@ -668,4 +668,4 @@ async function scanSingleCreator(creatorPath, creatorId, creatorName, progressCa
   }
 }
 
-module.exports = { scanLibrary, scanSingleCreator, LIBRARY_PATH, matchesHint, pickRenderArchives, analyzeFolder, inferReleaseName, discoverModelFolders };
+module.exports = { scanLibrary, scanSingleCreator, LIBRARY_PATH, matchesHint, pickRenderArchives, analyzeFolder, inferReleaseName, discoverModelFolders, extractImagesFromArchive };

@@ -102,6 +102,39 @@ try { db.exec(`ALTER TABLE models ADD COLUMN team TEXT`); } catch {}
 try { db.exec(`CREATE INDEX IF NOT EXISTS idx_models_team ON models(team)`); } catch {}
 try { db.exec(`ALTER TABLE model_files ADD COLUMN printed_at TEXT`); } catch {}
 
+// Print queue
+try { db.exec(`
+  CREATE TABLE IF NOT EXISTS print_queue (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    model_id INTEGER NOT NULL UNIQUE REFERENCES models(id) ON DELETE CASCADE,
+    position REAL NOT NULL DEFAULT 0,
+    added_at TEXT DEFAULT (datetime('now'))
+  )
+`); } catch {}
+try { db.exec(`CREATE INDEX IF NOT EXISTS idx_queue_position ON print_queue(position)`); } catch {}
+
+// Collections
+try { db.exec(`
+  CREATE TABLE IF NOT EXISTS collections (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    color TEXT DEFAULT '#5b9bd5',
+    created_at TEXT DEFAULT (datetime('now'))
+  )
+`); } catch {}
+try { db.exec(`
+  CREATE TABLE IF NOT EXISTS collection_models (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    collection_id INTEGER NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
+    model_id INTEGER NOT NULL REFERENCES models(id) ON DELETE CASCADE,
+    sort_order INTEGER DEFAULT 0,
+    added_at TEXT DEFAULT (datetime('now')),
+    UNIQUE(collection_id, model_id)
+  )
+`); } catch {}
+try { db.exec(`CREATE INDEX IF NOT EXISTS idx_coll_models_coll ON collection_models(collection_id)`); } catch {}
+try { db.exec(`CREATE INDEX IF NOT EXISTS idx_coll_models_model ON collection_models(model_id)`); } catch {}
+
 // Status history log
 try { db.exec(`
   CREATE TABLE IF NOT EXISTS status_log (

@@ -143,7 +143,7 @@ app.post('/api/scan/creator/:id', async (req, res) => {
 // ── Models ─────────────────────────────────────────────────────────────────────
 
 app.get('/api/models', (req, res) => {
-  const { search, creator, status, tags, franchise, page = 1, limit = 48, show_hidden, has_thumbnail, recently_added } = req.query;
+  const { search, creator, status, tags, franchise, collection, page = 1, limit = 48, show_hidden, has_thumbnail, recently_added } = req.query;
   const offset = (parseInt(page) - 1) * parseInt(limit);
 
   let where = ['1=1'];
@@ -172,6 +172,12 @@ app.get('/api/models', (req, res) => {
   if (franchise) {
     where.push('m.franchise = ?');
     params.push(franchise);
+  }
+
+  // Collection filter — join collection_models
+  if (collection) {
+    where.push('m.id IN (SELECT model_id FROM collection_models WHERE collection_id = ?)');
+    params.push(collection);
   }
 
   if (search) {
@@ -1426,6 +1432,167 @@ app.get('/api/files/:fileId/stl', (req, res) => {
   res.setHeader('Content-Disposition', `inline; filename="${file.filename}"`);
   res.setHeader('Access-Control-Allow-Origin', '*');
   fs.createReadStream(file.filepath).pipe(res);
+});
+
+// ── Print Queue ───────────────────────────────────────────────────────────────
+
+app.get('/api/queue', (req, res) => {
+  const rows = db.prepare(`
+    SELECT pq.model_id, pq.position, pq.added_at,
+           m.name, m.thumbnail_path, m.print_status, m.franchise,
+           c.name AS creator_name
+    FROM print_queue pq
+    JOIN models m ON m.id = pq.model_id
+    LEFT JOIN creators c ON c.id = m.creator_id
+    ORDER BY pq.position ASC
+  `).all();
+  res.json(rows);
+});
+
+app.post('/api/queue', (req, res) => {
+  const { modelId } = req.body;
+  if (!modelId) return res.status(400).json({ error: 'modelId required' });
+  const model = db.prepare('SELECT id FROM models WHERE id = ?').get(modelId);
+  if (!model) return res.status(404).json({ error: 'Model not found' });
+  // Add at the end (max position + 1)
+  const maxPos = db.prepare('SELECT MAX(position) as m FROM print_queue').get().m || 0;
+  try {
+    db.prepare('INSERT INTO print_queue (model_id, position) VALUES (?, ?)').run(modelId, maxPos + 1);
+  } catch {
+    return res.status(409).json({ error: 'Already in queue' });
+  }
+  res.json({ success: true, position: maxPos + 1 });
+});
+
+app.delete('/api/queue/:modelId', (req, res) => {
+  db.prepare('DELETE FROM print_queue WHERE model_id = ?').run(req.params.modelId);
+  res.json({ success: true });
+});
+
+app.put('/api/queue/reorder', (req, res) => {
+  // { order: [modelId1, modelId2, ...] } — assign positions 1,2,3...
+  const { order } = req.body;
+  if (!Array.isArray(order)) return res.status(400).json({ error: 'order array required' });
+  const update = db.prepare('UPDATE print_queue SET position = ? WHERE model_id = ?');
+  db.transaction(() => {
+    order.forEach((modelId, i) => update.run(i + 1, modelId));
+  })();
+  res.json({ success: true });
+});
+
+// ── Tag suggestions ───────────────────────────────────────────────────────────
+
+app.get('/api/models/:id/tag-suggestions', (req, res) => {
+  const model = db.prepare('SELECT id, tags, franchise, creator_id FROM models WHERE id = ?').get(req.params.id);
+  if (!model) return res.status(404).json({ error: 'Not found' });
+
+  let existingTags;
+  try { existingTags = new Set(JSON.parse(model.tags || '[]')); } catch { existingTags = new Set(); }
+
+  // Gather tags from same-franchise AND same-creator models
+  const conditions = [];
+  const params = [];
+  if (model.franchise) { conditions.push('franchise = ?'); params.push(model.franchise); }
+  conditions.push('creator_id = ?'); params.push(model.creator_id);
+  params.push(model.id);
+
+  const siblings = db.prepare(`
+    SELECT tags FROM models
+    WHERE (${conditions.join(' OR ')}) AND id != ? AND (hidden IS NULL OR hidden = 0)
+    LIMIT 200
+  `).all(...params);
+
+  const freq = {};
+  for (const s of siblings) {
+    try {
+      for (const t of JSON.parse(s.tags || '[]')) {
+        if (!existingTags.has(t)) freq[t] = (freq[t] || 0) + 1;
+      }
+    } catch {}
+  }
+
+  const suggestions = Object.entries(freq)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 10)
+    .map(([tag, count]) => ({ tag, count }));
+
+  res.json(suggestions);
+});
+
+// ── Collections ───────────────────────────────────────────────────────────────
+
+app.get('/api/collections', (req, res) => {
+  const cols = db.prepare(`
+    SELECT c.id, c.name, c.color, c.created_at,
+           COUNT(cm.id) AS model_count
+    FROM collections c
+    LEFT JOIN collection_models cm ON cm.collection_id = c.id
+    GROUP BY c.id ORDER BY c.name ASC
+  `).all();
+  res.json(cols);
+});
+
+app.post('/api/collections', (req, res) => {
+  const { name, color } = req.body;
+  if (!name?.trim()) return res.status(400).json({ error: 'name required' });
+  try {
+    const r = db.prepare('INSERT INTO collections (name, color) VALUES (?, ?)').run(name.trim(), color || '#5b9bd5');
+    res.json({ id: r.lastInsertRowid, name: name.trim(), color: color || '#5b9bd5', model_count: 0 });
+  } catch { res.status(409).json({ error: 'Name already in use' }); }
+});
+
+app.patch('/api/collections/:id', (req, res) => {
+  const { name, color } = req.body;
+  const col = db.prepare('SELECT id FROM collections WHERE id = ?').get(req.params.id);
+  if (!col) return res.status(404).json({ error: 'Not found' });
+  if (name) db.prepare('UPDATE collections SET name = ? WHERE id = ?').run(name.trim(), req.params.id);
+  if (color) db.prepare('UPDATE collections SET color = ? WHERE id = ?').run(color, req.params.id);
+  res.json({ success: true });
+});
+
+app.delete('/api/collections/:id', (req, res) => {
+  db.prepare('DELETE FROM collections WHERE id = ?').run(req.params.id);
+  res.json({ success: true });
+});
+
+app.get('/api/collections/:id/models', (req, res) => {
+  const { page = 1, limit = 48 } = req.query;
+  const offset = (parseInt(page) - 1) * parseInt(limit);
+  const total = db.prepare('SELECT COUNT(*) as n FROM collection_models WHERE collection_id = ?').get(req.params.id).n;
+  const models = db.prepare(`
+    SELECT m.id, m.name, m.thumbnail_path, m.print_status, m.tags, m.franchise,
+           m.has_stl, m.has_chitubox, m.has_lychee, m.file_count,
+           c.name AS creator_name, cm.sort_order
+    FROM collection_models cm
+    JOIN models m ON m.id = cm.model_id
+    LEFT JOIN creators c ON c.id = m.creator_id
+    WHERE cm.collection_id = ?
+    ORDER BY cm.sort_order ASC, cm.added_at ASC
+    LIMIT ? OFFSET ?
+  `).all(req.params.id, parseInt(limit), offset);
+  res.json({ models, total, pages: Math.ceil(total / parseInt(limit)) });
+});
+
+app.post('/api/collections/:id/models', (req, res) => {
+  const { modelIds } = req.body;
+  if (!Array.isArray(modelIds) || !modelIds.length) return res.status(400).json({ error: 'modelIds array required' });
+  const insert = db.prepare('INSERT OR IGNORE INTO collection_models (collection_id, model_id) VALUES (?, ?)');
+  db.transaction(() => { for (const mid of modelIds) insert.run(req.params.id, mid); })();
+  res.json({ success: true, added: modelIds.length });
+});
+
+app.delete('/api/collections/:id/models/:modelId', (req, res) => {
+  db.prepare('DELETE FROM collection_models WHERE collection_id = ? AND model_id = ?').run(req.params.id, req.params.modelId);
+  res.json({ success: true });
+});
+
+app.get('/api/models/:id/collections', (req, res) => {
+  const cols = db.prepare(`
+    SELECT c.id, c.name, c.color FROM collections c
+    JOIN collection_models cm ON cm.collection_id = c.id
+    WHERE cm.model_id = ? ORDER BY c.name
+  `).all(req.params.id);
+  res.json(cols);
 });
 
 // ── Health ────────────────────────────────────────────────────────────────────

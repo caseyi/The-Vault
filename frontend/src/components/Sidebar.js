@@ -11,10 +11,30 @@ const STATUS_OPTIONS = [
   { value: 'failed', label: 'Failed', dot: '#cf7272' },
 ];
 
-export default function Sidebar({ open, onToggle, stats, creators, tags, filters, onFilterChange, onScanClick, onOrganizeClick, onHomeClick, showHidden, onToggleHidden, appVersion, onRescanCreator, franchises }) {
+export default function Sidebar({ open, onToggle, stats, creators, tags, filters, onFilterChange, onScanClick, onOrganizeClick, onHomeClick, showHidden, onToggleHidden, appVersion, onRescanCreator, franchises, collections, queueCount, onQueueClick, onCollectionClick, onCollectionsChange }) {
   const [hintCreator, setHintCreator] = useState(null); // { id, name, render_zip_hint }
   const [showAllTags, setShowAllTags] = useState(false);
   const [rescanningId, setRescanningId] = useState(null);
+  const [newCollectionName, setNewCollectionName] = useState('');
+  const [showNewCollection, setShowNewCollection] = useState(false);
+
+  const handleCreateCollection = async () => {
+    if (!newCollectionName.trim()) return;
+    await fetch('/api/collections', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: newCollectionName.trim() }),
+    });
+    setNewCollectionName(''); setShowNewCollection(false);
+    if (onCollectionsChange) onCollectionsChange();
+  };
+
+  const handleDeleteCollection = async (e, id) => {
+    e.stopPropagation();
+    if (!window.confirm('Delete this collection?')) return;
+    await fetch(`/api/collections/${id}`, { method: 'DELETE' });
+    if (onCollectionsChange) onCollectionsChange();
+    if (filters.collection === String(id)) onFilterChange({ ...filters, collection: '' });
+  };
 
   const handleRescanCreator = async (e, creator) => {
     e.stopPropagation();
@@ -65,6 +85,12 @@ export default function Sidebar({ open, onToggle, stats, creators, tags, filters
                   <span className="sidebar-stat-val" style={{ color: 'var(--text-faint)' }}>{stats.totalHidden}</span>
                 </div>
               )}
+              <button
+                onClick={onQueueClick}
+                style={{ marginTop: 8, width: '100%', background: queueCount > 0 ? 'rgba(193,127,58,0.12)' : 'var(--bg3)', border: `1px solid ${queueCount > 0 ? 'rgba(193,127,58,0.4)' : 'var(--border)'}`, borderRadius: 4, color: queueCount > 0 ? '#c17f3a' : 'var(--text-muted)', padding: '5px 10px', cursor: 'pointer', fontSize: 12, fontFamily: 'var(--font-body)', display: 'flex', alignItems: 'center', gap: 6 }}>
+                🖨 Print Queue
+                <span style={{ marginLeft: 'auto', fontFamily: 'var(--font-mono)', fontSize: 10 }}>{queueCount > 0 ? queueCount : ''}</span>
+              </button>
             </div>
 
             <div className="sidebar-section">
@@ -150,6 +176,56 @@ export default function Sidebar({ open, onToggle, stats, creators, tags, filters
                 </div>
               </div>
             )}
+
+            {/* Collections */}
+            <div className="sidebar-section">
+              <div className="sidebar-section-label" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                Collections
+                <div style={{ display: 'flex', gap: 4 }}>
+                  {filters.collection && (
+                    <button onClick={() => onFilterChange({ ...filters, collection: '' })}
+                      style={{ background: 'none', border: 'none', color: 'var(--accent)', cursor: 'pointer', fontSize: 9, fontFamily: 'var(--font-mono)', letterSpacing: 1 }}>
+                      CLEAR
+                    </button>
+                  )}
+                  <button onClick={() => setShowNewCollection(s => !s)}
+                    style={{ background: 'none', border: 'none', color: 'var(--text-faint)', cursor: 'pointer', fontSize: 13, lineHeight: 1 }}
+                    title="New collection">+</button>
+                </div>
+              </div>
+              {showNewCollection && (
+                <div style={{ display: 'flex', gap: 4, marginBottom: 6 }}>
+                  <input value={newCollectionName} onChange={e => setNewCollectionName(e.target.value)}
+                    onKeyDown={e => { if (e.key === 'Enter') handleCreateCollection(); if (e.key === 'Escape') setShowNewCollection(false); }}
+                    placeholder="Collection name" autoFocus
+                    style={{ flex: 1, background: 'var(--bg3)', border: '1px solid var(--border)', borderRadius: 4, color: 'var(--text)', padding: '4px 7px', fontSize: 11, outline: 'none', fontFamily: 'var(--font-body)' }} />
+                  <button onClick={handleCreateCollection}
+                    style={{ background: 'var(--accent)', border: 'none', borderRadius: 4, color: '#0d0d0f', padding: '4px 8px', cursor: 'pointer', fontSize: 10, fontFamily: 'var(--font-display)' }}>
+                    ADD
+                  </button>
+                </div>
+              )}
+              {collections && collections.length > 0 ? (
+                <div className="creator-list">
+                  {collections.map(c => (
+                    <button key={c.id}
+                      className={`creator-btn ${filters.collection === String(c.id) ? 'active' : ''}`}
+                      onClick={() => { onFilterChange({ ...filters, collection: filters.collection === String(c.id) ? '' : String(c.id) }); }}>
+                      <span style={{ width: 8, height: 8, borderRadius: '50%', background: c.color, flexShrink: 0 }} />
+                      <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', flex: 1 }}>{c.name}</span>
+                      <span className="count">{c.model_count}</span>
+                      <span onClick={e => handleDeleteCollection(e, c.id)}
+                        style={{ color: 'var(--text-faint)', fontSize: 10, padding: '0 2px', opacity: 0.6 }}
+                        title="Delete collection">✕</span>
+                    </button>
+                  ))}
+                </div>
+              ) : (
+                <div style={{ fontSize: 11, color: 'var(--text-faint)', padding: '4px 0' }}>
+                  No collections yet. Press + to create one.
+                </div>
+              )}
+            </div>
 
             {/* Tag Cloud */}
             {tags && tags.length > 0 && (

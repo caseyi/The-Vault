@@ -125,13 +125,24 @@ function ModelCard({ model, onClick, bulkMode, selected, onToggle, onHide }) {
   );
 }
 
-function BulkActionBar({ selectedIds, onClearSelection, onBulkStatus, onBulkTag, onBulkHide, onSelectAll, totalVisible }) {
+function BulkActionBar({ selectedIds, onClearSelection, onBulkStatus, onBulkTag, onBulkHide, onSelectAll, totalVisible, collections, onRefreshCollections }) {
   const [showStatusMenu, setShowStatusMenu] = useState(false);
   const [showTagMenu, setShowTagMenu] = useState(false);
+  const [showCollectionMenu, setShowCollectionMenu] = useState(false);
   const [tagInput, setTagInput] = useState('');
   const [commonTags, setCommonTags] = useState([]);
   const [allTags, setAllTags] = useState([]);
   const [saving, setSaving] = useState(false);
+
+  const handleAddToCollection = async (colId) => {
+    setSaving(true); setShowCollectionMenu(false);
+    await fetch(`/api/collections/${colId}/models`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ modelIds: selectedIds }),
+    });
+    setSaving(false);
+    if (onRefreshCollections) onRefreshCollections();
+  };
 
   const handleBulkStatus = async (status) => {
     setSaving(true); setShowStatusMenu(false);
@@ -246,6 +257,27 @@ function BulkActionBar({ selectedIds, onClearSelection, onBulkStatus, onBulkTag,
         )}
       </div>
 
+      {/* Add to Collection */}
+      {collections && collections.length > 0 && (
+        <div style={{ position: 'relative' }}>
+          <button onClick={() => { setShowCollectionMenu(s => !s); setShowStatusMenu(false); setShowTagMenu(false); }}
+            style={{ background: '#242429', border: '1px solid #3f3f4d', borderRadius: 4, color: '#e8e8f0', padding: '6px 12px', cursor: 'pointer', fontSize: 12 }}>
+            📁 Collection ▾
+          </button>
+          {showCollectionMenu && (
+            <div style={{ position: 'absolute', bottom: '110%', left: 0, background: '#1c1c21', border: '1px solid #3f3f4d', borderRadius: 6, overflow: 'hidden', minWidth: 160, boxShadow: '0 8px 24px rgba(0,0,0,0.5)', zIndex: 30 }}>
+              {collections.map(c => (
+                <button key={c.id} onClick={() => handleAddToCollection(c.id)} disabled={saving}
+                  style={{ display: 'flex', alignItems: 'center', gap: 8, width: '100%', padding: '7px 12px', background: 'none', border: 'none', color: '#e8e8f0', cursor: 'pointer', fontSize: 12, textAlign: 'left' }}>
+                  <span style={{ width: 8, height: 8, borderRadius: '50%', background: c.color, flexShrink: 0 }} />
+                  {c.name}
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
       {/* Bulk hide button */}
       <button onClick={() => onBulkHide(true)}
         style={{ background: '#242429', border: '1px solid #3f3f4d', borderRadius: 4, color: '#7a7a8c', padding: '6px 12px', cursor: 'pointer', fontSize: 12 }}>
@@ -264,7 +296,7 @@ function BulkActionBar({ selectedIds, onClearSelection, onBulkStatus, onBulkTag,
   );
 }
 
-export default function Gallery({ filters, onFilterChange, onModelClick, showHidden, onRefreshStats, refreshKey }) {
+export default function Gallery({ filters, onFilterChange, onModelClick, showHidden, onRefreshStats, refreshKey, collections, onRefreshCollections }) {
   const [models, setModels] = useState([]);
   const [total, setTotal] = useState(0);
   const [pages, setPages] = useState(1);
@@ -285,6 +317,7 @@ export default function Gallery({ filters, onFilterChange, onModelClick, showHid
         ...(filters.has_thumbnail && { has_thumbnail: '1' }),
         ...(filters.recently_added && { recently_added: '1' }),
         ...(filters.franchise && { franchise: filters.franchise }),
+        ...(filters.collection && { collection: filters.collection }),
         ...(showHidden && { show_hidden: '1' }),
       });
       const r = await fetch(`/api/models?${params}`);
@@ -422,7 +455,8 @@ export default function Gallery({ filters, onFilterChange, onModelClick, showHid
       {bulkMode && selectedIds.length > 0 && (
         <BulkActionBar selectedIds={selectedIds} onClearSelection={clearSelection}
           onBulkStatus={handleBulkStatus} onBulkTag={handleBulkTag} onBulkHide={handleBulkHide}
-          onSelectAll={() => setSelectedIds(models.map(m => m.id))} totalVisible={models.length} />
+          onSelectAll={() => setSelectedIds(models.map(m => m.id))} totalVisible={models.length}
+          collections={collections} onRefreshCollections={onRefreshCollections} />
       )}
     </div>
   );

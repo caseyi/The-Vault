@@ -457,9 +457,11 @@ function HealthTab({ onAnnotateThese }) {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
-  const [activeSection, setActiveSection] = useState('duplicates');
+  const [activeSection, setActiveSection] = useState('crossCreator');
   const [thumbFixing, setThumbFixing] = useState(false);
   const [thumbResult, setThumbResult] = useState('');
+  const [integrityData, setIntegrityData] = useState(null);
+  const [integrityLoading, setIntegrityLoading] = useState(false);
 
   const run = useCallback(async () => {
     setLoading(true); setError('');
@@ -478,15 +480,25 @@ function HealthTab({ onAnnotateThese }) {
     try {
       const res = await fetch('/api/organize/fix-thumbnails', { method: 'POST' });
       const d = await res.json();
-      setThumbResult(`✓ Fixed ${d.fixed} thumbnails`);
+      setThumbResult(`✓ Fixed ${d.fixed}${d.extracted ? ` + extracted ${d.extracted} from archives` : ''}`);
       run();
     } catch (e) { setError(e.message); }
     setThumbFixing(false);
   };
 
+  const runIntegrity = async () => {
+    setIntegrityLoading(true); setActiveSection('integrity');
+    try {
+      const r = await fetch('/api/organize/integrity');
+      setIntegrityData(await r.json());
+    } catch (e) { setError(e.message); }
+    setIntegrityLoading(false);
+  };
+
   const sections = [
     { id: 'crossCreator', label: 'X-Creator Dupes', icon: '🔀', count: data?.summary?.crossCreatorDupes },
     { id: 'duplicates',   label: 'Similar Names',   icon: '⧉', count: data?.summary?.duplicatePairs },
+    { id: 'integrity',    label: 'Integrity',        icon: '🔍', count: integrityData?.summary?.missingFolders },
     { id: 'emptyFolders', label: 'Empty Folders',   icon: '📂', count: data?.summary?.emptyFolders },
     { id: 'noThumbnail',  label: 'No Thumbnail',    icon: '🖼', count: data?.summary?.noThumbnail },
     { id: 'noTags',       label: 'No Tags',          icon: '🏷', count: data?.summary?.noTags },
@@ -558,9 +570,19 @@ function HealthTab({ onAnnotateThese }) {
           </span>
           <button className="org-btn org-btn-sm" onClick={fixThumbnails} disabled={thumbFixing}
             style={{ color: '#5b9bd5', borderColor: 'rgba(91,155,213,0.4)' }}>
-            {thumbFixing ? '⏳' : '🖼'} Auto-Fix Thumbnails
+            {thumbFixing ? '⏳' : '🖼'} Auto-Fix + Extract
           </button>
           {thumbResult && <span style={{ fontSize: 11, color: '#4caf7d' }}>{thumbResult}</span>}
+        </div>
+      );
+    }
+    if (activeSection === 'integrity') {
+      return (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '6px 0', marginBottom: 6 }}>
+          <button className="org-btn org-btn-sm" onClick={runIntegrity} disabled={integrityLoading}
+            style={{ color: '#5b9bd5', borderColor: 'rgba(91,155,213,0.4)' }}>
+            {integrityLoading ? '⏳ Checking…' : '↻ Re-run Check'}
+          </button>
         </div>
       );
     }
@@ -594,6 +616,28 @@ function HealthTab({ onAnnotateThese }) {
               <ModelRow m={pair.b} />
             </div>
           ));
+      case 'integrity':
+        if (!integrityData) return (
+          <div style={{ textAlign: 'center', padding: '20px 0' }}>
+            <button className="org-btn org-btn-secondary" onClick={runIntegrity} disabled={integrityLoading}>
+              {integrityLoading ? '⏳ Checking…' : '🔍 Run Integrity Check'}
+            </button>
+            <div style={{ fontSize: 11, color: 'var(--text-faint)', marginTop: 8 }}>
+              Checks whether each model's folder still exists on disk.
+            </div>
+          </div>
+        );
+        return integrityData.missingFolders.length === 0
+          ? <div className="org-empty">All {integrityData.summary.checked} model folders found on disk 🎉</div>
+          : (<>
+            <div style={{ fontSize: 11, color: 'var(--text-faint)', marginBottom: 8 }}>
+              {integrityData.summary.missingFolders} of {integrityData.summary.checked} folders not found on disk.
+              These models may have been moved or deleted.
+            </div>
+            {integrityData.missingFolders.map((m, i) => (
+              <ModelRow key={i} m={m} extra={m.folder_path?.split('/').slice(-2).join('/')} />
+            ))}
+          </>);
       case 'emptyFolders':
         return data.emptyFolders.length === 0
           ? <div className="org-empty">No empty folders 🎉</div>

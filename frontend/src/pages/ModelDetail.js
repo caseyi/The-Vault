@@ -66,11 +66,100 @@ function StatusHistory({ modelId }) {
   );
 }
 
-export default function ModelDetail({ modelId, onBack, onSaved }) {
+function TagSuggestions({ modelId, existingTags, onAddTag }) {
+  const [suggestions, setSuggestions] = useState([]);
+  useEffect(() => {
+    fetch(`/api/models/${modelId}/tag-suggestions`)
+      .then(r => r.json()).then(setSuggestions).catch(() => {});
+  }, [modelId]);
+  if (!suggestions.length) return null;
+  return (
+    <div style={{ marginTop: 6 }}>
+      <div style={{ fontSize: 10, fontFamily: 'var(--font-mono)', color: 'var(--text-faint)', letterSpacing: 1, marginBottom: 4 }}>SUGGESTED</div>
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
+        {suggestions.filter(s => !existingTags.includes(s.tag)).slice(0, 8).map(s => (
+          <button key={s.tag} onClick={() => onAddTag(s.tag)}
+            style={{ background: 'rgba(91,155,213,0.1)', border: '1px solid rgba(91,155,213,0.3)', borderRadius: 3, color: '#5b9bd5', padding: '2px 8px', cursor: 'pointer', fontSize: 11, fontFamily: 'var(--font-body)' }}>
+            + {s.tag}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function ModelCollections({ modelId, collections, onCollectionsChange }) {
+  const [modelCols, setModelCols] = useState([]);
+  const [showAdd, setShowAdd] = useState(false);
+  const [adding, setAdding] = useState(false);
+
+  useEffect(() => {
+    fetch(`/api/models/${modelId}/collections`)
+      .then(r => r.json()).then(setModelCols).catch(() => {});
+  }, [modelId]);
+
+  const addToCollection = async (colId) => {
+    setAdding(true);
+    await fetch(`/api/collections/${colId}/models`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ modelIds: [modelId] }),
+    });
+    const updated = await fetch(`/api/models/${modelId}/collections`).then(r => r.json());
+    setModelCols(updated); setShowAdd(false); setAdding(false);
+    if (onCollectionsChange) onCollectionsChange();
+  };
+
+  const removeFromCollection = async (colId) => {
+    await fetch(`/api/collections/${colId}/models/${modelId}`, { method: 'DELETE' });
+    setModelCols(c => c.filter(x => x.id !== colId));
+    if (onCollectionsChange) onCollectionsChange();
+  };
+
+  const available = collections.filter(c => !modelCols.find(m => m.id === c.id));
+
+  return (
+    <div className="detail-card">
+      <div className="detail-card-title">Collections</div>
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginBottom: 6 }}>
+        {modelCols.map(c => (
+          <span key={c.id} style={{ display: 'inline-flex', alignItems: 'center', gap: 4, background: 'var(--bg3)', border: '1px solid var(--border)', borderRadius: 3, padding: '2px 8px', fontSize: 11, color: 'var(--text-muted)' }}>
+            <span style={{ width: 6, height: 6, borderRadius: '50%', background: c.color }} />
+            {c.name}
+            <button onClick={() => removeFromCollection(c.id)}
+              style={{ background: 'none', border: 'none', color: 'var(--text-faint)', cursor: 'pointer', fontSize: 10, padding: 0, marginLeft: 2 }}>×</button>
+          </span>
+        ))}
+        {available.length > 0 && (
+          <div style={{ position: 'relative' }}>
+            <button onClick={() => setShowAdd(s => !s)}
+              style={{ background: 'none', border: '1px dashed var(--border)', borderRadius: 3, color: 'var(--text-faint)', padding: '2px 8px', cursor: 'pointer', fontSize: 11 }}>
+              + Add
+            </button>
+            {showAdd && (
+              <div style={{ position: 'absolute', top: '110%', left: 0, background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 6, minWidth: 160, boxShadow: '0 8px 24px rgba(0,0,0,0.4)', zIndex: 20 }}>
+                {available.map(c => (
+                  <button key={c.id} onClick={() => addToCollection(c.id)} disabled={adding}
+                    style={{ display: 'flex', alignItems: 'center', gap: 8, width: '100%', background: 'none', border: 'none', padding: '7px 12px', color: 'var(--text)', cursor: 'pointer', fontSize: 12, textAlign: 'left' }}>
+                    <span style={{ width: 8, height: 8, borderRadius: '50%', background: c.color, flexShrink: 0 }} />
+                    {c.name}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+export default function ModelDetail({ modelId, onBack, onSaved, onQueueChange, collections, onCollectionsChange }) {
   const [model, setModel] = useState(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  const [inQueue, setInQueue] = useState(false);
+  const [queueLoading, setQueueLoading] = useState(false);
   const [scraping, setScraping] = useState(false);
   const [scrapeLog, setScrapeLog] = useState([]);
   const [scrapeError, setScrapeError] = useState(null);
@@ -134,6 +223,26 @@ export default function ModelDetail({ modelId, onBack, onSaved }) {
         setLoading(false);
       })
       .catch(() => setLoading(false));
+    // Check queue status
+    fetch('/api/queue').then(r => r.json())
+      .then(q => setInQueue(q.some(i => i.model_id === modelId)))
+      .catch(() => {});
+  };
+
+  const toggleQueue = async () => {
+    setQueueLoading(true);
+    if (inQueue) {
+      await fetch(`/api/queue/${modelId}`, { method: 'DELETE' });
+      setInQueue(false);
+    } else {
+      await fetch('/api/queue', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ modelId }),
+      });
+      setInQueue(true);
+    }
+    setQueueLoading(false);
+    if (onQueueChange) onQueueChange();
   };
 
   useEffect(() => { loadModel(); }, [modelId]);
@@ -474,7 +583,13 @@ export default function ModelDetail({ modelId, onBack, onSaved }) {
             </div>
 
             <div className="detail-card">
-              <div className="detail-card-title">Print Status</div>
+              <div className="detail-card-title" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                Print Status
+                <button onClick={toggleQueue} disabled={queueLoading}
+                  style={{ marginLeft: 'auto', background: inQueue ? 'rgba(193,127,58,0.15)' : 'none', border: `1px solid ${inQueue ? '#c17f3a' : 'var(--border)'}`, borderRadius: 4, color: inQueue ? '#c17f3a' : 'var(--text-faint)', padding: '2px 8px', cursor: 'pointer', fontSize: 10, fontFamily: 'var(--font-mono)' }}>
+                  {inQueue ? '🖨 In Queue' : '+ Queue'}
+                </button>
+              </div>
               <select className="status-select" value={status} onChange={e => setStatus(e.target.value)}>
                 {STATUS_OPTIONS.map(s => <option key={s} value={s}>{s.charAt(0).toUpperCase() + s.slice(1)}</option>)}
               </select>
@@ -494,7 +609,16 @@ export default function ModelDetail({ modelId, onBack, onSaved }) {
                   }}
                   placeholder={tags.length ? '' : 'Add tags...'} />
               </div>
+              <TagSuggestions modelId={model.id} existingTags={tags} onAddTag={addTag} />
             </div>
+
+            {collections && (
+              <ModelCollections
+                modelId={model.id}
+                collections={collections}
+                onCollectionsChange={onCollectionsChange}
+              />
+            )}
 
             <div className="detail-card">
               <div className="detail-card-title">Source URL</div>
