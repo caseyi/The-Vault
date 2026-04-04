@@ -73,21 +73,81 @@ function scrapeOpenGraph(html) {
   return [...new Set(images)];
 }
 
+/**
+ * POST a GraphQL query to the Printables public API.
+ * Returns { body, status } like fetchUrl but uses POST.
+ */
+function printablesGraphQL(query, variables) {
+  return new Promise((resolve, reject) => {
+    const payload = JSON.stringify({ query, variables });
+    const req = https.request({
+      hostname: 'api.printables.com',
+      path: '/graphql/',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(payload),
+        'User-Agent': 'Mozilla/5.0 (compatible; VaultScraper/1.0)',
+        'Accept': 'application/json',
+      },
+      timeout: 12000,
+    }, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => resolve({ status: res.statusCode, body: data }));
+    });
+    req.on('error', reject);
+    req.on('timeout', () => { req.destroy(); reject(new Error('GraphQL request timed out')); });
+    req.write(payload);
+    req.end();
+  });
+}
+
 async function scrapePrintables(url, modelUuid) {
   // Printables model URLs: printables.com/model/123456-name
   const match = url.match(/printables\.com\/model\/(\d+)/i);
   if (!match) throw new Error('Not a valid Printables model URL');
-
   const modelId = match[1];
-  // Try the API endpoint first
-  const apiUrl = `https://api.printables.com/graphql/`;
-  // Fall back to HTML scraping
-  const { body } = await fetchUrl(url);
 
-  // Extract images from JSON-LD or og:image
+  // ── Try official GraphQL API first ────────────────────────────────────────
+  try {
+    const gqlQuery = `
+      query PrintDetail($id: ID!) {
+        print(id: $id) {
+          id
+          name
+          summary
+          description
+          images { filePath }
+          tags { name }
+        }
+      }
+    `;
+    const { status, body } = await printablesGraphQL(gqlQuery, { id: modelId });
+    if (status === 200) {
+      const json = JSON.parse(body);
+      const print = json?.data?.print;
+      if (print) {
+        const images = (print.images || [])
+          .map(img => {
+            const fp = img.filePath || '';
+            // filePath is like "/media/prints/12345/abc.jpg" — prepend CDN base
+            return fp.startsWith('http') ? fp : `https://media.printables.com${fp}`;
+          })
+          .filter(u => /\.(jpg|jpeg|png|webp)/i.test(u))
+          .slice(0, 8);
+        return { images, sourceSite: 'printables', sourceUrl: url };
+      }
+    }
+  } catch (apiErr) {
+    // fall through to HTML scraping
+  }
+
+  // ── Fallback: HTML scraping ───────────────────────────────────────────────
+  const { body } = await fetchUrl(url);
   const images = [];
 
-  // Try JSON-LD structured data
+  // JSON-LD structured data
   const jsonLdMatch = body.match(/<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi);
   if (jsonLdMatch) {
     for (const block of jsonLdMatch) {
@@ -101,16 +161,12 @@ async function scrapePrintables(url, modelUuid) {
     }
   }
 
-  // Try og:image
-  const ogImgs = scrapeOpenGraph(body);
-  images.push(...ogImgs);
+  images.push(...scrapeOpenGraph(body));
 
-  // Try to find image URLs in the page source (Printables uses specific patterns)
+  // Printables CDN pattern
   const imgPattern = /["'](https:\/\/media\.printables\.com\/media\/[^"']+\.(jpg|jpeg|png|webp))["']/gi;
   let m;
-  while ((m = imgPattern.exec(body)) !== null) {
-    images.push(m[1]);
-  }
+  while ((m = imgPattern.exec(body)) !== null) images.push(m[1]);
 
   const unique = [...new Set(images)].filter(u => u.startsWith('http')).slice(0, 8);
   return { images: unique, sourceSite: 'printables', sourceUrl: url };

@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useRef, useState, useCallback } from 'react';
 
 // Dynamically load Three.js from CDN
 function loadScript(src) {
@@ -12,12 +12,26 @@ function loadScript(src) {
   });
 }
 
+const COLOR_PRESETS = [
+  { name: 'Grey',    hex: 0xc8c8d4, label: '⬤', css: '#c8c8d4' },
+  { name: 'Resin',   hex: 0xe8e0c8, label: '⬤', css: '#e8e0c8' },
+  { name: 'Orange',  hex: 0xe07820, label: '⬤', css: '#e07820' },
+  { name: 'Black',   hex: 0x282828, label: '⬤', css: '#282828' },
+  { name: 'White',   hex: 0xf0f0f0, label: '⬤', css: '#f0f0f0' },
+  { name: 'Green',   hex: 0x3aaf6a, label: '⬤', css: '#3aaf6a' },
+];
+
 export default function StlViewer({ fileId, filename }) {
   const mountRef = useRef(null);
   const sceneRef = useRef(null);
+  const controlsRef = useRef(null);
+  const cameraRef = useRef(null);
+  const defaultCamPos = useRef(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [wireframe, setWireframe] = useState(false);
+  const [colorIdx, setColorIdx] = useState(0);
+  const [stats, setStats] = useState(null); // { vertices, triangles }
   const meshRef = useRef(null);
 
   useEffect(() => {
@@ -54,15 +68,15 @@ export default function StlViewer({ fileId, filename }) {
         renderer.shadowMap.enabled = true;
         el.appendChild(renderer.domElement);
 
-        // Lights
-        const ambient = new THREE.AmbientLight(0xffffff, 0.4);
-        scene.add(ambient);
-        const dir1 = new THREE.DirectionalLight(0xffffff, 0.8);
-        dir1.position.set(1, 2, 3);
-        scene.add(dir1);
-        const dir2 = new THREE.DirectionalLight(0xc17f3a, 0.3);
-        dir2.position.set(-2, -1, -1);
-        scene.add(dir2);
+        // Lights — hemisphere (sky/ground) + two directionals for depth
+        const hemi = new THREE.HemisphereLight(0xd0d8e8, 0x303040, 0.6);
+        scene.add(hemi);
+        const keyLight = new THREE.DirectionalLight(0xffffff, 0.9);
+        keyLight.position.set(2, 3, 4);
+        scene.add(keyLight);
+        const fillLight = new THREE.DirectionalLight(0x8090c0, 0.3);
+        fillLight.position.set(-3, 1, -2);
+        scene.add(fillLight);
 
         // Grid
         const grid = new THREE.GridHelper(400, 20, 0x2e2e36, 0x2e2e36);
@@ -75,6 +89,7 @@ export default function StlViewer({ fileId, filename }) {
         controls.dampingFactor = 0.05;
         controls.minDistance = 10;
         controls.maxDistance = 2000;
+        controlsRef.current = controls;
 
         // Load STL
         const loader = new THREE.STLLoader();
@@ -97,9 +112,9 @@ export default function StlViewer({ fileId, filename }) {
             geometry.translate(-center.x, -center.y, -center.z);
 
             const material = new THREE.MeshPhongMaterial({
-              color: 0xc8c8d4,
-              specular: 0x444444,
-              shininess: 30,
+              color: COLOR_PRESETS[0].hex,
+              specular: 0x333344,
+              shininess: 40,
             });
 
             const mesh = new THREE.Mesh(geometry, material);
@@ -113,9 +128,19 @@ export default function StlViewer({ fileId, filename }) {
             grid.position.y = -scaledH / 2;
 
             // Fit camera
-            camera.position.set(0, scaledH * 0.8, maxDim * scale * 1.5);
+            const fitY = scaledH * 0.8;
+            const fitZ = maxDim * scale * 1.5;
+            camera.position.set(0, fitY, fitZ);
             controls.target.set(0, 0, 0);
             controls.update();
+            cameraRef.current = camera;
+            defaultCamPos.current = { x: 0, y: fitY, z: fitZ };
+
+            // Stats
+            const vCount = geometry.attributes.position
+              ? geometry.attributes.position.count
+              : 0;
+            setStats({ vertices: vCount, triangles: Math.round(vCount / 3) });
 
             setLoading(false);
           },
@@ -174,6 +199,22 @@ export default function StlViewer({ fileId, filename }) {
     }
   }, [wireframe]);
 
+  // Change color
+  useEffect(() => {
+    if (meshRef.current) {
+      meshRef.current.material.color.setHex(COLOR_PRESETS[colorIdx].hex);
+    }
+  }, [colorIdx]);
+
+  const resetView = useCallback(() => {
+    if (cameraRef.current && controlsRef.current && defaultCamPos.current) {
+      const { x, y, z } = defaultCamPos.current;
+      cameraRef.current.position.set(x, y, z);
+      controlsRef.current.target.set(0, 0, 0);
+      controlsRef.current.update();
+    }
+  }, []);
+
   return (
     <div style={{ position: 'relative', width: '100%', aspectRatio: '4/3', background: '#1c1c21', borderRadius: 6, overflow: 'hidden' }}>
       <div ref={mountRef} style={{ width: '100%', height: '100%' }} />
@@ -192,18 +233,48 @@ export default function StlViewer({ fileId, filename }) {
       )}
 
       {!loading && !error && (
-        <div style={{ position: 'absolute', bottom: 10, right: 10, display: 'flex', gap: 6 }}>
-          <button
-            onClick={() => setWireframe(w => !w)}
-            style={{ background: wireframe ? 'rgba(193,127,58,0.3)' : 'rgba(13,13,15,0.7)', border: `1px solid ${wireframe ? '#c17f3a' : '#3f3f4d'}`, borderRadius: 4, color: wireframe ? '#c17f3a' : '#7a7a8c', padding: '4px 8px', cursor: 'pointer', fontSize: 10, fontFamily: 'var(--font-mono)' }}>
-            WIRE
-          </button>
-        </div>
-      )}
+        <>
+          {/* Top-left: stats */}
+          {stats && (
+            <div style={{ position: 'absolute', top: 8, left: 8, fontFamily: 'var(--font-mono)', fontSize: 9, color: '#4a4a5a', lineHeight: 1.6 }}>
+              <div>{stats.triangles.toLocaleString()} △</div>
+              <div>{stats.vertices.toLocaleString()} vert</div>
+            </div>
+          )}
 
-      <div style={{ position: 'absolute', bottom: 10, left: 10, fontFamily: 'var(--font-mono)', fontSize: 9, color: '#4a4a5a' }}>
-        Drag to rotate · Scroll to zoom · Right-drag to pan
-      </div>
+          {/* Bottom-left: hint */}
+          <div style={{ position: 'absolute', bottom: 8, left: 8, fontFamily: 'var(--font-mono)', fontSize: 9, color: '#4a4a5a' }}>
+            Drag · Scroll · Right-drag pan
+          </div>
+
+          {/* Bottom-right: controls */}
+          <div style={{ position: 'absolute', bottom: 8, right: 8, display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 5 }}>
+            {/* Color presets */}
+            <div style={{ display: 'flex', gap: 4 }}>
+              {COLOR_PRESETS.map((c, i) => (
+                <button key={c.name} onClick={() => setColorIdx(i)} title={c.name}
+                  style={{
+                    width: 16, height: 16, borderRadius: '50%', border: `2px solid ${i === colorIdx ? '#c17f3a' : 'transparent'}`,
+                    background: c.css, cursor: 'pointer', padding: 0,
+                    boxShadow: i === colorIdx ? '0 0 0 1px rgba(193,127,58,0.5)' : 'none',
+                  }} />
+              ))}
+            </div>
+            {/* Wire + Reset */}
+            <div style={{ display: 'flex', gap: 4 }}>
+              <button onClick={resetView}
+                style={{ background: 'rgba(13,13,15,0.75)', border: '1px solid #3f3f4d', borderRadius: 4, color: '#7a7a8c', padding: '3px 7px', cursor: 'pointer', fontSize: 10, fontFamily: 'var(--font-mono)' }}
+                title="Reset camera">
+                ⌖
+              </button>
+              <button onClick={() => setWireframe(w => !w)}
+                style={{ background: wireframe ? 'rgba(193,127,58,0.3)' : 'rgba(13,13,15,0.75)', border: `1px solid ${wireframe ? '#c17f3a' : '#3f3f4d'}`, borderRadius: 4, color: wireframe ? '#c17f3a' : '#7a7a8c', padding: '3px 7px', cursor: 'pointer', fontSize: 10, fontFamily: 'var(--font-mono)' }}>
+                WIRE
+              </button>
+            </div>
+          </div>
+        </>
+      )}
     </div>
   );
 }

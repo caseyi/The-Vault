@@ -129,6 +129,8 @@ function BulkActionBar({ selectedIds, onClearSelection, onBulkStatus, onBulkTag,
   const [showStatusMenu, setShowStatusMenu] = useState(false);
   const [showTagMenu, setShowTagMenu] = useState(false);
   const [tagInput, setTagInput] = useState('');
+  const [commonTags, setCommonTags] = useState([]);
+  const [allTags, setAllTags] = useState([]);
   const [saving, setSaving] = useState(false);
 
   const handleBulkStatus = async (status) => {
@@ -137,11 +139,38 @@ function BulkActionBar({ selectedIds, onClearSelection, onBulkStatus, onBulkTag,
     setSaving(false);
   };
 
+  const openTagMenu = async () => {
+    const open = !showTagMenu;
+    setShowTagMenu(open);
+    setShowStatusMenu(false);
+    if (open && selectedIds.length) {
+      try {
+        const r = await fetch(`/api/models/common-tags?ids=${selectedIds.join(',')}`);
+        const d = await r.json();
+        setCommonTags(d.commonTags || []);
+        setAllTags(d.allTags || []);
+      } catch {}
+    }
+  };
+
   const handleAddTag = async () => {
     if (!tagInput.trim()) return;
     setSaving(true);
     await onBulkTag([tagInput.trim().toLowerCase()], []);
-    setTagInput(''); setSaving(false);
+    setTagInput('');
+    // Refresh tag list
+    const r = await fetch(`/api/models/common-tags?ids=${selectedIds.join(',')}`);
+    const d = await r.json();
+    setCommonTags(d.commonTags || []); setAllTags(d.allTags || []);
+    setSaving(false);
+  };
+
+  const handleRemoveTag = async (tag) => {
+    setSaving(true);
+    await onBulkTag([], [tag]);
+    setAllTags(t => t.filter(x => x !== tag));
+    setCommonTags(t => t.filter(x => x !== tag));
+    setSaving(false);
   };
 
   return (
@@ -176,19 +205,43 @@ function BulkActionBar({ selectedIds, onClearSelection, onBulkStatus, onBulkTag,
       </div>
 
       <div style={{ position: 'relative' }}>
-        <button onClick={() => { setShowTagMenu(s => !s); setShowStatusMenu(false); }}
-          style={{ background: '#242429', border: '1px solid #3f3f4d', borderRadius: 4, color: '#e8e8f0', padding: '6px 12px', cursor: 'pointer', fontSize: 12 }}>
-          Add Tag ▾
+        <button onClick={openTagMenu}
+          style={{ background: showTagMenu ? 'rgba(193,127,58,0.15)' : '#242429', border: `1px solid ${showTagMenu ? '#c17f3a' : '#3f3f4d'}`, borderRadius: 4, color: '#e8e8f0', padding: '6px 12px', cursor: 'pointer', fontSize: 12 }}>
+          🏷 Tags ▾
         </button>
         {showTagMenu && (
-          <div style={{ position: 'absolute', bottom: '110%', left: 0, background: '#1c1c21', border: '1px solid #3f3f4d', borderRadius: 6, padding: 10, minWidth: 200, boxShadow: '0 8px 24px rgba(0,0,0,0.5)', zIndex: 30 }}>
-            <div style={{ display: 'flex', gap: 6 }}>
+          <div style={{ position: 'absolute', bottom: '110%', left: 0, background: '#1c1c21', border: '1px solid #3f3f4d', borderRadius: 6, padding: 10, minWidth: 240, boxShadow: '0 8px 24px rgba(0,0,0,0.5)', zIndex: 30 }}>
+            {/* Add new tag */}
+            <div style={{ fontSize: 10, fontFamily: 'var(--font-mono)', color: 'var(--text-faint)', marginBottom: 5, letterSpacing: 1 }}>ADD TAG</div>
+            <div style={{ display: 'flex', gap: 6, marginBottom: 10 }}>
               <input value={tagInput} onChange={e => setTagInput(e.target.value)}
                 onKeyDown={e => { if (e.key === 'Enter') handleAddTag(); }}
                 placeholder="tag name" autoFocus
                 style={{ flex: 1, background: '#242429', border: '1px solid #3f3f4d', borderRadius: 4, color: '#e8e8f0', padding: '5px 8px', fontSize: 12, outline: 'none', fontFamily: 'var(--font-body)' }} />
-              <button onClick={handleAddTag} style={{ background: '#c17f3a', border: 'none', borderRadius: 4, color: '#0d0d0f', padding: '5px 10px', cursor: 'pointer', fontSize: 11, fontFamily: 'var(--font-display)', letterSpacing: 0.5 }}>ADD</button>
+              <button onClick={handleAddTag} disabled={saving} style={{ background: '#c17f3a', border: 'none', borderRadius: 4, color: '#0d0d0f', padding: '5px 10px', cursor: 'pointer', fontSize: 11, fontFamily: 'var(--font-display)', letterSpacing: 0.5 }}>ADD</button>
             </div>
+            {/* Existing tags to remove */}
+            {allTags.length > 0 && (
+              <>
+                <div style={{ fontSize: 10, fontFamily: 'var(--font-mono)', color: 'var(--text-faint)', marginBottom: 5, letterSpacing: 1 }}>
+                  REMOVE TAG <span style={{ color: '#4a4a5a' }}>(★ = on all selected)</span>
+                </div>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
+                  {allTags.map(t => (
+                    <button key={t} onClick={() => handleRemoveTag(t)} disabled={saving}
+                      style={{
+                        display: 'inline-flex', alignItems: 'center', gap: 3,
+                        background: commonTags.includes(t) ? 'rgba(193,127,58,0.15)' : '#242429',
+                        border: `1px solid ${commonTags.includes(t) ? '#c17f3a' : '#3f3f4d'}`,
+                        borderRadius: 3, color: commonTags.includes(t) ? '#c17f3a' : '#7a7a8c',
+                        padding: '3px 7px', cursor: 'pointer', fontSize: 11, fontFamily: 'var(--font-body)'
+                      }}>
+                      {commonTags.includes(t) ? '★ ' : ''}{t} ×
+                    </button>
+                  ))}
+                </div>
+              </>
+            )}
           </div>
         )}
       </div>

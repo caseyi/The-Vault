@@ -27,6 +27,45 @@ function setStoredApiKey(key) {
   try { localStorage.setItem('claude_api_key', key); } catch {}
 }
 
+const STATUS_COLORS = {
+  unprinted: '#4a4a5a', sliced: '#5b9bd5', printing: '#c17f3a',
+  printed: '#4caf7d', painted: '#a78bd4', failed: '#cf7272',
+};
+
+function StatusHistory({ modelId }) {
+  const [log, setLog] = useState([]);
+  useEffect(() => {
+    fetch(`/api/models/${modelId}/status-log`)
+      .then(r => r.json())
+      .then(d => setLog(d))
+      .catch(() => {});
+  }, [modelId]);
+
+  if (!log.length) return null;
+
+  return (
+    <div style={{ marginTop: 8 }}>
+      <div style={{ fontSize: 10, fontFamily: 'var(--font-mono)', color: 'var(--text-faint)', letterSpacing: 1, marginBottom: 6 }}>STATUS HISTORY</div>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+        {log.map(entry => (
+          <div key={entry.id} style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 11 }}>
+            <span style={{ fontFamily: 'var(--font-mono)', fontSize: 9, color: 'var(--text-faint)', minWidth: 100 }}>
+              {new Date(entry.changed_at).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: '2-digit' })}
+            </span>
+            <span style={{ color: STATUS_COLORS[entry.from_status] || '#4a4a5a', fontSize: 10 }}>
+              {entry.from_status || '?'}
+            </span>
+            <span style={{ color: 'var(--text-faint)', fontSize: 9 }}>→</span>
+            <span style={{ color: STATUS_COLORS[entry.to_status] || '#e8e8f0', fontSize: 10, fontWeight: 600 }}>
+              {entry.to_status}
+            </span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 export default function ModelDetail({ modelId, onBack, onSaved }) {
   const [model, setModel] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -439,6 +478,7 @@ export default function ModelDetail({ modelId, onBack, onSaved }) {
               <select className="status-select" value={status} onChange={e => setStatus(e.target.value)}>
                 {STATUS_OPTIONS.map(s => <option key={s} value={s}>{s.charAt(0).toUpperCase() + s.slice(1)}</option>)}
               </select>
+              <StatusHistory modelId={model.id} key={model.id} />
             </div>
 
             <div className="detail-card">
