@@ -7,11 +7,14 @@ import TaskLog from './TaskLog';
  * mode="creator"  → shows hint field + "Re-extract all models" button
  * mode="model"    → shows hint override field only (inherits creator hint)
  */
-export default function RenderHintPanel({ mode = 'creator', creatorId, modelId, currentHint, creatorHint, onSaved, onClose }) {
+export default function RenderHintPanel({ mode = 'creator', creatorId, modelId, currentHint, currentNotes, creatorHint, onSaved, onClose }) {
   const [hint, setHint] = useState(currentHint || '');
+  const [notes, setNotes] = useState(currentNotes || '');
   const [availableZips, setAvailableZips] = useState([]);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  const [savingNotes, setSavingNotes] = useState(false);
+  const [savedNotes, setSavedNotes] = useState(false);
   const [extracting, setExtracting] = useState(false);
   const [log, setLog] = useState([]);
   const [done, setDone] = useState(null);
@@ -28,6 +31,18 @@ export default function RenderHintPanel({ mode = 'creator', creatorId, modelId, 
         .catch(() => {});
     }
   }, [mode, creatorId]);
+
+  const handleSaveNotes = async () => {
+    setSavingNotes(true);
+    await fetch(`/api/creators/${creatorId}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ notes: notes || null }),
+    });
+    setSavingNotes(false);
+    setSavedNotes(true);
+    setTimeout(() => setSavedNotes(false), 2000);
+  };
 
   const handleSave = async () => {
     setSaving(true);
@@ -207,6 +222,37 @@ export default function RenderHintPanel({ mode = 'creator', creatorId, modelId, 
             {done.success
               ? `✓ Done — ${done.updated} model(s) updated · ${done.skipped} skipped`
               : `✗ ${done.error}`}
+          </div>
+        )}
+
+        {/* Creator notes (creator mode only) */}
+        {mode === 'creator' && (
+          <div style={{ marginTop: 20, paddingTop: 16, borderTop: '1px solid var(--border)' }}>
+            <label style={{ display: 'block', fontFamily: 'var(--font-mono)', fontSize: 9, letterSpacing: 2, color: 'var(--text-faint)', textTransform: 'uppercase', marginBottom: 6 }}>
+              Creator Notes
+            </label>
+            <textarea
+              value={notes}
+              onChange={e => setNotes(e.target.value)}
+              placeholder="Patreon tier, website, purchase notes, etc."
+              rows={3}
+              style={{
+                width: '100%', boxSizing: 'border-box', resize: 'vertical',
+                background: 'var(--bg3)', border: '1px solid var(--border)',
+                borderRadius: 5, color: 'var(--text)', fontFamily: 'var(--font-body)',
+                fontSize: 12, padding: '7px 10px', outline: 'none', lineHeight: 1.5,
+              }}
+            />
+            <button onClick={handleSaveNotes} disabled={savingNotes}
+              style={{
+                marginTop: 8, width: '100%', padding: '7px', background: 'var(--bg3)',
+                border: '1px solid var(--border-bright)', borderRadius: 5,
+                color: savedNotes ? '#4caf7d' : 'var(--text)', cursor: savingNotes ? 'not-allowed' : 'pointer',
+                fontFamily: 'var(--font-display)', fontSize: 13, letterSpacing: 1,
+                opacity: savingNotes ? 0.6 : 1,
+              }}>
+              {savedNotes ? '✓ SAVED' : savingNotes ? 'SAVING…' : 'SAVE NOTES'}
+            </button>
           </div>
         )}
       </div>
