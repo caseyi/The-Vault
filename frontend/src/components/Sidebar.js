@@ -1,6 +1,42 @@
 import React, { useState } from 'react';
 import RenderHintPanel from './RenderHintPanel';
 
+const COLLAPSED_HEIGHT = 200; // px — show ~6 items before "Show more"
+
+/** Scrollable, collapsible sidebar list with a "Show N more" toggle */
+function CollapsibleList({ label, onClear, items, renderItem, activeKey, getKey, extraControls }) {
+  const [expanded, setExpanded] = useState(false);
+  const hasActive = activeKey && items.some(i => getKey(i) === activeKey);
+  // If the active item is past the fold, always expand
+  const shouldExpand = expanded || hasActive;
+
+  return (
+    <div className="sidebar-section">
+      <div className="sidebar-section-label" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+        <span>{label} <span style={{ fontFamily: 'var(--font-mono)', fontSize: 9, color: 'var(--text-faint)' }}>{items.length}</span></span>
+        <div style={{ display: 'flex', gap: 4 }}>
+          {extraControls}
+          {onClear && (
+            <button onClick={onClear}
+              style={{ background: 'none', border: 'none', color: 'var(--accent)', cursor: 'pointer', fontSize: 9, fontFamily: 'var(--font-mono)', letterSpacing: 1 }}>
+              CLEAR
+            </button>
+          )}
+        </div>
+      </div>
+      <div className="creator-list" style={{ maxHeight: shouldExpand ? 320 : COLLAPSED_HEIGHT, overflowY: 'auto' }}>
+        {items.map(item => renderItem(item))}
+      </div>
+      {items.length > 6 && (
+        <button onClick={() => setExpanded(e => !e)}
+          style={{ background: 'none', border: 'none', color: 'var(--text-faint)', cursor: 'pointer', fontSize: 10, fontFamily: 'var(--font-mono)', padding: '3px 0', width: '100%', textAlign: 'left' }}>
+          {shouldExpand ? '▲ Show less' : `▼ Show all ${items.length}`}
+        </button>
+      )}
+    </div>
+  );
+}
+
 const STATUS_OPTIONS = [
   { value: '', label: 'All Models', dot: '#4a4a5a' },
   { value: 'unprinted', label: 'Unprinted', dot: '#4a4a5a' },
@@ -153,28 +189,22 @@ export default function Sidebar({ open, onToggle, stats, creators, tags, filters
 
             {/* Franchise filter */}
             {franchises && franchises.length > 0 && (
-              <div className="sidebar-section">
-                <div className="sidebar-section-label" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                  Franchise
-                  {filters.franchise && (
-                    <button onClick={() => onFilterChange({ ...filters, franchise: '' })}
-                      style={{ background: 'none', border: 'none', color: 'var(--accent)', cursor: 'pointer', fontSize: 9, fontFamily: 'var(--font-mono)', letterSpacing: 1 }}>
-                      CLEAR
-                    </button>
-                  )}
-                </div>
-                <div className="creator-list">
-                  {franchises.map(f => (
-                    <button
-                      key={f.franchise}
-                      className={`creator-btn ${filters.franchise === f.franchise ? 'active' : ''}`}
-                      onClick={() => onFilterChange({ ...filters, franchise: filters.franchise === f.franchise ? '' : f.franchise })}>
-                      <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', flex: 1 }}>{f.franchise}</span>
-                      <span className="count">{f.count}</span>
-                    </button>
-                  ))}
-                </div>
-              </div>
+              <CollapsibleList
+                label="Franchise"
+                onClear={filters.franchise ? () => onFilterChange({ ...filters, franchise: '' }) : null}
+                items={franchises}
+                renderItem={f => (
+                  <button
+                    key={f.franchise}
+                    className={`creator-btn ${filters.franchise === f.franchise ? 'active' : ''}`}
+                    onClick={() => onFilterChange({ ...filters, franchise: filters.franchise === f.franchise ? '' : f.franchise })}>
+                    <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', flex: 1 }}>{f.franchise}</span>
+                    <span className="count">{f.count}</span>
+                  </button>
+                )}
+                activeKey={filters.franchise}
+                getKey={f => f.franchise}
+              />
             )}
 
             {/* Collections */}
@@ -206,7 +236,7 @@ export default function Sidebar({ open, onToggle, stats, creators, tags, filters
                 </div>
               )}
               {collections && collections.length > 0 ? (
-                <div className="creator-list">
+                <div className="creator-list" style={{ maxHeight: 180, overflowY: 'auto' }}>
                   {collections.map(c => (
                     <button key={c.id}
                       className={`creator-btn ${filters.collection === String(c.id) ? 'active' : ''}`}
@@ -277,10 +307,12 @@ export default function Sidebar({ open, onToggle, stats, creators, tags, filters
               </div>
             )}
 
-            {/* Creators — collapsed by default when tags are available */}
+            {/* Creators */}
             <div className="sidebar-section" style={{ overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
-              <div className="sidebar-section-label">Creators</div>
-              <div className="creator-list">
+              <div className="sidebar-section-label">
+                Creators <span style={{ fontFamily: 'var(--font-mono)', fontSize: 9, color: 'var(--text-faint)' }}>{creators.length}</span>
+              </div>
+              <div className="creator-list" style={{ maxHeight: 260, overflowY: 'auto' }}>
                 <button className={`creator-btn ${filters.creator === '' ? 'active' : ''}`}
                   onClick={() => onFilterChange({ ...filters, creator: '' })}>
                   <span>All Creators</span>

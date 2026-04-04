@@ -500,6 +500,8 @@ body {
   border: 1px solid var(--border);
   border-radius: var(--radius);
   min-height: 40px;
+  max-height: 120px;
+  overflow-y: auto;
   cursor: text;
   transition: border-color 0.15s;
 }
