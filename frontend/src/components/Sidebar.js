@@ -47,7 +47,7 @@ const STATUS_OPTIONS = [
   { value: 'failed', label: 'Failed', dot: '#cf7272' },
 ];
 
-export default function Sidebar({ open, onToggle, stats, creators, tags, filters, onFilterChange, onScanClick, onOrganizeClick, onHomeClick, showHidden, onToggleHidden, appVersion, onRescanCreator, franchises, collections, queueCount, onQueueClick, onCollectionClick, onCollectionsChange }) {
+export default function Sidebar({ open, onToggle, stats, creators, tags, filters, onFilterChange, onScanClick, onOrganizeClick, onHomeClick, showHidden, onToggleHidden, appVersion, onRescanCreator, franchises, collections, queueCount, onQueueClick, onCollectionClick, onCollectionsChange, recentlyViewed, onRecentClick }) {
   const [hintCreator, setHintCreator] = useState(null); // { id, name, render_zip_hint }
   const [showAllTags, setShowAllTags] = useState(false);
   const [rescanningId, setRescanningId] = useState(null);
@@ -357,6 +357,42 @@ export default function Sidebar({ open, onToggle, stats, creators, tags, filters
                 ))}
               </div>
             </div>
+
+            {/* Recently Viewed */}
+            {recentlyViewed && recentlyViewed.length > 0 && (
+              <div className="sidebar-section">
+                <div className="sidebar-section-label" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  Recently Viewed
+                  <span style={{ fontFamily: 'var(--font-mono)', fontSize: 9, color: 'var(--text-faint)' }}>{recentlyViewed.length}</span>
+                </div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
+                  {recentlyViewed.map(m => (
+                    <button
+                      key={m.id}
+                      onClick={() => onRecentClick && onRecentClick(m)}
+                      style={{
+                        display: 'flex', alignItems: 'center', gap: 7,
+                        background: 'none', border: 'none', borderRadius: 4,
+                        padding: '3px 4px', cursor: 'pointer', textAlign: 'left',
+                        width: '100%',
+                      }}
+                      onMouseEnter={e => e.currentTarget.style.background = 'var(--bg3)'}
+                      onMouseLeave={e => e.currentTarget.style.background = 'none'}
+                    >
+                      {m.thumbnail_path ? (
+                        <img src={m.thumbnail_path} alt="" style={{ width: 28, height: 28, borderRadius: 3, objectFit: 'cover', flexShrink: 0, background: 'var(--bg3)' }} />
+                      ) : (
+                        <div style={{ width: 28, height: 28, borderRadius: 3, background: 'var(--bg3)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 13, flexShrink: 0 }}>🧩</div>
+                      )}
+                      <div style={{ overflow: 'hidden' }}>
+                        <div style={{ fontSize: 11, color: 'var(--text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{m.name}</div>
+                        <div style={{ fontSize: 9, color: 'var(--text-faint)', fontFamily: 'var(--font-mono)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{m.creator_name || '—'}</div>
+                      </div>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
 
             <button className="scan-btn" onClick={onScanClick}>⟳ SCAN LIBRARY</button>
             <button className="scan-btn" onClick={onOrganizeClick} style={{ background: 'rgba(193,127,58,0.12)', color: 'var(--accent)', marginTop: 4 }}>🗂 ORGANIZE</button>

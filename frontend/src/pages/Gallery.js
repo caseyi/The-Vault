@@ -296,6 +296,14 @@ function BulkActionBar({ selectedIds, onClearSelection, onBulkStatus, onBulkTag,
   );
 }
 
+const SORT_OPTIONS = [
+  { value: 'creator', label: 'Creator / Name' },
+  { value: 'name', label: 'Name A–Z' },
+  { value: 'date_added', label: 'Date Added' },
+  { value: 'updated', label: 'Recently Updated' },
+  { value: 'status', label: 'Print Status' },
+];
+
 export default function Gallery({ filters, onFilterChange, onModelClick, showHidden, onRefreshStats, refreshKey, collections, onRefreshCollections }) {
   const [models, setModels] = useState([]);
   const [total, setTotal] = useState(0);
@@ -304,6 +312,24 @@ export default function Gallery({ filters, onFilterChange, onModelClick, showHid
   const [loading, setLoading] = useState(false);
   const [bulkMode, setBulkMode] = useState(false);
   const [selectedIds, setSelectedIds] = useState([]);
+  const [sort, setSort] = useState('creator');
+
+  // Reset to page 1 when sort changes
+  useEffect(() => { setPage(1); }, [sort]);
+
+  const buildExportUrl = () => {
+    const params = new URLSearchParams({
+      ...(filters.search && { search: filters.search }),
+      ...(filters.creator && { creator: filters.creator }),
+      ...(filters.status && { status: filters.status }),
+      ...(filters.tags && { tags: filters.tags }),
+      ...(filters.has_thumbnail && { has_thumbnail: '1' }),
+      ...(filters.franchise && { franchise: filters.franchise }),
+      ...(filters.collection && { collection: filters.collection }),
+      ...(showHidden && { show_hidden: '1' }),
+    });
+    return `/api/export?${params}`;
+  };
 
   const fetchModels = useCallback(async () => {
     setLoading(true);
@@ -319,6 +345,7 @@ export default function Gallery({ filters, onFilterChange, onModelClick, showHid
         ...(filters.franchise && { franchise: filters.franchise }),
         ...(filters.collection && { collection: filters.collection }),
         ...(showHidden && { show_hidden: '1' }),
+        sort,
       });
       const r = await fetch(`/api/models?${params}`);
       const data = await r.json();
@@ -327,7 +354,7 @@ export default function Gallery({ filters, onFilterChange, onModelClick, showHid
       setPages(data.pages || 1);
     } catch {}
     setLoading(false);
-  }, [filters, page, showHidden, refreshKey]);
+  }, [filters, page, showHidden, refreshKey, sort]);
 
   useEffect(() => { setPage(1); }, [filters, showHidden]);
   useEffect(() => { fetchModels(); }, [fetchModels]);
@@ -379,6 +406,20 @@ export default function Gallery({ filters, onFilterChange, onModelClick, showHid
         <div className="gallery-title">MODELS</div>
         <input className="search-input" placeholder="Search models, creators, tags..."
           value={filters.search} onChange={e => onFilterChange({ ...filters, search: e.target.value })} />
+
+        {/* Sort dropdown */}
+        <select
+          value={sort}
+          onChange={e => setSort(e.target.value)}
+          style={{
+            background: 'var(--bg3)', border: '1px solid var(--border)',
+            borderRadius: 'var(--radius)', color: 'var(--text-muted)',
+            padding: '6px 8px', cursor: 'pointer', fontSize: 12,
+            fontFamily: 'var(--font-mono)', outline: 'none', flexShrink: 0,
+          }}>
+          {SORT_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+        </select>
+
         <button onClick={() => { setBulkMode(b => !b); setSelectedIds([]); }}
           style={{
             background: bulkMode ? 'rgba(193,127,58,0.15)' : 'var(--bg3)',
@@ -388,6 +429,20 @@ export default function Gallery({ filters, onFilterChange, onModelClick, showHid
           }}>
           {bulkMode ? '✕ Cancel' : '⊡ Select'}
         </button>
+
+        {/* CSV export */}
+        <a href={buildExportUrl()} download
+          style={{
+            background: 'var(--bg3)', border: '1px solid var(--border)',
+            borderRadius: 'var(--radius)', color: 'var(--text-muted)',
+            padding: '6px 10px', fontSize: 12, fontFamily: 'var(--font-mono)',
+            textDecoration: 'none', whiteSpace: 'nowrap', flexShrink: 0,
+            display: 'flex', alignItems: 'center', gap: 4,
+          }}
+          title="Export current view to CSV">
+          ⬇ CSV
+        </a>
+
         <div className="result-count">{total.toLocaleString()} models</div>
       </div>
 

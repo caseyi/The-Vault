@@ -142,8 +142,16 @@ app.post('/api/scan/creator/:id', async (req, res) => {
 
 // ── Models ─────────────────────────────────────────────────────────────────────
 
+const SORT_MAP = {
+  name:       'm.name ASC',
+  creator:    'c.name ASC, m.name ASC',
+  date_added: 'm.created_at DESC',
+  updated:    'm.updated_at DESC',
+  status:     'm.print_status ASC, m.name ASC',
+};
+
 app.get('/api/models', (req, res) => {
-  const { search, creator, status, tags, franchise, collection, page = 1, limit = 48, show_hidden, has_thumbnail, recently_added } = req.query;
+  const { search, creator, status, tags, franchise, collection, page = 1, limit = 48, show_hidden, has_thumbnail, recently_added, sort } = req.query;
   const offset = (parseInt(page) - 1) * parseInt(limit);
 
   let where = ['1=1'];
@@ -197,11 +205,12 @@ app.get('/api/models', (req, res) => {
     SELECT COUNT(*) as cnt FROM models m LEFT JOIN creators c ON m.creator_id = c.id WHERE ${whereStr}
   `).get(...params).cnt;
 
+  const orderBy = SORT_MAP[sort] || 'c.name ASC, m.name ASC';
   const models = db.prepare(`
     SELECT m.*, c.name as creator_name
     FROM models m LEFT JOIN creators c ON m.creator_id = c.id
     WHERE ${whereStr}
-    ORDER BY c.name ASC, m.name ASC
+    ORDER BY ${orderBy}
     LIMIT ? OFFSET ?
   `).all(...params, parseInt(limit), offset);
 
@@ -537,6 +546,75 @@ app.post('/api/models/bulk', (req, res) => {
   }
 
   res.json({ success: true, updated });
+});
+
+// ── Export ────────────────────────────────────────────────────────────────────
+
+// CSV export — supports same filters as GET /api/models (no pagination, returns all rows)
+app.get('/api/export', (req, res) => {
+  const { search, creator, status, tags, franchise, collection, show_hidden, has_thumbnail } = req.query;
+
+  let where = ['1=1'];
+  const params = [];
+
+  if (!show_hidden || show_hidden === '0') {
+    where.push('(m.hidden IS NULL OR m.hidden = 0)');
+  }
+  if (has_thumbnail === '1') {
+    where.push('m.thumbnail_path IS NOT NULL');
+  }
+  if (franchise) { where.push('m.franchise = ?'); params.push(franchise); }
+  if (collection) {
+    where.push('m.id IN (SELECT model_id FROM collection_models WHERE collection_id = ?)');
+    params.push(collection);
+  }
+  if (search) {
+    where.push('(m.name LIKE ? OR c.name LIKE ? OR m.tags LIKE ? OR m.notes LIKE ?)');
+    const s = `%${search}%`;
+    params.push(s, s, s, s);
+  }
+  if (creator) { where.push('c.name = ?'); params.push(creator); }
+  if (status) { where.push('m.print_status = ?'); params.push(status); }
+  if (tags) {
+    tags.split(',').forEach(t => { where.push('m.tags LIKE ?'); params.push(`%"${t.trim()}"%`); });
+  }
+
+  const rows = db.prepare(`
+    SELECT m.id, m.name, c.name as creator_name, m.print_status, m.franchise, m.team,
+           m.tags, m.source_site, m.source_url, m.notes, m.file_count,
+           m.has_stl, m.has_chitubox, m.has_lychee, m.has_plate,
+           m.created_at, m.updated_at
+    FROM models m LEFT JOIN creators c ON m.creator_id = c.id
+    WHERE ${where.join(' AND ')}
+    ORDER BY c.name ASC, m.name ASC
+  `).all(...params);
+
+  const escape = (v) => {
+    if (v === null || v === undefined) return '';
+    const str = String(v);
+    if (str.includes(',') || str.includes('"') || str.includes('\n')) {
+      return `"${str.replace(/"/g, '""')}"`;
+    }
+    return str;
+  };
+
+  const headers = ['id','name','creator','status','franchise','team','tags','source_site','source_url','notes','file_count','has_stl','has_chitubox','has_lychee','has_plate','created_at','updated_at'];
+  const lines = [headers.join(',')];
+
+  for (const r of rows) {
+    const tags = (() => { try { return JSON.parse(r.tags || '[]').join(';'); } catch { return ''; } })();
+    lines.push([
+      r.id, r.name, r.creator_name, r.print_status, r.franchise, r.team,
+      tags, r.source_site, r.source_url, r.notes,
+      r.file_count, r.has_stl ? 1 : 0, r.has_chitubox ? 1 : 0, r.has_lychee ? 1 : 0, r.has_plate ? 1 : 0,
+      r.created_at, r.updated_at,
+    ].map(escape).join(','));
+  }
+
+  const filename = `vault-export-${new Date().toISOString().slice(0,10)}.csv`;
+  res.setHeader('Content-Type', 'text/csv');
+  res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+  res.send(lines.join('\n'));
 });
 
 // SSE stream version of scrape (GET so EventSource can use it)

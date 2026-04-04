@@ -24,6 +24,9 @@ export default function App() {
   const [refreshKey, setRefreshKey] = useState(0);
   const [queueCount, setQueueCount] = useState(0);
   const [collections, setCollections] = useState([]);
+  const [recentlyViewed, setRecentlyViewed] = useState(() => {
+    try { return JSON.parse(localStorage.getItem('vault_recently_viewed') || '[]'); } catch { return []; }
+  });
 
   const fetchQueueCount = useCallback(() => {
     fetch('/api/queue').then(r => r.json()).then(q => setQueueCount(q.length)).catch(() => {});
@@ -55,7 +58,18 @@ export default function App() {
       .catch(() => {});
   }, []);
 
-  const openModel = (model) => { setSelectedModel(model); setView('detail'); };
+  const openModel = (model) => {
+    setSelectedModel(model);
+    setView('detail');
+    // Track recently viewed (store minimal info for sidebar display)
+    setRecentlyViewed(prev => {
+      const entry = { id: model.id, name: model.name, thumbnail_path: model.thumbnail_path, creator_name: model.creator_name };
+      const filtered = prev.filter(m => m.id !== model.id);
+      const next = [entry, ...filtered].slice(0, 10);
+      try { localStorage.setItem('vault_recently_viewed', JSON.stringify(next)); } catch {}
+      return next;
+    });
+  };
   const closeModel = () => { setSelectedModel(null); setView('gallery'); };
   const openQueue = () => { setSelectedModel(null); setView('queue'); };
 
@@ -82,6 +96,8 @@ export default function App() {
         onQueueClick={openQueue}
         onCollectionClick={(id) => { setFilters(f => ({ ...f, collection: id })); setView('gallery'); }}
         onCollectionsChange={fetchCollections}
+        recentlyViewed={recentlyViewed}
+        onRecentClick={openModel}
       />
       <main className="main-content">
         {view === 'gallery' && (
