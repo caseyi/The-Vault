@@ -3,7 +3,7 @@ const cors = require('cors');
 const path = require('path');
 const fs = require('fs');
 const db = require('./db');
-const { scanLibrary, LIBRARY_PATH, matchesHint, pickRenderArchives, analyzeFolder, inferReleaseName } = require('./scanner');
+const { scanLibrary, scanSingleCreator, LIBRARY_PATH, matchesHint, pickRenderArchives, analyzeFolder, inferReleaseName } = require('./scanner');
 const { scrapeImagesFromUrl, detectUrlFromFolderName } = require('./scraper');
 const organizeRouter = require('./organize');
 
@@ -101,6 +101,43 @@ app.post('/api/scan', async (req, res) => {
 // Legacy status endpoint (still used by anything polling)
 app.get('/api/scan/status', (req, res) => {
   res.json({ inProgress: scanInProgress, log: scanLog, summary: scanSummary });
+});
+
+// Per-creator rescan — scans a single creator's folder using the shared SSE machinery
+app.post('/api/scan/creator/:id', async (req, res) => {
+  if (scanInProgress) return res.status(409).json({ error: 'Scan already in progress' });
+  const creator = db.prepare('SELECT * FROM creators WHERE id = ?').get(req.params.id);
+  if (!creator) return res.status(404).json({ error: 'Creator not found' });
+  if (!creator.folder_path) return res.status(400).json({ error: 'Creator has no folder path' });
+  if (!fs.existsSync(creator.folder_path)) return res.status(400).json({ error: `Folder not found: ${creator.folder_path}` });
+
+  scanInProgress = true;
+  scanLog = [];
+  scanSummary = null;
+
+  res.json({ message: 'Creator scan started', creator: creator.name, path: creator.folder_path });
+
+  pushLog('info', `Scanning creator: ${creator.name}`);
+  pushLog('info', `Path: ${creator.folder_path}`);
+
+  try {
+    const result = await scanSingleCreator(
+      creator.folder_path, creator.id, creator.name,
+      (p) => {
+        if (p.stage === 'scanning') {
+          if (p.model) pushLog('scan', `  ${p.creator} / ${p.model}`);
+        }
+      },
+      pushLog
+    );
+    pushLog('success', `✓ Done — ${result.modelsFound} found · ${result.modelsAdded} added · ${result.modelsUpdated} updated · ${result.modelsSkipped} skipped`);
+    scanSummary = { type: 'done', success: true, ...result };
+  } catch (err) {
+    pushLog('error', `✗ Error: ${err.message}`);
+    scanSummary = { type: 'done', success: false, error: err.message };
+  } finally {
+    scanInProgress = false;
+  }
 });
 
 // ── Models ─────────────────────────────────────────────────────────────────────

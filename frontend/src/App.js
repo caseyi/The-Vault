@@ -63,6 +63,7 @@ export default function App() {
         showHidden={showHidden}
         onToggleHidden={() => setShowHidden(h => !h)}
         appVersion={appVersion}
+        onRescanCreator={() => setShowScan(true)}
       />
       <main className="main-content">
         {view === 'gallery' && (

@@ -11,9 +11,22 @@ const STATUS_OPTIONS = [
   { value: 'failed', label: 'Failed', dot: '#cf7272' },
 ];
 
-export default function Sidebar({ open, onToggle, stats, creators, tags, filters, onFilterChange, onScanClick, onOrganizeClick, onHomeClick, showHidden, onToggleHidden, appVersion }) {
+export default function Sidebar({ open, onToggle, stats, creators, tags, filters, onFilterChange, onScanClick, onOrganizeClick, onHomeClick, showHidden, onToggleHidden, appVersion, onRescanCreator }) {
   const [hintCreator, setHintCreator] = useState(null); // { id, name, render_zip_hint }
   const [showAllTags, setShowAllTags] = useState(false);
+  const [rescanningId, setRescanningId] = useState(null);
+
+  const handleRescanCreator = async (e, creator) => {
+    e.stopPropagation();
+    if (rescanningId) return;
+    setRescanningId(creator.id);
+    try {
+      await fetch(`/api/scan/creator/${creator.id}`, { method: 'POST' });
+      if (onRescanCreator) onRescanCreator(creator);
+    } catch {}
+    // Keep spinner showing until scan modal closes/refreshes
+    setTimeout(() => setRescanningId(null), 1500);
+  };
 
   const activeTags = filters.tags ? filters.tags.split(',').filter(Boolean) : [];
   const toggleTag = (tag) => {
@@ -172,7 +185,18 @@ export default function Sidebar({ open, onToggle, stats, creators, tags, filters
                       <span className="count">{c.model_count}</span>
                     </button>
                     <button
-                      title="Configure render ZIP hint"
+                      title="Rescan this creator's folder"
+                      onClick={e => handleRescanCreator(e, c)}
+                      style={{
+                        background: 'none', border: '1px solid transparent',
+                        borderRadius: 3, color: rescanningId === c.id ? 'var(--accent)' : 'var(--text-faint)',
+                        cursor: rescanningId ? 'default' : 'pointer', fontSize: 11, padding: '2px 4px', flexShrink: 0, lineHeight: 1,
+                        animation: rescanningId === c.id ? 'spin 0.8s linear infinite' : 'none',
+                      }}>
+                      ⟳
+                    </button>
+                    <button
+                      title="Configure render ZIP hint / notes"
                       onClick={e => { e.stopPropagation(); setHintCreator(hintCreator?.id === c.id ? null : c); }}
                       style={{
                         background: hintCreator?.id === c.id ? 'rgba(193,127,58,0.15)' : 'none',

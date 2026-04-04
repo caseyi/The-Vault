@@ -559,4 +559,113 @@ async function scanLibrary(libraryPath, progressCallback, logger) {
   }
 }
 
-module.exports = { scanLibrary, LIBRARY_PATH, matchesHint, pickRenderArchives, analyzeFolder, inferReleaseName, discoverModelFolders };
+/**
+ * scanSingleCreator — scan one creator folder in isolation.
+ * Uses the same scan-state machinery (scanLog/scanSummary) as scanLibrary.
+ * Called by POST /api/scan/creator/:id.
+ */
+async function scanSingleCreator(creatorPath, creatorId, creatorName, progressCallback, logger) {
+  const log = logger || (() => {});
+  const logId = db.prepare('INSERT INTO scan_log (scan_path, status) VALUES (?, ?)').run(creatorPath, 'running').lastInsertRowid;
+
+  let modelsFound = 0, modelsAdded = 0, modelsUpdated = 0, modelsSkipped = 0;
+
+  try {
+    const creatorRow = stmts.getCreator.get(creatorName);
+    const creatorHint = creatorRow?.render_zip_hint || null;
+
+    if (progressCallback) progressCallback({ stage: 'scanning', creator: creatorName });
+
+    const discovered = discoverModelFolders(creatorPath, '', 5);
+    const foldersToProcess = discovered.map(d => ({ ...d, creatorId, creatorName }));
+
+    log('creator', `▸ ${creatorName} (${foldersToProcess.length} model${foldersToProcess.length !== 1 ? 's' : ''})`);
+
+    const CHUNK_SIZE = 10;
+    for (let ci = 0; ci < foldersToProcess.length; ci += CHUNK_SIZE) {
+      const chunk = foldersToProcess.slice(ci, ci + CHUNK_SIZE);
+
+      db.transaction(() => {
+        for (const model of chunk) {
+          modelsFound++;
+          if (progressCallback) progressCallback({ stage: 'scanning', creator: creatorName, model: model.name, found: modelsFound });
+
+          const existing = stmts.getModel.get(model.fullPath);
+          const hash = folderHash(model.fullPath);
+
+          if (existing && existing.folder_hash === hash) {
+            stmts.touchModel.run(existing.id);
+            if (existing.creator_id !== creatorId) {
+              db.prepare('UPDATE models SET creator_id=?, updated_at=datetime(\'now\') WHERE id=?').run(creatorId, existing.id);
+              log('info', `  ↻ Re-attributed: ${model.name} → ${creatorName}`);
+            }
+            modelsSkipped++;
+            log('skip', `  ⟳ Unchanged: ${model.name}`);
+            return;
+          }
+
+          const analysis = analyzeFolder(model.fullPath, creatorName);
+          const sourceSite = detectSourceSite(model.fullPath) || detectSourceSite(model.name);
+          const modelUuid = existing ? existing.uuid : uuidv4();
+
+          const relParts = path.relative(creatorPath, model.fullPath).split(path.sep).filter(Boolean);
+          const pathFranchise = relParts.length >= 2 ? relParts[0] : null;
+          const pathTeam      = relParts.length >= 3 ? relParts[1] : null;
+          const hint = existing?.render_zip_hint || creatorHint || null;
+
+          let allImages = existing ? JSON.parse(existing.images || '[]') : [];
+          const freshImages = [];
+          const renderArchives = pickRenderArchives(analysis, hint);
+          for (const archivePath of renderArchives) {
+            log('zip', `    📦 ${path.basename(archivePath)}`);
+            const imgs = extractImagesFromArchive(archivePath, modelUuid);
+            freshImages.push(...imgs);
+            if (imgs.length) log('img', `       → ${imgs.length} image(s)`);
+          }
+          if (freshImages.length === 0 && analysis.images.length > 0) {
+            freshImages.push(...extractImagesFromFolder(model.fullPath, modelUuid));
+          }
+          if (freshImages.length > 0) {
+            allImages = [...new Set([...freshImages, ...allImages])];
+          }
+          const thumbnail = allImages[0] || null;
+
+          if (existing) {
+            stmts.updateModel.run(
+              inferModelName(model.fullPath), creatorId, sourceSite,
+              analysis.files.length, analysis.hasStl ? 1 : 0,
+              analysis.hasChitubox ? 1 : 0, analysis.hasLychee ? 1 : 0, analysis.hasPlate ? 1 : 0,
+              thumbnail, JSON.stringify(allImages), hash, pathFranchise, pathTeam, existing.id
+            );
+            stmts.deleteFiles.run(existing.id);
+            for (const f of analysis.files) stmts.insertFile.run(existing.id, f.filename, f.filepath, fileType(f.filename), f.size, f.release_name || null);
+            log('update', `    ↻ ${model.name} (${analysis.files.length} files)`);
+            modelsUpdated++;
+          } else {
+            const ins = stmts.insertModel.run(
+              modelUuid, inferModelName(model.fullPath), creatorId, model.fullPath, sourceSite,
+              analysis.files.length, analysis.hasStl ? 1 : 0,
+              analysis.hasChitubox ? 1 : 0, analysis.hasLychee ? 1 : 0, analysis.hasPlate ? 1 : 0,
+              thumbnail, JSON.stringify(allImages), hash, pathFranchise, pathTeam
+            );
+            for (const f of analysis.files) stmts.insertFile.run(ins.lastInsertRowid, f.filename, f.filepath, fileType(f.filename), f.size, f.release_name || null);
+            log('add', `    + ${model.name} (${analysis.files.length} files${allImages.length ? `, ${allImages.length} img` : ''})`);
+            modelsAdded++;
+          }
+        }
+      })();
+
+      await new Promise(resolve => setImmediate(resolve));
+    }
+
+    stmts.finishLog.run('complete', modelsFound, modelsAdded, modelsUpdated, modelsSkipped, logId);
+    log('info', `Skipped ${modelsSkipped} unchanged model(s)`);
+    return { success: true, modelsFound, modelsAdded, modelsUpdated, modelsSkipped };
+
+  } catch (err) {
+    stmts.errorLog.run('error', err.message, logId);
+    throw err;
+  }
+}
+
+module.exports = { scanLibrary, scanSingleCreator, LIBRARY_PATH, matchesHint, pickRenderArchives, analyzeFolder, inferReleaseName, discoverModelFolders };

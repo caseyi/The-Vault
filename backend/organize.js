@@ -802,10 +802,13 @@ function extractModelName(filename) {
   name = name.replace(/^\d+[-_]\d+\s*[Ss]cale\s*/i, '');
 
   // Strip common variant modifiers (word-boundary aware)
+  // Note: "diorama" is intentionally NOT stripped — it's a distinct product type
   name = name.replace(/\bpre[-\s]?support(?:s|ed)?\b/gi, '');
   name = name.replace(/\buncut\b/gi, '');
   name = name.replace(/\bNSFW\b/gi, '');
   name = name.replace(/\bpainted\b/gi, '');
+  name = name.replace(/\bbust\b/gi, '');
+  name = name.replace(/\bstatue\b/gi, '');
 
   // Strip creator slug at word boundary
   name = name.replace(/\bCA[-\s]?3D\b/gi, '');
