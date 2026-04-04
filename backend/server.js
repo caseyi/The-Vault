@@ -143,7 +143,7 @@ app.post('/api/scan/creator/:id', async (req, res) => {
 // ── Models ─────────────────────────────────────────────────────────────────────
 
 app.get('/api/models', (req, res) => {
-  const { search, creator, status, tags, page = 1, limit = 48, show_hidden, has_thumbnail } = req.query;
+  const { search, creator, status, tags, franchise, page = 1, limit = 48, show_hidden, has_thumbnail, recently_added } = req.query;
   const offset = (parseInt(page) - 1) * parseInt(limit);
 
   let where = ['1=1'];
@@ -157,6 +157,21 @@ app.get('/api/models', (req, res) => {
   // Thumbnail filter
   if (has_thumbnail === '1') {
     where.push('m.thumbnail_path IS NOT NULL');
+  }
+
+  // Recently added: models created since the last scan started
+  if (recently_added === '1') {
+    const lastScan = db.prepare('SELECT started_at FROM scan_log ORDER BY id DESC LIMIT 1').get();
+    if (lastScan?.started_at) {
+      where.push('m.created_at >= ?');
+      params.push(lastScan.started_at);
+    }
+  }
+
+  // Franchise filter
+  if (franchise) {
+    where.push('m.franchise = ?');
+    params.push(franchise);
   }
 
   if (search) {
@@ -388,7 +403,36 @@ app.get('/api/stats', (req, res) => {
   const creators = db.prepare('SELECT COUNT(*) as n FROM creators').get().n;
   const withImages = db.prepare("SELECT COUNT(*) as n FROM models WHERE thumbnail_path IS NOT NULL AND (hidden IS NULL OR hidden = 0)").get().n;
   const lastScan = db.prepare('SELECT * FROM scan_log ORDER BY id DESC LIMIT 1').get();
-  res.json({ total, totalHidden, byStatus, creators, withImages, lastScan });
+
+  // Count models added since the last scan started
+  let recentlyAdded = 0;
+  if (lastScan?.started_at) {
+    recentlyAdded = db.prepare('SELECT COUNT(*) as n FROM models WHERE (hidden IS NULL OR hidden = 0) AND created_at >= ?').get(lastScan.started_at).n;
+  }
+
+  // Franchise list with counts
+  const franchises = db.prepare(`
+    SELECT franchise, COUNT(*) as count FROM models
+    WHERE franchise IS NOT NULL AND franchise != '' AND (hidden IS NULL OR hidden = 0)
+    GROUP BY franchise ORDER BY count DESC, franchise
+  `).all();
+
+  res.json({ total, totalHidden, byStatus, creators, withImages, lastScan, recentlyAdded, franchises });
+});
+
+// General creator update (notes, name)
+app.patch('/api/creators/:id', (req, res) => {
+  const { notes, name } = req.body;
+  const creator = db.prepare('SELECT id FROM creators WHERE id = ?').get(req.params.id);
+  if (!creator) return res.status(404).json({ error: 'Not found' });
+  const updates = [];
+  const params = [];
+  if (notes !== undefined) { updates.push('notes = ?'); params.push(notes || null); }
+  if (name !== undefined) { updates.push('name = ?'); params.push(name); }
+  if (!updates.length) return res.status(400).json({ error: 'Nothing to update' });
+  params.push(req.params.id);
+  db.prepare(`UPDATE creators SET ${updates.join(', ')} WHERE id = ?`).run(...params);
+  res.json({ success: true });
 });
 
 // ── Tags ──────────────────────────────────────────────────────────────────────

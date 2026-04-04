@@ -230,6 +230,8 @@ export default function Gallery({ filters, onFilterChange, onModelClick, showHid
         ...(filters.status && { status: filters.status }),
         ...(filters.tags && { tags: filters.tags }),
         ...(filters.has_thumbnail && { has_thumbnail: '1' }),
+        ...(filters.recently_added && { recently_added: '1' }),
+        ...(filters.franchise && { franchise: filters.franchise }),
         ...(showHidden && { show_hidden: '1' }),
       });
       const r = await fetch(`/api/models?${params}`);

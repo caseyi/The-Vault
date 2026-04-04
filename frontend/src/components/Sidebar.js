@@ -11,7 +11,7 @@ const STATUS_OPTIONS = [
   { value: 'failed', label: 'Failed', dot: '#cf7272' },
 ];
 
-export default function Sidebar({ open, onToggle, stats, creators, tags, filters, onFilterChange, onScanClick, onOrganizeClick, onHomeClick, showHidden, onToggleHidden, appVersion, onRescanCreator }) {
+export default function Sidebar({ open, onToggle, stats, creators, tags, filters, onFilterChange, onScanClick, onOrganizeClick, onHomeClick, showHidden, onToggleHidden, appVersion, onRescanCreator, franchises }) {
   const [hintCreator, setHintCreator] = useState(null); // { id, name, render_zip_hint }
   const [showAllTags, setShowAllTags] = useState(false);
   const [rescanningId, setRescanningId] = useState(null);
@@ -97,8 +97,21 @@ export default function Sidebar({ open, onToggle, stats, creators, tags, filters
               </div>
             )}
 
-            {/* Thumbnail filter */}
+            {/* Thumbnail filter + Recently Added */}
             <div className="sidebar-section" style={{ paddingTop: 0 }}>
+              {(stats?.recentlyAdded > 0 || filters.recently_added) && (
+                <button
+                  className={`status-filter-btn ${filters.recently_added ? 'active' : ''}`}
+                  onClick={() => onFilterChange({ ...filters, recently_added: !filters.recently_added })}
+                  style={{ color: filters.recently_added ? '#4caf7d' : 'var(--text-muted)', marginBottom: 2 }}
+                >
+                  <span className="dot" style={{ background: filters.recently_added ? '#4caf7d' : '#2a2a35' }} />
+                  New This Scan
+                  <span style={{ marginLeft: 'auto', fontFamily: 'var(--font-mono)', fontSize: '10px', color: 'var(--text-faint)' }}>
+                    {stats?.recentlyAdded ?? 0}
+                  </span>
+                </button>
+              )}
               <button
                 className={`status-filter-btn ${filters.has_thumbnail ? 'active' : ''}`}
                 onClick={() => onFilterChange({ ...filters, has_thumbnail: !filters.has_thumbnail })}
@@ -111,6 +124,32 @@ export default function Sidebar({ open, onToggle, stats, creators, tags, filters
                 </span>
               </button>
             </div>
+
+            {/* Franchise filter */}
+            {franchises && franchises.length > 0 && (
+              <div className="sidebar-section">
+                <div className="sidebar-section-label" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  Franchise
+                  {filters.franchise && (
+                    <button onClick={() => onFilterChange({ ...filters, franchise: '' })}
+                      style={{ background: 'none', border: 'none', color: 'var(--accent)', cursor: 'pointer', fontSize: 9, fontFamily: 'var(--font-mono)', letterSpacing: 1 }}>
+                      CLEAR
+                    </button>
+                  )}
+                </div>
+                <div className="creator-list">
+                  {franchises.map(f => (
+                    <button
+                      key={f.franchise}
+                      className={`creator-btn ${filters.franchise === f.franchise ? 'active' : ''}`}
+                      onClick={() => onFilterChange({ ...filters, franchise: filters.franchise === f.franchise ? '' : f.franchise })}>
+                      <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', flex: 1 }}>{f.franchise}</span>
+                      <span className="count">{f.count}</span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
 
             {/* Tag Cloud */}
             {tags && tags.length > 0 && (
@@ -246,6 +285,7 @@ export default function Sidebar({ open, onToggle, stats, creators, tags, filters
             mode="creator"
             creatorId={hintCreator.id}
             currentHint={hintCreator.render_zip_hint}
+            currentNotes={hintCreator.notes}
             onClose={() => setHintCreator(null)}
             onSaved={(hint) => {
               // Refresh creator list so hint badge updates

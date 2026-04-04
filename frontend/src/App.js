@@ -13,7 +13,7 @@ export default function App() {
   const [selectedModel, setSelectedModel] = useState(null);
   const [stats, setStats] = useState(null);
   const [creators, setCreators] = useState([]);
-  const [filters, setFilters] = useState({ search: '', creator: '', status: '', tags: '', has_thumbnail: false })
+  const [filters, setFilters] = useState({ search: '', creator: '', status: '', tags: '', franchise: '', has_thumbnail: false, recently_added: false })
   const [tags, setTags] = useState([]);
   const [showScan, setShowScan] = useState(false);
   const [showOrganize, setShowOrganize] = useState(false);
@@ -64,6 +64,7 @@ export default function App() {
         onToggleHidden={() => setShowHidden(h => !h)}
         appVersion={appVersion}
         onRescanCreator={() => setShowScan(true)}
+        franchises={stats?.franchises || []}
       />
       <main className="main-content">
         {view === 'gallery' && (
