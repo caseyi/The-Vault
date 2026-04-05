@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 
 const STATUS_ICONS = {
   unprinted: '○', sliced: '◑', printing: '◕', printed: '●', painted: '★', failed: '✗'
@@ -307,15 +307,14 @@ const SORT_OPTIONS = [
 export default function Gallery({ filters, onFilterChange, onModelClick, showHidden, onRefreshStats, refreshKey, collections, onRefreshCollections }) {
   const [models, setModels] = useState([]);
   const [total, setTotal] = useState(0);
-  const [pages, setPages] = useState(1);
+  const [hasMore, setHasMore] = useState(true);
   const [page, setPage] = useState(1);
   const [loading, setLoading] = useState(false);
   const [bulkMode, setBulkMode] = useState(false);
   const [selectedIds, setSelectedIds] = useState([]);
   const [sort, setSort] = useState('creator');
-
-  // Reset to page 1 when sort changes
-  useEffect(() => { setPage(1); }, [sort]);
+  const sentinelRef = useRef(null);
+  const loadingRef = useRef(false); // avoid double-fires
 
   const buildExportUrl = () => {
     const params = new URLSearchParams({
@@ -331,11 +330,13 @@ export default function Gallery({ filters, onFilterChange, onModelClick, showHid
     return `/api/export?${params}`;
   };
 
-  const fetchModels = useCallback(async () => {
+  const fetchModels = useCallback(async (pageNum, append = false) => {
+    if (loadingRef.current) return;
+    loadingRef.current = true;
     setLoading(true);
     try {
       const params = new URLSearchParams({
-        page, limit: 48,
+        page: pageNum, limit: 48,
         ...(filters.search && { search: filters.search }),
         ...(filters.creator && { creator: filters.creator }),
         ...(filters.status && { status: filters.status }),
@@ -349,25 +350,59 @@ export default function Gallery({ filters, onFilterChange, onModelClick, showHid
       });
       const r = await fetch(`/api/models?${params}`);
       const data = await r.json();
-      setModels(data.models || []);
+      const incoming = data.models || [];
+      if (append) {
+        setModels(prev => [...prev, ...incoming]);
+      } else {
+        setModels(incoming);
+      }
       setTotal(data.total || 0);
-      setPages(data.pages || 1);
+      setHasMore(data.page < data.pages);
     } catch {}
     setLoading(false);
-  }, [filters, page, showHidden, refreshKey, sort]);
+    loadingRef.current = false;
+  }, [filters, showHidden, refreshKey, sort]);
 
-  useEffect(() => { setPage(1); }, [filters, showHidden]);
-  useEffect(() => { fetchModels(); }, [fetchModels]);
+  // Reset and reload when filters/sort/showHidden/refreshKey change
+  useEffect(() => {
+    setPage(1);
+    setHasMore(true);
+    fetchModels(1, false);
+  }, [filters, sort, showHidden, refreshKey]); // eslint-disable-line
+
+  // Load more when page increments (triggered by sentinel)
+  useEffect(() => {
+    if (page === 1) return; // handled by filter effect above
+    fetchModels(page, true);
+  }, [page]); // eslint-disable-line
+
+  // IntersectionObserver — fires when sentinel scrolls into view
+  useEffect(() => {
+    const sentinel = sentinelRef.current;
+    if (!sentinel) return;
+    const observer = new IntersectionObserver(
+      ([entry]) => {
+        if (entry.isIntersecting && !loadingRef.current && hasMore) {
+          setPage(p => p + 1);
+        }
+      },
+      { rootMargin: '200px' }
+    );
+    observer.observe(sentinel);
+    return () => observer.disconnect();
+  }, [hasMore]);
 
   const toggleSelect = (id) => setSelectedIds(prev => prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]);
   const clearSelection = () => { setSelectedIds([]); setBulkMode(false); };
+
+  const reload = () => { setPage(1); setHasMore(true); fetchModels(1, false); };
 
   const handleBulkStatus = async (status) => {
     await fetch('/api/models/bulk', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ ids: selectedIds, print_status: status })
     });
-    fetchModels();
+    reload();
   };
 
   const handleBulkTag = async (tagsAdd, tagsRemove) => {
@@ -375,7 +410,7 @@ export default function Gallery({ filters, onFilterChange, onModelClick, showHid
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ ids: selectedIds, tags_add: tagsAdd, tags_remove: tagsRemove })
     });
-    fetchModels();
+    reload();
   };
 
   const handleBulkHide = async (hide) => {
@@ -384,7 +419,7 @@ export default function Gallery({ filters, onFilterChange, onModelClick, showHid
       body: JSON.stringify({ ids: selectedIds, hidden: hide })
     });
     clearSelection();
-    fetchModels();
+    reload();
     if (onRefreshStats) onRefreshStats();
   };
 
@@ -393,12 +428,9 @@ export default function Gallery({ filters, onFilterChange, onModelClick, showHid
       method: 'PATCH', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ hidden: hide })
     });
-    fetchModels();
+    reload();
     if (onRefreshStats) onRefreshStats();
   };
-
-  const pageNums = [];
-  for (let i = Math.max(1, page - 3); i <= Math.min(pages, page + 3); i++) pageNums.push(i);
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
@@ -471,9 +503,7 @@ export default function Gallery({ filters, onFilterChange, onModelClick, showHid
       )}
 
       <div className="gallery-scroll">
-        {loading && <div className="loading"><div className="spinner" /> Loading...</div>}
-
-        {!loading && models.length === 0 && (
+        {models.length === 0 && !loading && (
           <div className="empty-state">
             <div className="empty-icon">🗄️</div>
             <div className="empty-title">VAULT IS EMPTY</div>
@@ -483,27 +513,28 @@ export default function Gallery({ filters, onFilterChange, onModelClick, showHid
           </div>
         )}
 
-        {!loading && models.length > 0 && (
-          <>
-            <div className="model-grid">
-              {models.map(m => (
-                <ModelCard key={m.id} model={m} onClick={onModelClick}
-                  bulkMode={bulkMode} selected={selectedIds.includes(m.id)}
-                  onToggle={toggleSelect} onHide={handleHideModel} />
-              ))}
-            </div>
-            {pages > 1 && (
-              <div className="pagination">
-                <button className="page-btn" disabled={page === 1} onClick={() => setPage(p => p - 1)}>← Prev</button>
-                {page > 4 && <span style={{ color: 'var(--text-faint)', fontFamily: 'var(--font-mono)', fontSize: '11px' }}>1 ...</span>}
-                {pageNums.map(n => (
-                  <button key={n} className={`page-btn ${page === n ? 'active' : ''}`} onClick={() => setPage(n)}>{n}</button>
-                ))}
-                {page < pages - 3 && <span style={{ color: 'var(--text-faint)', fontFamily: 'var(--font-mono)', fontSize: '11px' }}>... {pages}</span>}
-                <button className="page-btn" disabled={page === pages} onClick={() => setPage(p => p + 1)}>Next →</button>
-              </div>
-            )}
-          </>
+        {models.length > 0 && (
+          <div className="model-grid">
+            {models.map(m => (
+              <ModelCard key={m.id} model={m} onClick={onModelClick}
+                bulkMode={bulkMode} selected={selectedIds.includes(m.id)}
+                onToggle={toggleSelect} onHide={handleHideModel} />
+            ))}
+          </div>
+        )}
+
+        {/* Infinite scroll sentinel */}
+        <div ref={sentinelRef} style={{ height: 1 }} />
+
+        {loading && (
+          <div style={{ display: 'flex', justifyContent: 'center', padding: '20px 0', gap: 8, alignItems: 'center', color: 'var(--text-faint)', fontFamily: 'var(--font-mono)', fontSize: 11 }}>
+            <div className="spinner" /> Loading...
+          </div>
+        )}
+        {!loading && !hasMore && models.length > 0 && (
+          <div style={{ textAlign: 'center', padding: '16px 0', fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--text-faint)', letterSpacing: 1 }}>
+            — {total.toLocaleString()} models —
+          </div>
         )}
       </div>
 

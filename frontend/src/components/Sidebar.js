@@ -47,7 +47,7 @@ const STATUS_OPTIONS = [
   { value: 'failed', label: 'Failed', dot: '#cf7272' },
 ];
 
-export default function Sidebar({ open, onToggle, stats, creators, tags, filters, onFilterChange, onScanClick, onOrganizeClick, onHomeClick, showHidden, onToggleHidden, appVersion, onRescanCreator, franchises, collections, queueCount, onQueueClick, onCollectionClick, onCollectionsChange, recentlyViewed, onRecentClick }) {
+export default function Sidebar({ open, onToggle, stats, creators, tags, filters, onFilterChange, onScanClick, onOrganizeClick, onHomeClick, showHidden, onToggleHidden, appVersion, onRescanCreator, franchises, collections, queueCount, onQueueClick, onWishlistClick, wishlistCount, onCollectionClick, onCollectionsChange, recentlyViewed, onRecentClick }) {
   const [hintCreator, setHintCreator] = useState(null); // { id, name, render_zip_hint }
   const [showAllTags, setShowAllTags] = useState(false);
   const [rescanningId, setRescanningId] = useState(null);
@@ -126,6 +126,12 @@ export default function Sidebar({ open, onToggle, stats, creators, tags, filters
                 style={{ marginTop: 8, width: '100%', background: queueCount > 0 ? 'rgba(193,127,58,0.12)' : 'var(--bg3)', border: `1px solid ${queueCount > 0 ? 'rgba(193,127,58,0.4)' : 'var(--border)'}`, borderRadius: 4, color: queueCount > 0 ? '#c17f3a' : 'var(--text-muted)', padding: '5px 10px', cursor: 'pointer', fontSize: 12, fontFamily: 'var(--font-body)', display: 'flex', alignItems: 'center', gap: 6 }}>
                 🖨 Print Queue
                 <span style={{ marginLeft: 'auto', fontFamily: 'var(--font-mono)', fontSize: 10 }}>{queueCount > 0 ? queueCount : ''}</span>
+              </button>
+              <button
+                onClick={onWishlistClick}
+                style={{ marginTop: 4, width: '100%', background: wishlistCount > 0 ? 'rgba(91,155,213,0.1)' : 'var(--bg3)', border: `1px solid ${wishlistCount > 0 ? 'rgba(91,155,213,0.4)' : 'var(--border)'}`, borderRadius: 4, color: wishlistCount > 0 ? '#5b9bd5' : 'var(--text-muted)', padding: '5px 10px', cursor: 'pointer', fontSize: 12, fontFamily: 'var(--font-body)', display: 'flex', alignItems: 'center', gap: 6 }}>
+                ☆ Wishlist
+                <span style={{ marginLeft: 'auto', fontFamily: 'var(--font-mono)', fontSize: 10 }}>{wishlistCount > 0 ? wishlistCount : ''}</span>
               </button>
             </div>
 

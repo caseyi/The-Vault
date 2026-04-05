@@ -148,4 +148,18 @@ try { db.exec(`
 `); } catch {}
 try { db.exec(`CREATE INDEX IF NOT EXISTS idx_status_log_model ON status_log(model_id)`); } catch {}
 
+// Wishlist — models you want to acquire (not yet in library)
+try { db.exec(`
+  CREATE TABLE IF NOT EXISTS wishlist (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    url TEXT NOT NULL,
+    name TEXT,
+    source_site TEXT,
+    notes TEXT,
+    status TEXT DEFAULT 'want' CHECK(status IN ('want','scraping','got','failed')),
+    added_at TEXT DEFAULT (datetime('now'))
+  )
+`); } catch {}
+try { db.exec(`CREATE INDEX IF NOT EXISTS idx_wishlist_status ON wishlist(status)`); } catch {}
+
 module.exports = db;

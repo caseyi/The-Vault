@@ -2,6 +2,7 @@ import React, { useState, useEffect, useCallback } from 'react';
 import Gallery from './pages/Gallery';
 import ModelDetail from './pages/ModelDetail';
 import PrintQueue from './pages/PrintQueue';
+import Wishlist from './pages/Wishlist';
 import Sidebar from './components/Sidebar';
 import ScanModal from './components/ScanModal';
 import OrganizeModal from './components/OrganizeModal';
@@ -23,6 +24,7 @@ export default function App() {
   const [appVersion, setAppVersion] = useState(null);
   const [refreshKey, setRefreshKey] = useState(0);
   const [queueCount, setQueueCount] = useState(0);
+  const [wishlistCount, setWishlistCount] = useState(0);
   const [collections, setCollections] = useState([]);
   const [recentlyViewed, setRecentlyViewed] = useState(() => {
     try { return JSON.parse(localStorage.getItem('vault_recently_viewed') || '[]'); } catch { return []; }
@@ -30,6 +32,10 @@ export default function App() {
 
   const fetchQueueCount = useCallback(() => {
     fetch('/api/queue').then(r => r.json()).then(q => setQueueCount(q.length)).catch(() => {});
+  }, []);
+
+  const fetchWishlistCount = useCallback(() => {
+    fetch('/api/wishlist').then(r => r.json()).then(w => setWishlistCount(w.filter(i => i.status === 'want').length)).catch(() => {});
   }, []);
 
   const fetchCollections = useCallback(() => {
@@ -48,7 +54,7 @@ export default function App() {
     fetch(`${API}/api/tags`).then(r => r.json()).then(setTags).catch(() => {});
   }, []);
 
-  useEffect(() => { fetchStats(); fetchQueueCount(); fetchCollections(); }, [fetchStats, fetchQueueCount, fetchCollections]);
+  useEffect(() => { fetchStats(); fetchQueueCount(); fetchCollections(); fetchWishlistCount(); }, [fetchStats, fetchQueueCount, fetchCollections, fetchWishlistCount]);
 
   // Auto-open scan modal if a scan is already in progress on page load
   useEffect(() => {
@@ -72,6 +78,7 @@ export default function App() {
   };
   const closeModel = () => { setSelectedModel(null); setView('gallery'); };
   const openQueue = () => { setSelectedModel(null); setView('queue'); };
+  const openWishlist = () => { setSelectedModel(null); setView('wishlist'); };
 
   return (
     <div className={`app ${sidebarOpen ? 'sidebar-open' : 'sidebar-closed'}`}>
@@ -94,6 +101,8 @@ export default function App() {
         collections={collections}
         queueCount={queueCount}
         onQueueClick={openQueue}
+        onWishlistClick={openWishlist}
+        wishlistCount={wishlistCount}
         onCollectionClick={(id) => { setFilters(f => ({ ...f, collection: id })); setView('gallery'); }}
         onCollectionsChange={fetchCollections}
         recentlyViewed={recentlyViewed}
@@ -126,6 +135,12 @@ export default function App() {
           <PrintQueue
             onModelClick={openModel}
             onQueueChange={fetchQueueCount}
+          />
+        )}
+        {view === 'wishlist' && (
+          <Wishlist
+            onBack={closeModel}
+            onWishlistChange={fetchWishlistCount}
           />
         )}
       </main>

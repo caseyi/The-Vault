@@ -1677,6 +1677,64 @@ app.get('/api/models/:id/collections', (req, res) => {
 
 app.get('/api/health', (req, res) => res.json({ ok: true, libraryPath: LIBRARY_PATH, ...APP_VERSION }));
 
+// ── Wishlist ──────────────────────────────────────────────────────────────────
+
+const SITE_PATTERNS = [
+  { re: /printables\.com/i,     site: 'printables' },
+  { re: /thingiverse\.com/i,    site: 'thingiverse' },
+  { re: /myminifactory\.com/i,  site: 'myminifactory' },
+  { re: /cults3d\.com/i,        site: 'cults3d' },
+  { re: /patreon\.com/i,        site: 'patreon' },
+  { re: /gumroad\.com/i,        site: 'gumroad' },
+];
+
+function detectSite(url) {
+  for (const { re, site } of SITE_PATTERNS) if (re.test(url)) return site;
+  return null;
+}
+
+app.get('/api/wishlist', (req, res) => {
+  const items = db.prepare('SELECT * FROM wishlist ORDER BY added_at DESC').all();
+  res.json(items);
+});
+
+app.post('/api/wishlist', (req, res) => {
+  const { url, name, notes } = req.body;
+  if (!url?.trim()) return res.status(400).json({ error: 'url required' });
+  const source_site = detectSite(url);
+  try {
+    const r = db.prepare(
+      'INSERT INTO wishlist (url, name, source_site, notes) VALUES (?, ?, ?, ?)'
+    ).run(url.trim(), name?.trim() || null, source_site, notes?.trim() || null);
+    res.json({ id: r.lastInsertRowid, url: url.trim(), name: name?.trim() || null, source_site, notes: notes?.trim() || null, status: 'want' });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.patch('/api/wishlist/:id', (req, res) => {
+  const { status, name, notes, url } = req.body;
+  const item = db.prepare('SELECT id FROM wishlist WHERE id = ?').get(req.params.id);
+  if (!item) return res.status(404).json({ error: 'Not found' });
+  const updates = []; const params = [];
+  if (status !== undefined) { updates.push('status = ?'); params.push(status); }
+  if (name !== undefined)   { updates.push('name = ?');   params.push(name || null); }
+  if (notes !== undefined)  { updates.push('notes = ?');  params.push(notes || null); }
+  if (url !== undefined)    {
+    updates.push('url = ?'); params.push(url);
+    updates.push('source_site = ?'); params.push(detectSite(url));
+  }
+  if (!updates.length) return res.status(400).json({ error: 'Nothing to update' });
+  params.push(req.params.id);
+  db.prepare(`UPDATE wishlist SET ${updates.join(', ')} WHERE id = ?`).run(...params);
+  res.json({ success: true });
+});
+
+app.delete('/api/wishlist/:id', (req, res) => {
+  db.prepare('DELETE FROM wishlist WHERE id = ?').run(req.params.id);
+  res.json({ success: true });
+});
+
 // Only start the server if run directly (not when imported for testing)
 if (require.main === module) {
   app.listen(PORT, () => console.log(`The Vault v${APP_VERSION.version} (build ${APP_VERSION.build}) running on port ${PORT}`));
