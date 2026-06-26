@@ -20,6 +20,7 @@ organise your collection.
 
 - [Requirements](#requirements)
 - [Quick start](#quick-start-first-time)
+- [Step-by-step install (Windows / macOS / Synology)](#step-by-step-install)
 - [Setting your library folders](#setting-your-library-folders)
   - [A folder on this machine](#a-folder-on-this-machine)
   - [A second local folder](#a-second-local-folder)
@@ -73,6 +74,100 @@ Then click **⟳ SCAN LIBRARY** in the sidebar to index your files.
 
 Docker images are pulled automatically from GitHub Container Registry — no local
 build needed.
+
+---
+
+## Step-by-step install
+
+Don't have Docker yet? Pick your platform below. Each guide gets you from zero to
+The Vault running in your browser.
+
+> A quick note on **where your files live**. If your prints are on the *same*
+> machine you're installing on, point `LIBRARY_HOST_PATH` at that local folder. If
+> they're on a *different* NAS on your network, leave the local path as-is and use
+> the [SMB / CIFS section](#a-folder-on-another-nas-over-smb--cifs) to mount that
+> NAS instead.
+
+### 🪟 Windows
+
+1. **Install Docker Desktop.** Download it from the official guide and run the
+   installer — it will enable WSL 2 for you if needed:
+   <https://docs.docker.com/desktop/setup/install/windows-install/>
+   Reboot if prompted, then launch **Docker Desktop** and wait for it to say
+   "Engine running".
+2. **Install Git** (to download the project): <https://git-scm.com/download/win>
+   *(Or download the repo as a ZIP from GitHub and unzip it.)*
+3. **Get the project.** Open **PowerShell** and run:
+   ```powershell
+   git clone https://github.com/caseyi/stlvault.git
+   cd stlvault
+   copy .env.example .env
+   notepad .env
+   ```
+4. **Set your folder.** In `.env`, set `LIBRARY_HOST_PATH` to your prints folder
+   using forward slashes, e.g. `LIBRARY_HOST_PATH=C:/Users/you/3DPrints`. Save.
+5. **Start it:**
+   ```powershell
+   docker compose up -d
+   ```
+6. Open **http://localhost:8484** and click **⟳ SCAN LIBRARY**.
+
+> The first time Docker accesses a new drive it may pop up a **"file sharing"**
+> permission prompt — click **Share it**.
+
+### 🍎 macOS
+
+1. **Install Docker Desktop** — pick the build for your chip (Apple Silicon vs
+   Intel): <https://docs.docker.com/desktop/setup/install/mac-install/>
+   Open **Docker Desktop** from Applications and wait until the whale icon shows
+   "Engine running".
+2. **Get the project.** Open **Terminal** (Git ships with the Xcode command-line
+   tools; macOS will offer to install them if needed):
+   ```sh
+   git clone https://github.com/caseyi/stlvault.git
+   cd stlvault
+   cp .env.example .env
+   open -e .env
+   ```
+3. **Set your folder.** In `.env`, set `LIBRARY_HOST_PATH` to your prints folder,
+   e.g. `LIBRARY_HOST_PATH=/Users/you/3DPrints`. Save.
+4. **Start it:**
+   ```sh
+   docker compose up -d
+   ```
+5. Open **http://localhost:8484** and click **⟳ SCAN LIBRARY**.
+
+> If you keep prints on an external/network drive, Docker Desktop may ask you to
+> add the folder under **Settings → Resources → File sharing**.
+
+### 🗄️ Synology NAS
+
+Synology renamed its Docker package to **Container Manager** in DSM 7.2. (It's only
+available on x86_64 models — the "+" / "xs" series. ARM-based models can't run it.)
+
+1. **Install Container Manager.** In DSM, open **Package Center**, search for
+   **Container Manager**, and install it. Reference:
+   <https://www.synology.com/en-us/dsm/packages/ContainerManager>
+2. **Copy the project to your NAS.** Open **File Station** and create a folder such
+   as `docker/stlvault` on `volume1`, then copy the contents of this repo into it
+   (download the repo as a ZIP from GitHub and upload it, or `git clone` over SSH).
+3. **Create your `.env`.** Copy `.env.example` to `.env` in that folder (File
+   Station → right-click → Copy, then rename), and edit it (Text Editor) so
+   `LIBRARY_HOST_PATH` points at your prints share, e.g.
+   `LIBRARY_HOST_PATH=/volume1/STL Archive`.
+4. **Start it with the Project feature:**
+   - Open **Container Manager → Project → Create**.
+   - **Project name:** `stlvault`
+   - **Path:** browse to the `docker/stlvault` folder you created.
+   - **Source:** it will detect the existing `docker-compose.yml`. Click through
+     and **Build/Run**.
+5. Open **http://YOUR-NAS-IP:8484** and click **⟳ SCAN LIBRARY**.
+
+> **Prefer the command line?** Enable **SSH** (Control Panel → Terminal & SNMP),
+> then: `cd /volume1/docker/stlvault && sudo docker compose up -d`.
+>
+> **Updating on Synology:** in Container Manager open the project and choose
+> **Action → Build** to re-pull, or run `./update.sh` over SSH.
 
 ---
 

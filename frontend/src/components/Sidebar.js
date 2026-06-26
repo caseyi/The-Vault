@@ -111,6 +111,14 @@ export default function Sidebar({ open, onToggle, stats, creators, tags, filters
 
         {open && (
           <>
+            {/* Always-visible scan/organize actions, pinned just under the header */}
+            <div className="sidebar-actions">
+              <button className="scan-btn" onClick={onScanClick} style={{ margin: 0, flex: 1 }}>⟳ SCAN LIBRARY</button>
+              <button className="scan-btn" onClick={onOrganizeClick} title="Organize Library"
+                style={{ margin: 0, flex: '0 0 auto', background: 'rgba(193,127,58,0.12)', color: 'var(--accent)', padding: '10px 12px' }}>🗂</button>
+            </div>
+
+            <div className="sidebar-scroll">
             <div className="sidebar-section">
               <div className="sidebar-section-label">Library</div>
               <div className="sidebar-stat"><span className="sidebar-stat-label">Total models</span><span className="sidebar-stat-val">{stats?.total ?? '—'}</span></div>
@@ -427,13 +435,12 @@ export default function Sidebar({ open, onToggle, stats, creators, tags, filters
               </div>
             )}
 
-            <button className="scan-btn" onClick={onScanClick}>⟳ SCAN LIBRARY</button>
-            <button className="scan-btn" onClick={onOrganizeClick} style={{ background: 'rgba(193,127,58,0.12)', color: 'var(--accent)', marginTop: 4 }}>🗂 ORGANIZE</button>
             {appVersion && (
               <div style={{ padding: '8px 16px', fontFamily: 'var(--font-mono)', fontSize: 9, color: 'var(--text-faint)', letterSpacing: 1, textAlign: 'center' }}>
                 v{appVersion}
               </div>
             )}
+            </div>{/* /.sidebar-scroll */}
           </>
         )}
 

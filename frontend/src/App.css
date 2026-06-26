@@ -208,6 +208,24 @@ body {
 }
 .scan-btn:hover { background: #d4913f; }
 
+/* Pinned scan/organize actions just under the sidebar header */
+.sidebar-actions {
+  display: flex;
+  gap: 6px;
+  padding: 12px 12px 0;
+  flex-shrink: 0;
+}
+/* Scrollable region that holds all the filter sections, so the pinned
+   actions above stay visible no matter how long the lists get. */
+.sidebar-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
 /* ── Main Content ─────────────────────────────────── */
 .main-content {
   flex: 1;
