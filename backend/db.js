@@ -1,4 +1,4 @@
-const Database = require('better-sqlite3');
+const { DatabaseSync } = require('node:sqlite');
 const path = require('path');
 const fs = require('fs');
 
@@ -6,7 +6,28 @@ const DB_PATH = process.env.DB_PATH || '/data/vault.db';
 const dbDir = path.dirname(DB_PATH);
 if (!fs.existsSync(dbDir)) fs.mkdirSync(dbDir, { recursive: true });
 
-const db = new Database(DB_PATH);
+const db = new DatabaseSync(DB_PATH);
+
+// node:sqlite gives us prepare()/exec()/run/get/all just like better-sqlite3,
+// but has no db.transaction(fn) helper. Shim one with the same contract
+// (returns a callable that runs fn inside BEGIN/COMMIT, ROLLBACK on throw).
+// Nested calls reuse the outer transaction so we never double-BEGIN.
+let _txDepth = 0;
+db.transaction = (fn) => (...args) => {
+  if (_txDepth > 0) return fn(...args);
+  _txDepth++;
+  db.exec('BEGIN');
+  try {
+    const result = fn(...args);
+    db.exec('COMMIT');
+    return result;
+  } catch (e) {
+    try { db.exec('ROLLBACK'); } catch {}
+    throw e;
+  } finally {
+    _txDepth--;
+  }
+};
 
 db.exec(`
   PRAGMA journal_mode = WAL;

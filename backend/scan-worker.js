@@ -5,7 +5,7 @@
  * the main server's event loop. Progress and the final result are posted back
  * to the main thread via parentPort; the main thread owns scan state + SSE.
  *
- * better-sqlite3 opens its own connection here (the DB is in WAL mode, which
+ * node:sqlite opens its own connection here (the DB is in WAL mode, which
  * allows the worker to write while the main thread reads).
  */
 const { parentPort, workerData } = require('worker_threads');
