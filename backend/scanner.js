@@ -376,6 +376,58 @@ function getOrCreateCreator(name, folderPath) {
 
 // ── Main scan ─────────────────────────────────────────────────────────────────
 
+// Folder names we descend THROUGH (a mount root, a download dump, etc.) rather
+// than treat as a creator. Helps with chains like "STL Archive/Gumroad Downloads/<creator>".
+const PASSTHROUGH_NAME = /^(gumroad|gumroad downloads?|downloads?|backups?|sync|syncthing|temp|tmp|unsorted|to[\s_-]?sort|imports?|stl[\s_-]?archive|3d[\s_-]?prints?|prints?|library)$/i;
+const MAX_PASSTHROUGH_DEPTH = 6;
+
+function dirInfo(dirPath) {
+  let entries;
+  try { entries = fs.readdirSync(dirPath, { withFileTypes: true }); } catch { return { childDirs: [], hasPrintable: false }; }
+  entries = entries.filter(e => !IGNORED_FOLDERS.has(e.name) && !isJunkFile(e.name));
+  const hasPrintable = entries.some(e => {
+    if (e.isDirectory()) return false;
+    const ext = path.extname(e.name).toLowerCase();
+    return STL_EXTS.has(ext) || ARCHIVE_EXTS.has(ext) || SLICE_EXTS.has(ext) || PLATE_EXTS.has(ext);
+  });
+  const childDirs = entries.filter(e => e.isDirectory());
+  return { childDirs, hasPrintable };
+}
+
+/**
+ * Decide whether `name` (with already-computed `info`) is a pass-through container
+ * to descend into, vs. a creator folder to stop at. A folder is a pass-through
+ * when it holds no printable files AND either its name looks like a dump/mount,
+ * or — near the top of the tree — it has just a single subfolder (a wrapper).
+ * Otherwise it's a creator. Pure function (no fs) so it's easy to reason about/test.
+ */
+function isPassthrough(name, info, depth) {
+  if (info.hasPrintable || info.childDirs.length === 0) return false;
+  if (PASSTHROUGH_NAME.test(String(name).trim())) return true;
+  if (depth < 2 && info.childDirs.length === 1) return true;
+  return false;
+}
+
+/**
+ * Resolve the real creator folders under basePath, descending through
+ * pass-through containers (mount roots, download dumps, single-child wrappers).
+ */
+function resolveCreatorDirs(basePath, depth = 0, log = () => {}) {
+  const info = dirInfo(basePath);
+  const results = [];
+  for (const dir of info.childDirs) {
+    const dirPath = path.join(basePath, dir.name);
+    const childInfo = dirInfo(dirPath);
+    if (depth < MAX_PASSTHROUGH_DEPTH && isPassthrough(dir.name, childInfo, depth)) {
+      log('info', `"${dir.name}" looks like a container — descending to find creators inside it`);
+      results.push(...resolveCreatorDirs(dirPath, depth + 1, log));
+    } else {
+      results.push({ name: dir.name, path: dirPath });
+    }
+  }
+  return results;
+}
+
 async function scanLibrary(libraryPath, progressCallback, logger) {
   const log = logger || (() => {});
   const logId = db.prepare('INSERT INTO scan_log (scan_path, status) VALUES (?, ?)').run(libraryPath, 'running').lastInsertRowid;
@@ -400,37 +452,7 @@ async function scanLibrary(libraryPath, progressCallback, logger) {
     // it's likely a library root like "STL Archive" and its children are the
     // actual creators. We flatten these out so we don't attribute everything
     // to the library root name.
-    function resolveCreatorDirs(basePath) {
-      const allDirs = fs.readdirSync(basePath, { withFileTypes: true }).filter(d => d.isDirectory());
-      const dirs = allDirs.filter(d => !IGNORED_FOLDERS.has(d.name) && !isJunkFile(d.name));
-      const results = [];
-
-      for (const dir of dirs) {
-        const dirPath = path.join(basePath, dir.name);
-        const entries = fs.readdirSync(dirPath, { withFileTypes: true }).filter(e => !IGNORED_FOLDERS.has(e.name) && !isJunkFile(e.name));
-        const hasPrintableFiles = entries.some(e => {
-          if (e.isDirectory()) return false;
-          const ext = path.extname(e.name).toLowerCase();
-          return STL_EXTS.has(ext) || ARCHIVE_EXTS.has(ext) || SLICE_EXTS.has(ext) || PLATE_EXTS.has(ext);
-        });
-        const childDirs = entries.filter(e => e.isDirectory());
-
-        // If this folder has NO printable files and has subdirectories,
-        // treat it as a pass-through — its children are the real creators.
-        // Non-printable files (READMEs, images, etc.) don't disqualify it.
-        if (!hasPrintableFiles && childDirs.length > 0) {
-          log('info', `"${dir.name}" looks like a library root — using its ${childDirs.length} subfolder(s) as creators`);
-          for (const child of childDirs) {
-            results.push({ name: child.name, path: path.join(dirPath, child.name) });
-          }
-        } else {
-          results.push({ name: dir.name, path: dirPath });
-        }
-      }
-      return results;
-    }
-
-    const creatorDirs = resolveCreatorDirs(libraryPath);
+    const creatorDirs = resolveCreatorDirs(libraryPath, 0, log);
     log('info', `Found ${creatorDirs.length} creator folder(s)`);
 
     for (const creatorDir of creatorDirs) {
