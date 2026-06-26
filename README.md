@@ -25,6 +25,7 @@ organise your collection.
 - [Quick start](#quick-start-first-time)
 - [Step-by-step install (Windows / macOS / Synology)](#step-by-step-install)
 - [Setting your library folders](#setting-your-library-folders)
+  - [The easy way — add-library.sh](#the-easy-way--add-librarysh)
   - [A folder on this machine](#a-folder-on-this-machine)
   - [A second local folder](#a-second-local-folder)
   - [A folder on another NAS over SMB / CIFS](#a-folder-on-another-nas-over-smb--cifs)
@@ -188,6 +189,26 @@ docker-compose up -d
 > Each library folder is mounted **read-only** under `/library/<name>` inside the
 > container, and the app scans everything under `/library`. The Scan dialog shows
 > the folders it can currently see, so you can confirm a mount worked.
+
+### The easy way — `add-library.sh`
+
+To **add an extra** library folder (local or on another NAS over SMB) without
+editing config by hand, use the helper script. It writes a
+`docker-compose.override.yml` that mounts the new folder *in addition to* your
+primary library, then restarts. Run it from your project folder:
+
+```sh
+./add-library.sh            # interactive — pick local or SMB and answer the prompts
+./add-library.sh --list     # show the extra libraries you've added
+```
+
+It asks for a label and either a local path or SMB details (server IP, share
+name, username/password). Re-run it any time to add more. SMB credentials are
+written to the gitignored override file (chmod 600). Prefer to do it by hand?
+The sections below show the manual `.env` route.
+
+> On a NAS without `git`, fetch just the script first:
+> `wget -O add-library.sh https://raw.githubusercontent.com/caseyi/The-Vault/main/add-library.sh && chmod +x add-library.sh`
 
 ### A folder on this machine
 
