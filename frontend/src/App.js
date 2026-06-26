@@ -15,8 +15,9 @@ export default function App() {
   const [selectedModel, setSelectedModel] = useState(null);
   const [stats, setStats] = useState(null);
   const [creators, setCreators] = useState([]);
-  const [filters, setFilters] = useState({ search: '', creator: '', status: '', tags: '', franchise: '', collection: '', has_thumbnail: false, recently_added: false })
+  const [filters, setFilters] = useState({ search: '', creator: '', status: '', tags: '', franchise: '', collection: '', folder: '', has_thumbnail: false, recently_added: false })
   const [tags, setTags] = useState([]);
+  const [folderTree, setFolderTree] = useState(null);
   const [showScan, setShowScan] = useState(false);
   const [showOrganize, setShowOrganize] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
@@ -52,6 +53,7 @@ export default function App() {
     fetch(`${API}/api/stats`).then(r => r.json()).then(setStats).catch(() => {});
     fetch(`${API}/api/creators`).then(r => r.json()).then(setCreators).catch(() => {});
     fetch(`${API}/api/tags`).then(r => r.json()).then(setTags).catch(() => {});
+    fetch(`${API}/api/library/tree`).then(r => r.json()).then(setFolderTree).catch(() => {});
   }, []);
 
   useEffect(() => { fetchStats(); fetchQueueCount(); fetchCollections(); fetchWishlistCount(); }, [fetchStats, fetchQueueCount, fetchCollections, fetchWishlistCount]);
@@ -107,6 +109,8 @@ export default function App() {
         onCollectionsChange={fetchCollections}
         recentlyViewed={recentlyViewed}
         onRecentClick={openModel}
+        folderTree={folderTree}
+        onFolderSelect={(p) => { setFilters(f => ({ ...f, folder: p })); setView('gallery'); }}
       />
       <main className="main-content">
         {view === 'gallery' && (

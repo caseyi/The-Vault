@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import RenderHintPanel from './RenderHintPanel';
+import FolderTree from './FolderTree';
 
 const COLLAPSED_HEIGHT = 200; // px — show ~6 items before "Show more"
 
@@ -47,7 +48,7 @@ const STATUS_OPTIONS = [
   { value: 'failed', label: 'Failed', dot: '#cf7272' },
 ];
 
-export default function Sidebar({ open, onToggle, stats, creators, tags, filters, onFilterChange, onScanClick, onOrganizeClick, onHomeClick, showHidden, onToggleHidden, appVersion, onRescanCreator, franchises, collections, queueCount, onQueueClick, onWishlistClick, wishlistCount, onCollectionClick, onCollectionsChange, recentlyViewed, onRecentClick }) {
+export default function Sidebar({ open, onToggle, stats, creators, tags, filters, onFilterChange, onScanClick, onOrganizeClick, onHomeClick, showHidden, onToggleHidden, appVersion, onRescanCreator, franchises, collections, queueCount, onQueueClick, onWishlistClick, wishlistCount, onCollectionClick, onCollectionsChange, recentlyViewed, onRecentClick, folderTree, onFolderSelect }) {
   const [hintCreator, setHintCreator] = useState(null); // { id, name, render_zip_hint }
   const [showAllTags, setShowAllTags] = useState(false);
   const [rescanningId, setRescanningId] = useState(null);
@@ -310,6 +311,32 @@ export default function Sidebar({ open, onToggle, stats, creators, tags, filters
                     </button>
                   )}
                 </div>
+              </div>
+            )}
+
+            {/* Folder tree */}
+            {folderTree && folderTree.children && folderTree.children.length > 0 && (
+              <div className="sidebar-section">
+                <div className="sidebar-section-label" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  Folders
+                  {filters.folder && (
+                    <button onClick={() => onFolderSelect && onFolderSelect('')}
+                      style={{ background: 'none', border: 'none', color: 'var(--accent)', cursor: 'pointer', fontSize: 9, fontFamily: 'var(--font-mono)', letterSpacing: 1 }}>
+                      CLEAR
+                    </button>
+                  )}
+                </div>
+                {filters.folder && (
+                  <div title={filters.folder}
+                    style={{ fontSize: 10, fontFamily: 'var(--font-mono)', color: 'var(--accent)', padding: '0 2px 5px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    ▸ {filters.folder.split('/').filter(Boolean).slice(-1)[0]}
+                  </div>
+                )}
+                <FolderTree
+                  tree={folderTree}
+                  activePath={filters.folder}
+                  onSelect={(p) => onFolderSelect && onFolderSelect(p)}
+                />
               </div>
             )}
 

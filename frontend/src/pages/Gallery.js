@@ -14,6 +14,7 @@ function ModelCard({ model, onClick, bulkMode, selected, onToggle, onHide }) {
   const imgs = model.images || [];
   const [imgIdx, setImgIdx] = useState(0);
   const [hovered, setHovered] = useState(false);
+  const [imgLoaded, setImgLoaded] = useState(false);
   const currentImg = imgs[imgIdx] || model.thumbnail_path || imgs[0];
   const isHidden = model.hidden === 1 || model.hidden === true;
 
@@ -80,7 +81,9 @@ function ModelCard({ model, onClick, bulkMode, selected, onToggle, onHide }) {
         </button>
       )}
       {currentImg ? (
-        <img className="model-card-img" src={currentImg} alt={model.name} loading="lazy"
+        <img className="model-card-img" src={currentImg} alt={model.name} loading="lazy" decoding="async"
+          style={{ opacity: imgLoaded ? 1 : 0 }}
+          onLoad={() => setImgLoaded(true)}
           onError={e => { e.target.style.display = 'none'; e.target.nextSibling.style.display = 'flex'; }} />
       ) : null}
       <div className="model-card-no-img" style={{ display: currentImg ? 'none' : 'flex' }}>🧩</div>
@@ -313,6 +316,11 @@ export default function Gallery({ filters, onFilterChange, onModelClick, showHid
   const [bulkMode, setBulkMode] = useState(false);
   const [selectedIds, setSelectedIds] = useState([]);
   const [sort, setSort] = useState('creator');
+  const [cardSize, setCardSize] = useState(() => {
+    try { return localStorage.getItem('vault_card_size') || 'medium'; } catch { return 'medium'; }
+  });
+  const setSize = (s) => { setCardSize(s); try { localStorage.setItem('vault_card_size', s); } catch {} };
+  const CARD_MIN = { small: 150, medium: 200, large: 290 };
   const sentinelRef = useRef(null);
   const loadingRef = useRef(false); // avoid double-fires
 
@@ -325,6 +333,7 @@ export default function Gallery({ filters, onFilterChange, onModelClick, showHid
       ...(filters.has_thumbnail && { has_thumbnail: '1' }),
       ...(filters.franchise && { franchise: filters.franchise }),
       ...(filters.collection && { collection: filters.collection }),
+      ...(filters.folder && { folder: filters.folder }),
       ...(showHidden && { show_hidden: '1' }),
     });
     return `/api/export?${params}`;
@@ -345,6 +354,7 @@ export default function Gallery({ filters, onFilterChange, onModelClick, showHid
         ...(filters.recently_added && { recently_added: '1' }),
         ...(filters.franchise && { franchise: filters.franchise }),
         ...(filters.collection && { collection: filters.collection }),
+        ...(filters.folder && { folder: filters.folder }),
         ...(showHidden && { show_hidden: '1' }),
         sort,
       });
@@ -452,6 +462,22 @@ export default function Gallery({ filters, onFilterChange, onModelClick, showHid
           {SORT_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
         </select>
 
+        {/* Thumbnail size control */}
+        <div style={{ display: 'flex', flexShrink: 0, border: '1px solid var(--border)', borderRadius: 'var(--radius)', overflow: 'hidden' }}
+          title="Thumbnail size">
+          {[['small', 'S'], ['medium', 'M'], ['large', 'L']].map(([val, label]) => (
+            <button key={val} onClick={() => setSize(val)}
+              style={{
+                background: cardSize === val ? 'rgba(193,127,58,0.15)' : 'var(--bg3)',
+                border: 'none', borderRight: val !== 'large' ? '1px solid var(--border)' : 'none',
+                color: cardSize === val ? '#c17f3a' : 'var(--text-muted)',
+                padding: '6px 9px', cursor: 'pointer', fontSize: 11, fontFamily: 'var(--font-mono)',
+              }}>
+              {label}
+            </button>
+          ))}
+        </div>
+
         <button onClick={() => { setBulkMode(b => !b); setSelectedIds([]); }}
           style={{
             background: bulkMode ? 'rgba(193,127,58,0.15)' : 'var(--bg3)',
@@ -514,7 +540,7 @@ export default function Gallery({ filters, onFilterChange, onModelClick, showHid
         )}
 
         {models.length > 0 && (
-          <div className="model-grid">
+          <div className="model-grid" style={{ gridTemplateColumns: `repeat(auto-fill, minmax(${CARD_MIN[cardSize]}px, 1fr))` }}>
             {models.map(m => (
               <ModelCard key={m.id} model={m} onClick={onModelClick}
                 bulkMode={bulkMode} selected={selectedIds.includes(m.id)}

@@ -9,6 +9,7 @@ export default function ScanModal({ onClose, onScanComplete }) {
   const [summary, setSummary] = useState(null);
   const [lines, setLines] = useState([]);
   const [checking, setChecking] = useState(true); // loading state while checking scan status
+  const [roots, setRoots] = useState(null); // mounted library roots (read-only)
   const [tagging, setTagging] = useState(false);
   const [tagResult, setTagResult] = useState(null);
   const [findingImages, setFindingImages] = useState(false);
@@ -78,6 +79,14 @@ export default function ScanModal({ onClose, onScanComplete }) {
     })();
     return () => { cancelled = true; };
   }, [connectToStream]);
+
+  // Load the list of mounted library roots so the user can pick one to scan
+  useEffect(() => {
+    fetch('/api/library/roots')
+      .then(r => r.json())
+      .then(d => setRoots(d.roots || []))
+      .catch(() => setRoots([]));
+  }, []);
 
   // Cleanup SSE on unmount
   useEffect(() => () => esRef.current?.close(), []);
@@ -216,6 +225,39 @@ export default function ScanModal({ onClose, onScanComplete }) {
         <div className="modal-title">SCAN LIBRARY</div>
         <div className="modal-subtitle">Index your NAS folder to discover models and extract images</div>
 
+        {/* Mounted library roots — quick pick */}
+        {roots && roots.length > 0 && (
+          <div style={{ marginBottom: 10 }}>
+            <div style={{ fontSize: 10, fontFamily: 'var(--font-mono)', color: 'var(--text-faint)', letterSpacing: 1, marginBottom: 5 }}>
+              MOUNTED LIBRARY FOLDERS
+            </div>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+              {roots.map(r => (
+                <button
+                  key={r.path}
+                  onClick={() => setPath(r.path)}
+                  disabled={running || !r.accessible}
+                  title={r.accessible ? `Scan ${r.path}` : `Not readable: ${r.path}`}
+                  style={{
+                    display: 'inline-flex', alignItems: 'center', gap: 6,
+                    background: path === r.path ? 'rgba(193,127,58,0.18)' : 'var(--bg3)',
+                    border: `1px solid ${path === r.path ? 'var(--accent)' : 'var(--border)'}`,
+                    borderRadius: 4, padding: '5px 10px', cursor: r.accessible ? 'pointer' : 'not-allowed',
+                    color: path === r.path ? 'var(--accent)' : 'var(--text-muted)',
+                    fontSize: 12, fontFamily: 'var(--font-body)',
+                  }}>
+                  <span style={{ opacity: 0.85 }}>{r.accessible ? '🗂' : '⚠'}</span>
+                  {r.name}
+                  <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--text-faint)' }}>{r.modelCount}</span>
+                </button>
+              ))}
+            </div>
+            <div className="modal-hint" style={{ marginTop: 5 }}>
+              Pick a folder to scan just that root, or scan <code>/library</code> for everything. Add folders in your <code>.env</code> file.
+            </div>
+          </div>
+        )}
+
         <input
           className="modal-input"
           value={path}
@@ -224,7 +266,7 @@ export default function ScanModal({ onClose, onScanComplete }) {
           disabled={running}
         />
         <div className="modal-hint">
-          Default: <code>/library</code> — mapped to your NAS folder via Docker Compose.
+          Default: <code>/library</code> — mapped to your NAS folder(s) via Docker Compose / <code>.env</code>.
         </div>
 
         <label style={{

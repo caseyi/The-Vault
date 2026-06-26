@@ -151,7 +151,7 @@ const SORT_MAP = {
 };
 
 app.get('/api/models', (req, res) => {
-  const { search, creator, status, tags, franchise, collection, page = 1, limit = 48, show_hidden, has_thumbnail, recently_added, sort } = req.query;
+  const { search, creator, status, tags, franchise, collection, folder, page = 1, limit = 48, show_hidden, has_thumbnail, recently_added, sort } = req.query;
   const offset = (parseInt(page) - 1) * parseInt(limit);
 
   let where = ['1=1'];
@@ -186,6 +186,14 @@ app.get('/api/models', (req, res) => {
   if (collection) {
     where.push('m.id IN (SELECT model_id FROM collection_models WHERE collection_id = ?)');
     params.push(collection);
+  }
+
+  // Folder filter — models whose folder_path is at or beneath the given prefix.
+  // `folder` is an absolute container path (e.g. /library/STL Archive/SomeCreator)
+  // as supplied by /api/library/tree.
+  if (folder) {
+    where.push('(m.folder_path = ? OR m.folder_path LIKE ?)');
+    params.push(folder, folder.replace(/\/+$/, '') + '/%');
   }
 
   if (search) {
@@ -1676,6 +1684,68 @@ app.get('/api/models/:id/collections', (req, res) => {
 // ── Health ────────────────────────────────────────────────────────────────────
 
 app.get('/api/health', (req, res) => res.json({ ok: true, libraryPath: LIBRARY_PATH, ...APP_VERSION }));
+
+// ── Library roots ───────────────────────────────────────────────────────────
+// Lists the top-level folders mounted under LIBRARY_PATH (one per docker-compose
+// volume line). Lets the UI show what's actually mounted and how many models
+// each root holds — read-only; mounts themselves are configured in .env.
+app.get('/api/library/roots', (req, res) => {
+  let entries = [];
+  try {
+    entries = fs.readdirSync(LIBRARY_PATH, { withFileTypes: true })
+      .filter(e => e.isDirectory() && !e.name.startsWith('@') && !e.name.startsWith('#') && !e.name.startsWith('.'))
+      .map(e => e.name);
+  } catch (err) {
+    return res.json({ libraryPath: LIBRARY_PATH, mounted: false, roots: [], error: err.message });
+  }
+
+  const roots = entries.map(name => {
+    const fullPath = path.join(LIBRARY_PATH, name);
+    let accessible = false;
+    try { fs.accessSync(fullPath, fs.constants.R_OK); accessible = true; } catch {}
+    const count = db.prepare(
+      'SELECT COUNT(*) AS n FROM models WHERE folder_path = ? OR folder_path LIKE ?'
+    ).get(fullPath, fullPath + '/%').n;
+    return { name, path: fullPath, accessible, modelCount: count };
+  }).sort((a, b) => a.name.localeCompare(b.name));
+
+  res.json({ libraryPath: LIBRARY_PATH, mounted: true, roots });
+});
+
+// Folder tree built from indexed models' folder_path values. Each node carries
+// an aggregate model count (a model counts toward every ancestor folder).
+app.get('/api/library/tree', (req, res) => {
+  const rows = db.prepare(
+    'SELECT folder_path FROM models WHERE folder_path IS NOT NULL AND (hidden IS NULL OR hidden = 0)'
+  ).all();
+
+  const root = { name: 'Library', path: LIBRARY_PATH, children: {}, count: 0 };
+  const base = LIBRARY_PATH.replace(/\/+$/, '');
+
+  for (const { folder_path } of rows) {
+    if (!folder_path || !folder_path.startsWith(base)) continue;
+    const rel = folder_path.slice(base.length).replace(/^\/+/, '');
+    const parts = rel.split('/').filter(Boolean);
+    let node = root;
+    node.count++;
+    let accum = base;
+    for (const part of parts) {
+      accum += '/' + part;
+      if (!node.children[part]) node.children[part] = { name: part, path: accum, children: {}, count: 0 };
+      node = node.children[part];
+      node.count++;
+    }
+  }
+
+  const toArr = (node) => ({
+    name: node.name,
+    path: node.path,
+    count: node.count,
+    children: Object.values(node.children).map(toArr).sort((a, b) => a.name.localeCompare(b.name)),
+  });
+
+  res.json(toArr(root));
+});
 
 // ── Wishlist ──────────────────────────────────────────────────────────────────
 
