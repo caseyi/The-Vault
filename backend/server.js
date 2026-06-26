@@ -32,6 +32,53 @@ function pushLog(level, msg) {
   return line;
 }
 
+// Scans run in a worker thread so heavy/synchronous filesystem work never blocks
+// the main server. The main thread owns scan state and relays worker messages.
+const { Worker } = require('worker_threads');
+let scanWorker = null;
+
+function startScanWorker(workerData, startLogLines) {
+  scanInProgress = true;
+  scanLog = [];
+  scanSummary = null;
+  for (const [level, msg] of startLogLines) pushLog(level, msg);
+
+  scanWorker = new Worker(path.join(__dirname, 'scan-worker.js'), { workerData });
+
+  scanWorker.on('message', (m) => {
+    if (m.type === 'log') {
+      pushLog(m.level, m.msg);
+    } else if (m.type === 'done') {
+      if (m.success) {
+        const r = m.result || {};
+        pushLog('success', `✓ Scan complete — ${r.modelsFound ?? 0} found · ${r.modelsAdded ?? 0} added · ${r.modelsUpdated ?? 0} updated · ${r.modelsSkipped ?? 0} skipped`);
+        scanSummary = { type: 'done', success: true, ...r };
+      } else {
+        pushLog('error', `✗ Error: ${m.error}`);
+        scanSummary = { type: 'done', success: false, error: m.error };
+      }
+      scanInProgress = false;
+    }
+  });
+
+  scanWorker.on('error', (err) => {
+    pushLog('error', `✗ Worker error: ${err.message}`);
+    scanSummary = { type: 'done', success: false, error: err.message };
+    scanInProgress = false;
+    scanWorker = null;
+  });
+
+  scanWorker.on('exit', () => {
+    // Finalize state if the worker died without sending a 'done' message
+    if (scanInProgress && !scanSummary) {
+      scanSummary = { type: 'done', success: false, error: 'Scan ended unexpectedly' };
+      pushLog('error', scanSummary.error);
+    }
+    scanInProgress = false;
+    scanWorker = null;
+  });
+}
+
 // SSE stream — client connects and receives log lines in real time
 app.get('/api/scan/stream', (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
@@ -60,47 +107,34 @@ app.get('/api/scan/stream', (req, res) => {
   req.on('close', () => clearInterval(interval));
 });
 
-app.post('/api/scan', async (req, res) => {
+app.post('/api/scan', (req, res) => {
   if (scanInProgress) return res.status(409).json({ error: 'Scan already in progress' });
   const libPath = req.body.path || LIBRARY_PATH;
   const force = req.body.force === true;
   if (!fs.existsSync(libPath)) return res.status(400).json({ error: `Path not found: ${libPath}` });
 
-  // Force full rescan: clear all folder hashes so nothing is skipped
-  if (force) {
-    db.prepare('UPDATE models SET folder_hash = NULL').run();
-  }
-
-  scanInProgress = true;
-  scanLog = [];
-  scanSummary = null;
-
   res.json({ message: 'Scan started', path: libPath, force });
 
-  pushLog('info', `Starting ${force ? 'FULL ' : ''}scan: ${libPath}`);
-  pushLog('info', 'Discovering creators and models…');
-
-  try {
-    const result = await scanLibrary(libPath, (p) => {
-      if (p.stage === 'scanning') {
-        if (p.model) pushLog('scan', `  ${p.creator} / ${p.model}`);
-        else if (p.creator) pushLog('creator', `▸ Creator: ${p.creator}`);
-      }
-    }, pushLog);
-
-    pushLog('success', `✓ Scan complete — ${result.modelsFound} found · ${result.modelsAdded} added · ${result.modelsUpdated} updated · ${result.modelsSkipped} skipped (unchanged)`);
-    scanSummary = { type: 'done', success: true, ...result };
-  } catch (err) {
-    pushLog('error', `✗ Error: ${err.message}`);
-    scanSummary = { type: 'done', success: false, error: err.message };
-  } finally {
-    scanInProgress = false;
-  }
+  startScanWorker({ mode: 'full', libPath, force }, [
+    ['info', `Starting ${force ? 'FULL ' : ''}scan: ${libPath}`],
+    ['info', 'Discovering creators and models…'],
+  ]);
 });
 
 // Legacy status endpoint (still used by anything polling)
 app.get('/api/scan/status', (req, res) => {
   res.json({ inProgress: scanInProgress, log: scanLog, summary: scanSummary });
+});
+
+// Cancel a running scan (terminates the worker thread)
+app.post('/api/scan/cancel', async (req, res) => {
+  if (!scanInProgress || !scanWorker) return res.json({ cancelled: false, message: 'No scan running' });
+  pushLog('warn', 'Scan cancelled by user');
+  try { await scanWorker.terminate(); } catch {}
+  scanSummary = { type: 'done', success: false, error: 'Scan cancelled' };
+  scanInProgress = false;
+  scanWorker = null;
+  res.json({ cancelled: true });
 });
 
 // Per-creator rescan — scans a single creator's folder using the shared SSE machinery
@@ -111,33 +145,15 @@ app.post('/api/scan/creator/:id', async (req, res) => {
   if (!creator.folder_path) return res.status(400).json({ error: 'Creator has no folder path' });
   if (!fs.existsSync(creator.folder_path)) return res.status(400).json({ error: `Folder not found: ${creator.folder_path}` });
 
-  scanInProgress = true;
-  scanLog = [];
-  scanSummary = null;
-
   res.json({ message: 'Creator scan started', creator: creator.name, path: creator.folder_path });
 
-  pushLog('info', `Scanning creator: ${creator.name}`);
-  pushLog('info', `Path: ${creator.folder_path}`);
-
-  try {
-    const result = await scanSingleCreator(
-      creator.folder_path, creator.id, creator.name,
-      (p) => {
-        if (p.stage === 'scanning') {
-          if (p.model) pushLog('scan', `  ${p.creator} / ${p.model}`);
-        }
-      },
-      pushLog
-    );
-    pushLog('success', `✓ Done — ${result.modelsFound} found · ${result.modelsAdded} added · ${result.modelsUpdated} updated · ${result.modelsSkipped} skipped`);
-    scanSummary = { type: 'done', success: true, ...result };
-  } catch (err) {
-    pushLog('error', `✗ Error: ${err.message}`);
-    scanSummary = { type: 'done', success: false, error: err.message };
-  } finally {
-    scanInProgress = false;
-  }
+  startScanWorker(
+    { mode: 'creator', folderPath: creator.folder_path, creatorId: creator.id, creatorName: creator.name },
+    [
+      ['info', `Scanning creator: ${creator.name}`],
+      ['info', `Path: ${creator.folder_path}`],
+    ]
+  );
 });
 
 // ── Models ─────────────────────────────────────────────────────────────────────

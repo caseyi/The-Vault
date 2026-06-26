@@ -168,6 +168,13 @@ export default function ScanModal({ onClose, onScanComplete }) {
     connectToStream();
   };
 
+  const cancelScan = async () => {
+    try {
+      await fetch('/api/scan/cancel', { method: 'POST' });
+      setLines(l => [...l, { level: 'warn', msg: 'Cancelling scan…', ts: new Date().toISOString() }]);
+    } catch {}
+  };
+
   const testApiKey = async () => {
     setTestingKey(true);
     setKeyStatus(null);
@@ -429,6 +436,13 @@ export default function ScanModal({ onClose, onScanComplete }) {
           <button className="btn-cancel" onClick={onClose} disabled={running || tagging || findingImages || visionTagging}>
             {done ? 'Close' : 'Cancel'}
           </button>
+          {running && (
+            <button className="btn-cancel" onClick={cancelScan}
+              style={{ borderColor: 'rgba(207,114,114,0.5)', color: '#cf7272' }}
+              title="Stop the running scan">
+              ■ Stop Scan
+            </button>
+          )}
           <button className="btn-primary" onClick={() => { setDone(false); startScan(); }} disabled={running || tagging || findingImages || visionTagging}>
             {running ? 'Scanning…' : done ? 'Rescan' : 'Start Scan'}
           </button>

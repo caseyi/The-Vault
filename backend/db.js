@@ -14,6 +14,8 @@ db.exec(`
   PRAGMA cache_size = -32000;
   PRAGMA foreign_keys = ON;
   PRAGMA temp_store = MEMORY;
+  -- Wait instead of erroring if the scan worker and main thread touch the DB at once
+  PRAGMA busy_timeout = 15000;
 
   CREATE TABLE IF NOT EXISTS creators (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
