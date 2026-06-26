@@ -18,6 +18,14 @@ export default function App() {
   const [filters, setFilters] = useState({ search: '', creator: '', status: '', tags: '', franchise: '', collection: '', folder: '', has_thumbnail: false, recently_added: false, favorite: false })
   const [tags, setTags] = useState([]);
   const [folderTree, setFolderTree] = useState(null);
+  const [density, setDensity] = useState(() => {
+    try { return localStorage.getItem('vault_density') || 'comfortable'; } catch { return 'comfortable'; }
+  });
+  const toggleDensity = () => setDensity(d => {
+    const n = d === 'compact' ? 'comfortable' : 'compact';
+    try { localStorage.setItem('vault_density', n); } catch {}
+    return n;
+  });
   const [showScan, setShowScan] = useState(false);
   const [showOrganize, setShowOrganize] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
@@ -83,7 +91,7 @@ export default function App() {
   const openWishlist = () => { setSelectedModel(null); setView('wishlist'); };
 
   return (
-    <div className={`app ${sidebarOpen ? 'sidebar-open' : 'sidebar-closed'}`}>
+    <div className={`app ${sidebarOpen ? 'sidebar-open' : 'sidebar-closed'} density-${density}`}>
       <Sidebar
         open={sidebarOpen}
         onToggle={() => setSidebarOpen(o => !o)}
@@ -111,6 +119,8 @@ export default function App() {
         onRecentClick={openModel}
         folderTree={folderTree}
         onFolderSelect={(p) => { setFilters(f => ({ ...f, folder: p })); setView('gallery'); }}
+        density={density}
+        onToggleDensity={toggleDensity}
       />
       <main className="main-content">
         {view === 'gallery' && (

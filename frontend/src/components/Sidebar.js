@@ -38,6 +38,21 @@ function CollapsibleList({ label, onClear, items, renderItem, activeKey, getKey,
   );
 }
 
+// Remembered collapse state for a sidebar section (persisted in localStorage)
+function useCollapsed(key, defaultOpen = true) {
+  const storageKey = 'vault_sec_' + key;
+  const [open, setOpen] = useState(() => {
+    try { const v = localStorage.getItem(storageKey); return v === null ? defaultOpen : v === '1'; }
+    catch { return defaultOpen; }
+  });
+  const toggle = () => setOpen(o => {
+    const n = !o;
+    try { localStorage.setItem(storageKey, n ? '1' : '0'); } catch {}
+    return n;
+  });
+  return [open, toggle];
+}
+
 const STATUS_OPTIONS = [
   { value: '', label: 'All Models', dot: '#4a4a5a' },
   { value: 'unprinted', label: 'Unprinted', dot: '#4a4a5a' },
@@ -48,12 +63,18 @@ const STATUS_OPTIONS = [
   { value: 'failed', label: 'Failed', dot: '#cf7272' },
 ];
 
-export default function Sidebar({ open, onToggle, stats, creators, tags, filters, onFilterChange, onScanClick, onOrganizeClick, onHomeClick, showHidden, onToggleHidden, appVersion, onRescanCreator, franchises, collections, queueCount, onQueueClick, onWishlistClick, wishlistCount, onCollectionClick, onCollectionsChange, recentlyViewed, onRecentClick, folderTree, onFolderSelect }) {
+export default function Sidebar({ open, onToggle, stats, creators, tags, filters, onFilterChange, onScanClick, onOrganizeClick, onHomeClick, showHidden, onToggleHidden, appVersion, onRescanCreator, franchises, collections, queueCount, onQueueClick, onWishlistClick, wishlistCount, onCollectionClick, onCollectionsChange, recentlyViewed, onRecentClick, folderTree, onFolderSelect, density, onToggleDensity }) {
   const [hintCreator, setHintCreator] = useState(null); // { id, name, render_zip_hint }
   const [showAllTags, setShowAllTags] = useState(false);
   const [rescanningId, setRescanningId] = useState(null);
   const [newCollectionName, setNewCollectionName] = useState('');
   const [showNewCollection, setShowNewCollection] = useState(false);
+
+  // Remembered collapse state for the big sections
+  const [foldersOpen, toggleFolders] = useCollapsed('folders');
+  const [collectionsOpen, toggleCollections] = useCollapsed('collections');
+  const [tagsOpen, toggleTags] = useCollapsed('tags');
+  const [creatorsOpen, toggleCreators] = useCollapsed('creators');
 
   const handleCreateCollection = async () => {
     if (!newCollectionName.trim()) return;
@@ -141,6 +162,12 @@ export default function Sidebar({ open, onToggle, stats, creators, tags, filters
                 style={{ marginTop: 4, width: '100%', background: wishlistCount > 0 ? 'rgba(91,155,213,0.1)' : 'var(--bg3)', border: `1px solid ${wishlistCount > 0 ? 'rgba(91,155,213,0.4)' : 'var(--border)'}`, borderRadius: 4, color: wishlistCount > 0 ? '#5b9bd5' : 'var(--text-muted)', padding: '5px 10px', cursor: 'pointer', fontSize: 12, fontFamily: 'var(--font-body)', display: 'flex', alignItems: 'center', gap: 6 }}>
                 ☆ Wishlist
                 <span style={{ marginLeft: 'auto', fontFamily: 'var(--font-mono)', fontSize: 10 }}>{wishlistCount > 0 ? wishlistCount : ''}</span>
+              </button>
+              <button
+                onClick={onToggleDensity}
+                title="Toggle compact / comfortable spacing"
+                style={{ marginTop: 4, width: '100%', background: 'var(--bg3)', border: '1px solid var(--border)', borderRadius: 4, color: 'var(--text-muted)', padding: '5px 10px', cursor: 'pointer', fontSize: 12, fontFamily: 'var(--font-body)', display: 'flex', alignItems: 'center', gap: 6 }}>
+                {density === 'compact' ? '▦ Comfortable view' : '▤ Compact view'}
               </button>
             </div>
 
@@ -236,7 +263,9 @@ export default function Sidebar({ open, onToggle, stats, creators, tags, filters
             {/* Collections */}
             <div className="sidebar-section">
               <div className="sidebar-section-label" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                Collections
+                <span onClick={toggleCollections} style={{ cursor: 'pointer', userSelect: 'none', flex: 1 }}>
+                  <span className="sec-chevron">{collectionsOpen ? '▾' : '▸'}</span> Collections
+                </span>
                 <div style={{ display: 'flex', gap: 4 }}>
                   {filters.collection && (
                     <button onClick={() => onFilterChange({ ...filters, collection: '' })}
@@ -244,11 +273,12 @@ export default function Sidebar({ open, onToggle, stats, creators, tags, filters
                       CLEAR
                     </button>
                   )}
-                  <button onClick={() => setShowNewCollection(s => !s)}
+                  <button onClick={() => { setShowNewCollection(s => !s); }}
                     style={{ background: 'none', border: 'none', color: 'var(--text-faint)', cursor: 'pointer', fontSize: 13, lineHeight: 1 }}
                     title="New collection">+</button>
                 </div>
               </div>
+              {collectionsOpen && (<>
               {showNewCollection && (
                 <div style={{ display: 'flex', gap: 4, marginBottom: 6 }}>
                   <input value={newCollectionName} onChange={e => setNewCollectionName(e.target.value)}
@@ -281,13 +311,16 @@ export default function Sidebar({ open, onToggle, stats, creators, tags, filters
                   No collections yet. Press + to create one.
                 </div>
               )}
+              </>)}
             </div>
 
             {/* Tag Cloud */}
             {tags && tags.length > 0 && (
               <div className="sidebar-section">
                 <div className="sidebar-section-label" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                  Tags
+                  <span onClick={toggleTags} style={{ cursor: 'pointer', userSelect: 'none', flex: 1 }}>
+                    <span className="sec-chevron">{tagsOpen ? '▾' : '▸'}</span> Tags
+                  </span>
                   {activeTags.length > 0 && (
                     <button onClick={() => onFilterChange({ ...filters, tags: '' })}
                       style={{ background: 'none', border: 'none', color: 'var(--accent)', cursor: 'pointer', fontSize: 9, fontFamily: 'var(--font-mono)', letterSpacing: 1 }}>
@@ -295,6 +328,7 @@ export default function Sidebar({ open, onToggle, stats, creators, tags, filters
                     </button>
                   )}
                 </div>
+                {tagsOpen && (
                 <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, maxHeight: showAllTags ? 400 : 160, overflowY: 'auto', padding: '2px 0' }}>
                   {(showAllTags ? tags : tags.slice(0, 30)).map(t => {
                     const isActive = activeTags.includes(t.tag);
@@ -330,6 +364,7 @@ export default function Sidebar({ open, onToggle, stats, creators, tags, filters
                     </button>
                   )}
                 </div>
+                )}
               </div>
             )}
 
@@ -337,7 +372,9 @@ export default function Sidebar({ open, onToggle, stats, creators, tags, filters
             {folderTree && folderTree.children && folderTree.children.length > 0 && (
               <div className="sidebar-section">
                 <div className="sidebar-section-label" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                  Folders
+                  <span onClick={toggleFolders} style={{ cursor: 'pointer', userSelect: 'none', flex: 1 }}>
+                    <span className="sec-chevron">{foldersOpen ? '▾' : '▸'}</span> Folders
+                  </span>
                   {filters.folder && (
                     <button onClick={() => onFolderSelect && onFolderSelect('')}
                       style={{ background: 'none', border: 'none', color: 'var(--accent)', cursor: 'pointer', fontSize: 9, fontFamily: 'var(--font-mono)', letterSpacing: 1 }}>
@@ -345,6 +382,7 @@ export default function Sidebar({ open, onToggle, stats, creators, tags, filters
                     </button>
                   )}
                 </div>
+                {foldersOpen && (<>
                 {filters.folder && (
                   <div title={filters.folder}
                     style={{ fontSize: 10, fontFamily: 'var(--font-mono)', color: 'var(--accent)', padding: '0 2px 5px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
@@ -356,14 +394,16 @@ export default function Sidebar({ open, onToggle, stats, creators, tags, filters
                   activePath={filters.folder}
                   onSelect={(p) => onFolderSelect && onFolderSelect(p)}
                 />
+                </>)}
               </div>
             )}
 
             {/* Creators */}
             <div className="sidebar-section" style={{ overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
-              <div className="sidebar-section-label">
-                Creators <span style={{ fontFamily: 'var(--font-mono)', fontSize: 9, color: 'var(--text-faint)' }}>{creators.length}</span>
+              <div className="sidebar-section-label" onClick={toggleCreators} style={{ cursor: 'pointer', userSelect: 'none' }}>
+                <span className="sec-chevron">{creatorsOpen ? '▾' : '▸'}</span> Creators <span style={{ fontFamily: 'var(--font-mono)', fontSize: 9, color: 'var(--text-faint)' }}>{creators.length}</span>
               </div>
+              {creatorsOpen && (
               <div className="creator-list" style={{ maxHeight: 260, overflowY: 'auto' }}>
                 <button className={`creator-btn ${filters.creator === '' ? 'active' : ''}`}
                   onClick={() => onFilterChange({ ...filters, creator: '' })}>
@@ -408,6 +448,7 @@ export default function Sidebar({ open, onToggle, stats, creators, tags, filters
                   </div>
                 ))}
               </div>
+              )}
             </div>
 
             {/* Recently Viewed */}

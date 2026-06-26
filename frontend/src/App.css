@@ -208,6 +208,26 @@ body {
 }
 .scan-btn:hover { background: #d4913f; }
 
+/* Collapse chevron in section headers */
+.sec-chevron {
+  display: inline-block;
+  width: 12px;
+  font-size: 9px;
+  color: var(--text-faint);
+}
+
+/* ── Compact density mode ──────────────────────────────
+   Tightens spacing + type across the app when .density-compact is set. */
+.density-compact .sidebar-section { padding: 7px 0; }
+.density-compact .sidebar-stat { padding: 2px 16px; }
+.density-compact .creator-btn { padding: 3px 16px; font-size: 11px; }
+.density-compact .folder-label { padding: 2px 8px 2px 2px; font-size: 11px; }
+.density-compact .status-filter-btn { padding: 4px 16px; font-size: 12px; }
+.density-compact .model-card-body { padding: 6px 9px 8px; }
+.density-compact .model-card-name { font-size: 12px; }
+.density-compact .model-grid { gap: 9px; }
+.density-compact .gallery-header { padding-top: 8px; padding-bottom: 8px; }
+
 /* Pinned scan/organize actions just under the sidebar header */
 .sidebar-actions {
   display: flex;
