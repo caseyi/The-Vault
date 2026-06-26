@@ -1155,4 +1155,49 @@ router.get('/fs-tree', (req, res) => {
   res.json(tree);
 });
 
+// AI-assisted folder classification — sends Claude a compact text tree (names +
+// counts only, no file contents) and returns suggested roles to review & apply.
+router.post('/classify-folders', async (req, res) => {
+  const apiKey = req.headers['x-claude-key'] || process.env.CLAUDE_API_KEY || '';
+  if (!apiKey) return res.status(401).json({ error: 'API key required' });
+  const base = req.body?.path || LIBRARY_PATH;
+  const maxDepth = 3;
+
+  const lines = [];
+  function walk(dir, depth) {
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    entries = entries.filter(e => !e.name.startsWith('@') && !e.name.startsWith('#') && !e.name.startsWith('.'));
+    const dirs = entries.filter(e => e.isDirectory());
+    const files = entries.length - dirs.length;
+    lines.push(`${'  '.repeat(depth)}${path.basename(dir)} [${dirs.length} folders, ${files} files] :: ${dir}`);
+    if (depth < maxDepth) for (const d of dirs.slice(0, 80)) walk(path.join(dir, d.name), depth + 1);
+  }
+  walk(base, 0);
+  const treeText = lines.join('\n').slice(0, 12000);
+
+  const system = `You classify folders in a 3D-print library so a scanner groups models correctly. For each folder, decide a role:
+- "creator": a creator/studio whose subfolders are that creator's models — the scanner should STOP here.
+- "passthrough": a wrapper, download dump, mount root, or category folder the scanner should descend THROUGH (e.g. "Downloads", "Gumroad", "STL Archive").
+- "ignore": junk/system folders to skip.
+Use folder NAMES as the main signal (e.g. "...Studios"/"...3D Models" = creator; "Gumroad Downloads" = passthrough). Only include folders where you have a clear opinion; skip obvious individual model folders. Respond with ONLY a JSON array: [{"path":"<full path exactly as given after ::>","role":"creator|passthrough|ignore","reason":"short"}]`;
+  const user = `Folder tree (indentation = depth; each line ends with " :: <full path>"):\n\n${treeText}`;
+
+  try {
+    const r = await claudeRequest(apiKey, {
+      model: CLAUDE_MODEL, max_tokens: 2000, system,
+      messages: [{ role: 'user', content: user }],
+    });
+    if (r.status !== 200) return res.status(502).json({ error: `Claude API ${r.status}` });
+    const parsed = JSON.parse(r.body);
+    const text = (parsed.content || []).filter(b => b.type === 'text').map(b => b.text).join('\n');
+    const m = text.match(/\[[\s\S]*\]/);
+    const suggestions = (m ? JSON.parse(m[0]) : [])
+      .filter(s => s && s.path && ['creator', 'passthrough', 'ignore'].includes(s.role));
+    res.json({ suggestions });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 module.exports = router;
