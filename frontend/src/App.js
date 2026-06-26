@@ -121,6 +121,7 @@ export default function App() {
         onFolderSelect={(p) => { setFilters(f => ({ ...f, folder: p })); setView('gallery'); }}
         density={density}
         onToggleDensity={toggleDensity}
+        onTagsChange={() => { fetchStats(); setRefreshKey(k => k + 1); }}
       />
       <main className="main-content">
         {view === 'gallery' && (

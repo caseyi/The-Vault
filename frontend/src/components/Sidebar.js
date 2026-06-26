@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import RenderHintPanel from './RenderHintPanel';
 import FolderTree from './FolderTree';
+import TagManager from './TagManager';
 
 const COLLAPSED_HEIGHT = 200; // px — show ~6 items before "Show more"
 
@@ -63,7 +64,8 @@ const STATUS_OPTIONS = [
   { value: 'failed', label: 'Failed', dot: '#cf7272' },
 ];
 
-export default function Sidebar({ open, onToggle, stats, creators, tags, filters, onFilterChange, onScanClick, onOrganizeClick, onHomeClick, showHidden, onToggleHidden, appVersion, onRescanCreator, franchises, collections, queueCount, onQueueClick, onWishlistClick, wishlistCount, onCollectionClick, onCollectionsChange, recentlyViewed, onRecentClick, folderTree, onFolderSelect, density, onToggleDensity }) {
+export default function Sidebar({ open, onToggle, stats, creators, tags, filters, onFilterChange, onScanClick, onOrganizeClick, onHomeClick, showHidden, onToggleHidden, appVersion, onRescanCreator, franchises, collections, queueCount, onQueueClick, onWishlistClick, wishlistCount, onCollectionClick, onCollectionsChange, recentlyViewed, onRecentClick, folderTree, onFolderSelect, density, onToggleDensity, onTagsChange }) {
+  const [showTagManager, setShowTagManager] = useState(false);
   const [hintCreator, setHintCreator] = useState(null); // { id, name, render_zip_hint }
   const [showAllTags, setShowAllTags] = useState(false);
   const [rescanningId, setRescanningId] = useState(null);
@@ -382,36 +384,62 @@ export default function Sidebar({ open, onToggle, stats, creators, tags, filters
                   <span onClick={toggleTags} style={{ cursor: 'pointer', userSelect: 'none', flex: 1 }}>
                     <span className="sec-chevron">{tagsOpen ? '▾' : '▸'}</span> Tags
                   </span>
-                  {activeTags.length > 0 && (
-                    <button onClick={() => onFilterChange({ ...filters, tags: '' })}
-                      style={{ background: 'none', border: 'none', color: 'var(--accent)', cursor: 'pointer', fontSize: 9, fontFamily: 'var(--font-mono)', letterSpacing: 1 }}>
-                      CLEAR
+                  <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                    {activeTags.length > 0 && (
+                      <button onClick={() => onFilterChange({ ...filters, tags: '' })}
+                        style={{ background: 'none', border: 'none', color: 'var(--accent)', cursor: 'pointer', fontSize: 9, fontFamily: 'var(--font-mono)', letterSpacing: 1 }}>
+                        CLEAR
+                      </button>
+                    )}
+                    <button onClick={() => setShowTagManager(true)} title="Manage tags (rename / merge / delete)"
+                      style={{ background: 'none', border: 'none', color: 'var(--text-faint)', cursor: 'pointer', fontSize: 11, lineHeight: 1 }}>
+                      ⚙
                     </button>
-                  )}
+                  </div>
                 </div>
                 {tagsOpen && (
-                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, maxHeight: showAllTags ? 400 : 160, overflowY: 'auto', padding: '2px 0' }}>
-                  {(showAllTags ? tags : tags.slice(0, 30)).map(t => {
-                    const isActive = activeTags.includes(t.tag);
-                    return (
-                      <button
-                        key={t.tag}
-                        onClick={() => toggleTag(t.tag)}
-                        style={{
-                          background: isActive ? 'rgba(193,127,58,0.2)' : 'rgba(255,255,255,0.04)',
-                          border: `1px solid ${isActive ? 'var(--accent)' : 'rgba(255,255,255,0.08)'}`,
-                          borderRadius: 12, padding: '3px 10px', cursor: 'pointer',
-                          fontSize: 11, fontFamily: 'var(--font-mono)',
-                          color: isActive ? 'var(--accent)' : 'var(--text-muted)',
-                          whiteSpace: 'nowrap', lineHeight: '18px',
-                          transition: 'all 0.15s ease',
-                        }}
-                      >
-                        {t.tag}
-                        <span style={{ marginLeft: 4, fontSize: 9, opacity: 0.6 }}>{t.count}</span>
-                      </button>
-                    );
-                  })}
+                <div style={{ maxHeight: showAllTags ? 400 : 200, overflowY: 'auto', padding: '2px 0' }}>
+                  {(() => {
+                    const list = showAllTags ? tags : tags.slice(0, 30);
+                    const groups = {}; const order = [];
+                    for (const t of list) {
+                      const m = t.tag.match(/^([a-z0-9]+):(.+)$/);
+                      const facet = m ? m[1] : '';
+                      if (!(facet in groups)) { groups[facet] = []; order.push(facet); }
+                      groups[facet].push(t);
+                    }
+                    order.sort((a, b) => (a === '' ? -1 : b === '' ? 1 : a.localeCompare(b)));
+                    const renderChip = (t) => {
+                      const isActive = activeTags.includes(t.tag);
+                      const m = t.tag.match(/^([a-z0-9]+):(.+)$/);
+                      const label = m ? m[2] : t.tag;
+                      return (
+                        <button key={t.tag} onClick={() => toggleTag(t.tag)}
+                          title={t.tag}
+                          style={{
+                            background: isActive ? 'rgba(193,127,58,0.2)' : 'rgba(255,255,255,0.04)',
+                            border: `1px solid ${isActive ? 'var(--accent)' : 'rgba(255,255,255,0.08)'}`,
+                            borderRadius: 12, padding: '3px 10px', cursor: 'pointer',
+                            fontSize: 11, fontFamily: 'var(--font-mono)',
+                            color: isActive ? 'var(--accent)' : 'var(--text-muted)',
+                            whiteSpace: 'nowrap', lineHeight: '18px', transition: 'all 0.15s ease',
+                          }}>
+                          {label}
+                          <span style={{ marginLeft: 4, fontSize: 9, opacity: 0.6 }}>{t.count}</span>
+                        </button>
+                      );
+                    };
+                    return order.map(facet => (
+                      <div key={facet || '_general'} style={{ marginBottom: 6 }}>
+                        {facet && (
+                          <div style={{ fontSize: 9, fontFamily: 'var(--font-mono)', color: 'var(--text-faint)', letterSpacing: 1, textTransform: 'uppercase', margin: '2px 0 3px' }}>{facet}</div>
+                        )}
+                        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
+                          {groups[facet].map(renderChip)}
+                        </div>
+                      </div>
+                    ));
+                  })()}
                   {!showAllTags && tags.length > 30 && (
                     <button
                       onClick={() => setShowAllTags(true)}
@@ -590,6 +618,13 @@ export default function Sidebar({ open, onToggle, stats, creators, tags, filters
             }}
           />
         </div>
+      )}
+
+      {showTagManager && (
+        <TagManager
+          onClose={() => setShowTagManager(false)}
+          onChange={() => { if (onTagsChange) onTagsChange(); }}
+        />
       )}
     </>
   );

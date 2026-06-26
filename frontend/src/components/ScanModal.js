@@ -10,6 +10,11 @@ export default function ScanModal({ onClose, onScanComplete }) {
   const [lines, setLines] = useState([]);
   const [checking, setChecking] = useState(true); // loading state while checking scan status
   const [roots, setRoots] = useState(null); // mounted library roots (read-only)
+  const [aiModel, setAiModel] = useState(() => localStorage.getItem('vault_ai_model') || '');
+  const [aiModels, setAiModels] = useState([]);
+  const [estimate, setEstimate] = useState(null);
+  const [visionTagging, setVisionTagging] = useState(false);
+  const visionEsRef = useRef(null);
   const [tagging, setTagging] = useState(false);
   const [tagResult, setTagResult] = useState(null);
   const [findingImages, setFindingImages] = useState(false);
@@ -88,6 +93,40 @@ export default function ScanModal({ onClose, onScanComplete }) {
       .catch(() => setRoots([]));
   }, []);
 
+  // Load available AI models for the tagging model selector
+  useEffect(() => {
+    fetch('/api/ai/models')
+      .then(r => r.json())
+      .then(d => { setAiModels(d.models || []); setAiModel(m => m || d.default || ''); })
+      .catch(() => {});
+  }, []);
+
+  const fetchEstimate = async (vision = false) => {
+    const params = new URLSearchParams();
+    if (aiModel) params.set('model', aiModel);
+    if (vision) params.set('vision', '1');
+    try { const r = await fetch(`/api/ai/tag-estimate?${params.toString()}`); setEstimate({ ...(await r.json()), vision }); } catch {}
+  };
+
+  const visionTags = (trial = true) => {
+    setVisionTagging(true);
+    const params = new URLSearchParams();
+    if (apiKey) params.set('key', apiKey);
+    if (aiModel) params.set('model', aiModel);
+    if (!trial) params.set('trial', '0');
+    const es = new EventSource(`/api/ai/vision-tags?${params.toString()}`);
+    visionEsRef.current = es;
+    es.onmessage = (e) => {
+      const data = JSON.parse(e.data);
+      if (data.type === 'done') { setVisionTagging(false); es.close(); if (onScanComplete) onScanComplete(); }
+      else setLines(l => [...l, data]);
+    };
+    es.onerror = () => {
+      setLines(l => [...l, { level: 'error', msg: 'Vision tagging connection lost', ts: new Date().toISOString() }]);
+      setVisionTagging(false); es.close();
+    };
+  };
+
   // Cleanup SSE on unmount
   useEffect(() => () => esRef.current?.close(), []);
 
@@ -149,8 +188,10 @@ export default function ScanModal({ onClose, onScanComplete }) {
     setTagging(true);
     setTagResult(null);
 
-    const keyParam = apiKey ? `?key=${encodeURIComponent(apiKey)}` : '';
-    const es = new EventSource(`/api/ai/generate-tags${keyParam}`);
+    const tagParams = new URLSearchParams();
+    if (apiKey) tagParams.set('key', apiKey);
+    if (aiModel) tagParams.set('model', aiModel);
+    const es = new EventSource(`/api/ai/generate-tags?${tagParams.toString()}`);
     tagEsRef.current = es;
 
     es.onmessage = (e) => {
@@ -204,7 +245,7 @@ export default function ScanModal({ onClose, onScanComplete }) {
   };
 
   // Cleanup SSE connections on unmount
-  useEffect(() => () => { imgEsRef.current?.close(); tagEsRef.current?.close(); }, []);
+  useEffect(() => () => { imgEsRef.current?.close(); tagEsRef.current?.close(); visionEsRef.current?.close(); }, []);
 
   if (checking) {
     return (
@@ -327,6 +368,29 @@ export default function ScanModal({ onClose, onScanComplete }) {
           Required for Generate Tags and Find Online. Stored in browser only.
         </div>
 
+        {/* AI model + cost estimate */}
+        <div style={{ marginTop: 12, display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+          <span style={{ fontSize: 10, fontFamily: 'var(--font-mono)', color: 'var(--text-faint)', letterSpacing: 1 }}>AI MODEL</span>
+          <select
+            value={aiModel}
+            onChange={e => { setAiModel(e.target.value); localStorage.setItem('vault_ai_model', e.target.value); setEstimate(null); }}
+            style={{ background: 'var(--bg3)', border: '1px solid var(--border)', borderRadius: 4, color: 'var(--text)', padding: '5px 8px', fontSize: 11, fontFamily: 'var(--font-mono)', outline: 'none' }}
+          >
+            {aiModels.length === 0 && <option value="">(default)</option>}
+            {aiModels.map(m => <option key={m.id} value={m.id}>{m.label}</option>)}
+          </select>
+          <button onClick={() => fetchEstimate(false)}
+            style={{ background: 'var(--bg3)', border: '1px solid var(--border)', borderRadius: 4, color: 'var(--text-muted)', padding: '5px 10px', cursor: 'pointer', fontSize: 11, fontFamily: 'var(--font-mono)' }}
+            title="Rough cost estimate for tagging the whole library">
+            Estimate cost
+          </button>
+          {estimate && (
+            <span style={{ fontSize: 11, fontFamily: 'var(--font-mono)', color: 'var(--text-muted)' }}>
+              ~{estimate.models} models{estimate.vision ? ' (vision)' : ''} · <span style={{ color: 'var(--accent)' }}>~${estimate.estCostUsd}</span> <span style={{ color: 'var(--text-faint)' }}>(rough)</span>
+            </span>
+          )}
+        </div>
+
         <div style={{ marginTop: 14 }}>
           <TaskLog lines={lines} running={running} title="SCAN LOG" height={240} />
         </div>
@@ -347,16 +411,16 @@ export default function ScanModal({ onClose, onScanComplete }) {
         )}
 
         <div className="modal-actions" style={{ marginTop: 16, flexWrap: 'wrap' }}>
-          <button className="btn-cancel" onClick={onClose} disabled={running || tagging || findingImages}>
+          <button className="btn-cancel" onClick={onClose} disabled={running || tagging || findingImages || visionTagging}>
             {done ? 'Close' : 'Cancel'}
           </button>
-          <button className="btn-primary" onClick={() => { setDone(false); startScan(); }} disabled={running || tagging || findingImages}>
+          <button className="btn-primary" onClick={() => { setDone(false); startScan(); }} disabled={running || tagging || findingImages || visionTagging}>
             {running ? 'Scanning…' : done ? 'Rescan' : 'Start Scan'}
           </button>
           <button
             className="btn-primary"
             onClick={generateTags}
-            disabled={running || tagging || findingImages}
+            disabled={running || tagging || findingImages || visionTagging}
             style={{ background: tagging ? 'var(--bg-card)' : 'rgba(155,114,207,0.15)', color: '#9b72cf', border: '1px solid rgba(155,114,207,0.3)' }}
             title="Use Claude AI to auto-generate tags for all models based on names, creators, and folder structure"
           >
@@ -364,8 +428,17 @@ export default function ScanModal({ onClose, onScanComplete }) {
           </button>
           <button
             className="btn-primary"
+            onClick={() => visionTags(true)}
+            disabled={running || tagging || findingImages || visionTagging}
+            style={{ background: visionTagging ? 'var(--bg-card)' : 'rgba(155,114,207,0.15)', color: '#9b72cf', border: '1px solid rgba(155,114,207,0.3)' }}
+            title="Use Claude vision on each model's render image to identify it and generate accurate tags (trial: 10 models)"
+          >
+            {visionTagging ? 'Looking…' : '👁 Tags from Images (trial 10)'}
+          </button>
+          <button
+            className="btn-primary"
             onClick={() => findImages(true)}
-            disabled={running || tagging || findingImages}
+            disabled={running || tagging || findingImages || visionTagging}
             style={{ background: findingImages ? 'var(--bg-card)' : 'rgba(91,155,213,0.15)', color: '#5b9bd5', border: '1px solid rgba(91,155,213,0.3)' }}
             title="Trial run: process 10 best candidates first, then decide whether to continue"
           >
@@ -375,7 +448,7 @@ export default function ScanModal({ onClose, onScanComplete }) {
             <button
               className="btn-primary"
               onClick={() => findImages(false)}
-              disabled={running || tagging || findingImages}
+              disabled={running || tagging || findingImages || visionTagging}
               style={{ background: 'rgba(91,155,213,0.25)', color: '#5b9bd5', border: '1px solid rgba(91,155,213,0.4)' }}
               title={`Process all ${imgResult.remaining} remaining eligible models`}
             >

@@ -513,6 +513,59 @@ app.get('/api/tags', (req, res) => {
   res.json(sorted);
 });
 
+// ── Tag management (rename / merge / delete across the whole library) ─────────
+
+// Apply a transform fn to every model's tag array; returns how many changed.
+function rewriteAllTags(transform) {
+  const rows = db.prepare("SELECT id, tags FROM models WHERE tags IS NOT NULL AND tags != ''").all();
+  const upd = db.prepare("UPDATE models SET tags = ?, updated_at = datetime('now') WHERE id = ?");
+  let changed = 0;
+  db.transaction(() => {
+    for (const r of rows) {
+      let tags;
+      try { tags = JSON.parse(r.tags || '[]'); } catch { continue; }
+      if (!Array.isArray(tags)) continue;
+      const next = transform(tags);
+      if (next && JSON.stringify(next) !== JSON.stringify(tags)) {
+        upd.run(JSON.stringify(next), r.id);
+        changed++;
+      }
+    }
+  })();
+  return changed;
+}
+
+// Rename a tag everywhere (merges into target if it already exists)
+app.post('/api/tags/rename', (req, res) => {
+  const from = (req.body.from || '').trim();
+  const to = (req.body.to || '').trim().toLowerCase();
+  if (!from || !to) return res.status(400).json({ error: 'from and to required' });
+  const changed = rewriteAllTags(tags =>
+    tags.includes(from) ? [...new Set(tags.map(t => (t === from ? to : t)))] : tags
+  );
+  res.json({ success: true, changed });
+});
+
+// Merge several tags into one target tag
+app.post('/api/tags/merge', (req, res) => {
+  const sources = (req.body.sources || []).map(s => String(s).trim()).filter(Boolean);
+  const target = (req.body.target || '').trim().toLowerCase();
+  if (!sources.length || !target) return res.status(400).json({ error: 'sources[] and target required' });
+  const set = new Set(sources);
+  const changed = rewriteAllTags(tags =>
+    tags.some(t => set.has(t)) ? [...new Set(tags.map(t => (set.has(t) ? target : t)))] : tags
+  );
+  res.json({ success: true, changed });
+});
+
+// Remove a tag from every model
+app.post('/api/tags/delete', (req, res) => {
+  const tag = (req.body.tag || '').trim();
+  if (!tag) return res.status(400).json({ error: 'tag required' });
+  const changed = rewriteAllTags(tags => tags.filter(t => t !== tag));
+  res.json({ success: true, changed });
+});
+
 // ── Bulk Actions ──────────────────────────────────────────────────────────────
 
 app.post('/api/models/bulk', (req, res) => {
@@ -1132,11 +1185,140 @@ app.post('/api/ai/test-key', async (req, res) => {
   }
 });
 
+// ── AI model selection + cost estimate ───────────────────────────────────────
+
+// Models offered for tagging. Rates are approximate USD per million tokens —
+// adjust if Anthropic pricing changes; they only drive the rough cost preview.
+const TAG_MODELS = {
+  'claude-haiku-4-5-20251001': { label: 'Haiku 4.5 — fast & cheap', inRate: 1, outRate: 5 },
+  'claude-sonnet-4-6':         { label: 'Sonnet 4.6 — best quality', inRate: 3, outRate: 15 },
+};
+const DEFAULT_TAG_MODEL = process.env.CLAUDE_MODEL || 'claude-haiku-4-5-20251001';
+function resolveTagModel(requested) {
+  return TAG_MODELS[requested] ? requested : DEFAULT_TAG_MODEL;
+}
+
+app.get('/api/ai/models', (req, res) => {
+  res.json({
+    default: DEFAULT_TAG_MODEL,
+    models: Object.entries(TAG_MODELS).map(([id, m]) => ({ id, label: m.label })),
+  });
+});
+
+// Rough cost preview before running a tagging job
+app.get('/api/ai/tag-estimate', (req, res) => {
+  const model = resolveTagModel(req.query.model);
+  const vision = req.query.vision === '1';
+  const rates = TAG_MODELS[model] || { inRate: 1, outRate: 5 };
+  const n = vision
+    ? db.prepare("SELECT COUNT(*) AS n FROM models WHERE thumbnail_path IS NOT NULL AND (hidden IS NULL OR hidden = 0)").get().n
+    : db.prepare("SELECT COUNT(*) AS n FROM models WHERE (hidden IS NULL OR hidden = 0)").get().n;
+  // Heuristic per-model token usage (vision adds ~1.5k tokens for the image)
+  const perIn = vision ? 1700 : 90;
+  const perOut = 45;
+  const estIn = n * perIn;
+  const estOut = n * perOut;
+  const estCost = (estIn / 1e6) * rates.inRate + (estOut / 1e6) * rates.outRate;
+  res.json({
+    model, vision, models: n,
+    estInputTokens: estIn, estOutputTokens: estOut,
+    estCostUsd: Math.round(estCost * 100) / 100,
+  });
+});
+
+// ── AI Vision Tagging (SSE) — uses the extracted render image ────────────────
+
+const VISION_MEDIA = { '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.webp': 'image/webp', '.gif': 'image/gif' };
+
+app.get('/api/ai/vision-tags', async (req, res) => {
+  const apiKey = req.query.key || req.headers['x-claude-key'] || process.env.CLAUDE_API_KEY || '';
+  if (!apiKey) { res.status(401).json({ error: 'API key required' }); return; }
+  const model = resolveTagModel(req.query.model);
+  const trial = req.query.trial !== '0';
+  const TRIAL_LIMIT = 10;
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders();
+  const send = (data) => res.write(`data: ${JSON.stringify(data)}\n\n`);
+  const log = (level, msg) => send({ level, msg, ts: new Date().toISOString() });
+  const finish = (data) => { send({ type: 'done', ...data }); res.end(); };
+
+  const all = db.prepare(`
+    SELECT m.id, m.name, m.tags, m.thumbnail_path, m.folder_path, c.name AS creator_name
+    FROM models m LEFT JOIN creators c ON c.id = m.creator_id
+    WHERE m.thumbnail_path IS NOT NULL AND (m.hidden IS NULL OR m.hidden = 0)
+    ORDER BY c.name, m.name
+  `).all();
+
+  if (all.length === 0) { log('info', 'No models with images to analyse.'); return finish({ success: true, tagged: 0, total: 0 }); }
+
+  const batch = trial ? all.slice(0, TRIAL_LIMIT) : all;
+  const remaining = trial ? all.length - batch.length : 0;
+  log('info', `Vision tagging ${batch.length} model(s) with ${model}${trial && remaining > 0 ? ` (trial — ${remaining} more after)` : ''}`);
+
+  const systemPrompt = `You are a 3D-print cataloguing assistant. You are shown a render/photo of a 3D model plus its file metadata. Identify what it is and return up to 7 short lowercase tags describing franchise, character, type (bust/miniature/terrain/prop/vehicle), and theme. You may prefix a tag with a facet when useful: "type:", "franchise:", "scale:", "tech:". Always include the creator name as a tag. Respond with ONLY JSON: {"tags":["..."],"name":"a cleaner display name or null"}`;
+
+  let tagged = 0, errors = 0;
+  for (let i = 0; i < batch.length; i++) {
+    const m = batch[i];
+    const rel = (m.thumbnail_path || '').replace(/^\/images\//, '');
+    const file = path.join(IMAGES_DIR, rel);
+    const ext = path.extname(file).toLowerCase();
+    const media = VISION_MEDIA[ext];
+    const label = `[${i + 1}/${batch.length}] ${m.creator_name || '?'} / ${m.name}`;
+
+    if (!media || !fs.existsSync(file)) { log('warn', `${label} — image missing/unsupported, skipping`); continue; }
+    let b64;
+    try {
+      const buf = fs.readFileSync(file);
+      if (buf.length > 4_500_000) { log('warn', `${label} — image too large, skipping`); continue; }
+      b64 = buf.toString('base64');
+    } catch { log('warn', `${label} — could not read image`); continue; }
+
+    const meta = `File metadata:\n- name: ${m.name}\n- creator: ${m.creator_name || 'unknown'}\n- folder: ${m.folder_path.replace(/^\/library\/?/, '')}`;
+    try {
+      const parsed = await callClaudeAPI(apiKey, {
+        model, max_tokens: 400, system: systemPrompt,
+        messages: [{ role: 'user', content: [
+          { type: 'image', source: { type: 'base64', media_type: media, data: b64 } },
+          { type: 'text', text: `${meta}\n\nTag this model.` },
+        ] }],
+      }, { timeoutMs: 60000 });
+
+      const text = (parsed.content || []).filter(b => b.type === 'text').map(b => b.text).join('\n');
+      const jsonMatch = text.match(/\{[\s\S]*\}/);
+      if (!jsonMatch) { log('error', `${label} — no JSON in response`); errors++; continue; }
+      const result = JSON.parse(jsonMatch[0]);
+      const newTags = Array.isArray(result.tags) ? result.tags.map(t => String(t).toLowerCase().trim()).filter(Boolean) : [];
+      if (!newTags.length) { log('warn', `${label} — no tags returned`); continue; }
+
+      const existing = (() => { try { return JSON.parse(m.tags || '[]'); } catch { return []; } })();
+      const merged = [...new Set([...existing, ...newTags])].slice(0, 7);
+      db.prepare("UPDATE models SET tags = ?, updated_at = datetime('now') WHERE id = ?").run(JSON.stringify(merged), m.id);
+      tagged++;
+      log('tag', `  ${m.name}: [${newTags.join(', ')}]`);
+    } catch (e) {
+      errors++;
+      log('error', `${label} — ${e.message}`);
+      if (e.message.includes('Invalid API key') || e.message.includes('lacks permission')) {
+        return finish({ success: false, error: e.message, tagged, total: batch.length });
+      }
+      if (e.message.includes('Rate limited')) { log('warn', 'Waiting 30s…'); await new Promise(r => setTimeout(r, 30000)); i--; continue; }
+    }
+  }
+
+  log(errors ? 'warn' : 'success', `Vision tagging done — ${tagged} tagged, ${errors} error(s)`);
+  finish({ success: true, tagged, total: batch.length, remaining, errors });
+});
+
 // ── AI Auto-Tagging (SSE) ────────────────────────────────────────────────────
 
 app.get('/api/ai/generate-tags', async (req, res) => {
   const apiKey = req.query.key || process.env.CLAUDE_API_KEY || '';
   if (!apiKey) { res.status(401).json({ error: 'API key required' }); return; }
+  const model = resolveTagModel(req.query.model);
 
   // SSE setup
   res.setHeader('Content-Type', 'text/event-stream');
@@ -1187,6 +1369,7 @@ Rules:
 - If slicer is "fdm" (no resin slicer files), include "fdm" as a tag. This is important for filtering by print technology.
 - Examples: "star wars", "marvel", "thundercats", "dragon", "miniature", "terrain", "bust", "vehicle", "droid", "rebel", "empire", "fantasy", "sci-fi", "anime", "warhammer", "dnd", "resin", "fdm"
 - Use broad franchise tags (e.g. "star wars") AND specific tags (e.g. "rebel", "x-wing")
+- Optionally prefix a tag with a facet for cleaner organising: "type:" (bust/miniature/terrain/prop/vehicle), "franchise:", "scale:", "tech:" (e.g. "type:bust", "franchise:star wars", "tech:resin"). Plain tags are still fine; don't force facets where they don't help.
 - Use the folder path structure for context clues (e.g. "Star Wars/Vehicles/X-wing" → tags: ["star wars", "vehicle", "x-wing"])
 - If a model name suggests a known character or IP, tag appropriately (e.g. "Cheetara" → ["thundercats", "cheetara"])
 
@@ -1215,7 +1398,7 @@ No other text or explanation — just the JSON array.`;
 
     try {
       const parsed = await callClaudeAPI(apiKey, {
-        model: process.env.CLAUDE_MODEL || 'claude-haiku-4-5-20251001',
+        model,
         max_tokens: 4096,
         system: systemPrompt,
         messages: [{ role: 'user', content: userContent }]
