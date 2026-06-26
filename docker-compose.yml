@@ -21,7 +21,7 @@ version: '3.8'
 
 services:
   backend:
-    image: ghcr.io/caseyi/stlvault-backend:latest
+    image: ghcr.io/caseyi/the-vault-backend:latest
     # build: ./backend       # ← uncomment to build locally
     restart: unless-stopped
     volumes:
@@ -52,7 +52,7 @@ services:
       # - CLAUDE_MODEL=${CLAUDE_MODEL:-claude-haiku-4-5-20251001}
 
   frontend:
-    image: ghcr.io/caseyi/stlvault-frontend:latest
+    image: ghcr.io/caseyi/the-vault-frontend:latest
     # build: ./frontend      # ← uncomment to build locally
     restart: unless-stopped
     ports:

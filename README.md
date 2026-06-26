@@ -54,8 +54,8 @@ Docker images.
 
 ```sh
 # 1. Clone the repo
-git clone https://github.com/caseyi/stlvault.git
-cd stlvault
+git clone https://github.com/caseyi/The-Vault.git
+cd The-Vault
 
 # 2. Create your config file from the template
 cp .env.example .env
@@ -97,17 +97,18 @@ The Vault running in your browser.
    "Engine running".
 2. **Install Git** (to download the project): <https://git-scm.com/download/win>
    *(Or download the repo as a ZIP from GitHub and unzip it.)*
-3. **Get the project.** Open **PowerShell** and run:
-   ```powershell
-   git clone https://github.com/caseyi/stlvault.git
-   cd stlvault
+3. **Get the project.** Open **Command Prompt** (type `cmd` in the Start menu and
+   press Enter) and run:
+   ```bat
+   git clone https://github.com/caseyi/The-Vault.git
+   cd The-Vault
    copy .env.example .env
    notepad .env
    ```
 4. **Set your folder.** In `.env`, set `LIBRARY_HOST_PATH` to your prints folder
    using forward slashes, e.g. `LIBRARY_HOST_PATH=C:/Users/you/3DPrints`. Save.
 5. **Start it:**
-   ```powershell
+   ```bat
    docker compose up -d
    ```
 6. Open **http://localhost:8484** and click **⟳ SCAN LIBRARY**.
@@ -124,8 +125,8 @@ The Vault running in your browser.
 2. **Get the project.** Open **Terminal** (Git ships with the Xcode command-line
    tools; macOS will offer to install them if needed):
    ```sh
-   git clone https://github.com/caseyi/stlvault.git
-   cd stlvault
+   git clone https://github.com/caseyi/The-Vault.git
+   cd The-Vault
    cp .env.example .env
    open -e .env
    ```
@@ -149,7 +150,7 @@ available on x86_64 models — the "+" / "xs" series. ARM-based models can't run
    **Container Manager**, and install it. Reference:
    <https://www.synology.com/en-us/dsm/packages/ContainerManager>
 2. **Copy the project to your NAS.** Open **File Station** and create a folder such
-   as `docker/stlvault` on `volume1`, then copy the contents of this repo into it
+   as `docker/the-vault` on `volume1`, then copy the contents of this repo into it
    (download the repo as a ZIP from GitHub and upload it, or `git clone` over SSH).
 3. **Create your `.env`.** Copy `.env.example` to `.env` in that folder (File
    Station → right-click → Copy, then rename), and edit it (Text Editor) so
@@ -157,14 +158,14 @@ available on x86_64 models — the "+" / "xs" series. ARM-based models can't run
    `LIBRARY_HOST_PATH=/volume1/STL Archive`.
 4. **Start it with the Project feature:**
    - Open **Container Manager → Project → Create**.
-   - **Project name:** `stlvault`
-   - **Path:** browse to the `docker/stlvault` folder you created.
+   - **Project name:** `the-vault`
+   - **Path:** browse to the `docker/the-vault` folder you created.
    - **Source:** it will detect the existing `docker-compose.yml`. Click through
      and **Build/Run**.
 5. Open **http://YOUR-NAS-IP:8484** and click **⟳ SCAN LIBRARY**.
 
 > **Prefer the command line?** Enable **SSH** (Control Panel → Terminal & SNMP),
-> then: `cd /volume1/docker/stlvault && sudo docker compose up -d`.
+> then: `cd /volume1/docker/the-vault && sudo docker compose up -d`.
 >
 > **Updating on Synology:** in Container Manager open the project and choose
 > **Action → Build** to re-pull, or run `./update.sh` over SSH.
@@ -274,7 +275,7 @@ creators.
 Whenever a new version is released, just run:
 
 ```sh
-cd /path/to/stlvault
+cd /path/to/the-vault
 ./update.sh
 ```
 
@@ -338,7 +339,7 @@ These are set **inside the container** and normally don't need changing:
 **"Path not found" when scanning / a folder is missing from the Scan dialog.**
 The container can't see that folder. Double-check the host path in `.env`, make
 sure you ran `docker-compose up -d` after editing it, and confirm the path exists
-on the host. View what the container sees: `docker exec stlvault-backend-1 ls /library`.
+on the host. View what the container sees: `docker exec the-vault-backend-1 ls /library`.
 
 **SMB share won't mount.** Run `docker-compose up -d` and check
 `docker-compose logs backend`. Common fixes: try a different `vers=` (2.1 or 1.0)
@@ -364,10 +365,10 @@ To build images locally instead of pulling from GHCR, edit `docker-compose.yml`:
 ```yaml
 services:
   backend:
-    # image: ghcr.io/caseyi/stlvault-backend:latest  ← comment this out
+    # image: ghcr.io/caseyi/the-vault-backend:latest  ← comment this out
     build: ./backend                                   ← uncomment this
   frontend:
-    # image: ghcr.io/caseyi/stlvault-frontend:latest ← comment this out
+    # image: ghcr.io/caseyi/the-vault-frontend:latest ← comment this out
     build: ./frontend                                  ← uncomment this
 ```
 
@@ -390,8 +391,8 @@ cd frontend && npm install && CI=true npm test
 Pushing to `main` (or pushing a `v*` tag) triggers the GitHub Actions workflow
 at `.github/workflows/docker-publish.yml`, which:
 
-1. Builds `stlvault-backend` and `stlvault-frontend` Docker images
-2. Pushes them to `ghcr.io/caseyi/stlvault-{backend,frontend}:latest`
+1. Builds `the-vault-backend` and `the-vault-frontend` Docker images
+2. Pushes them to `ghcr.io/caseyi/the-vault-{backend,frontend}:latest`
 3. Also tags each image with `sha-<commit>` for rollback
 
 The images are public and require no authentication to pull.
@@ -411,7 +412,7 @@ donation is appreciated but never required (see below).
 The Vault is built and maintained in spare time and given away for free. If it
 saved you some headaches organising your print library, you can chip in:
 
-> **If you like The Vault, please feel free to donate with the Sponsors button — and if you have suggestions or hit a bug, [open a GitHub issue](https://github.com/caseyi/stlvault/issues) on this repo!**
+> **If you like The Vault, please feel free to donate with the Sponsors button — and if you have suggestions or hit a bug, [open a GitHub issue](https://github.com/caseyi/The-Vault/issues) on this repo!**
 
 - **GitHub Sponsors** — use the **Sponsor ❤** button at the top of the repo
   (one-time or recurring, no fees).

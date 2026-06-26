@@ -6,7 +6,7 @@
 # What it does:
 #   1. Stops any running Vault containers
 #   2. Finds and removes duplicate / old copies of the app files
-#   3. Clones a clean copy from GitHub into ~/stlvault
+#   3. Clones a clean copy from GitHub into ~/The-Vault
 #   4. Pulls the pre-built Docker images
 #   5. Starts the app
 #
@@ -19,8 +19,8 @@
 
 set -e
 
-REPO_URL="https://github.com/caseyi/stlvault.git"
-INSTALL_DIR="$HOME/stlvault"
+REPO_URL="https://github.com/caseyi/The-Vault.git"
+INSTALL_DIR="$HOME/The-Vault"
 
 echo ""
 echo "╔══════════════════════════════════════════╗"
@@ -32,7 +32,7 @@ echo ""
 echo "▸ Stopping any running Vault containers..."
 
 # Try all the places docker-compose might be running from
-for dir in "$HOME/stlvault" "$HOME/the-vault" "$HOME/STLVault" "$HOME/Documents/stlvault"; do
+for dir in "$HOME/The-Vault" "$HOME/the-vault" "$HOME/STLVault" "$HOME/Documents/The-Vault"; do
   if [ -f "$dir/docker-compose.yml" ]; then
     echo "  Found compose file at $dir — stopping..."
     cd "$dir"
@@ -48,8 +48,8 @@ echo "▸ Looking for existing copies of the app files..."
 echo "  (Searching your home directory — this may take a moment)"
 echo ""
 
-# Find any folder containing docker-compose.yml that references stlvault/vault
-FOUND=$(find "$HOME" -maxdepth 4 -name "docker-compose.yml" 2>/dev/null | xargs grep -l "stlvault\|vault_data\|the-vault" 2>/dev/null || true)
+# Find any folder containing docker-compose.yml that references the-vault/vault
+FOUND=$(find "$HOME" -maxdepth 4 -name "docker-compose.yml" 2>/dev/null | xargs grep -l "the-vault\|vault_data\|the-vault" 2>/dev/null || true)
 
 if [ -n "$FOUND" ]; then
   echo "  Found these existing copies:"

@@ -3,7 +3,7 @@
 **Version:** 0.2.0 (build auto-incremented via pre-commit hook)
 **Last Updated:** 2026-03-31
 **Maintainer:** Casey (caseyi@uw.edu)
-**Repository:** github.com/caseyi/stlvault
+**Repository:** github.com/caseyi/The-Vault
 **Host:** Synology NAS "Dagobah"
 
 ---
@@ -481,7 +481,7 @@ location / {
 
 ### CI/CD Pipeline
 
-GitHub Actions builds and pushes multi-arch Docker images to `ghcr.io/caseyi/stlvault-{backend,frontend}:latest` on push to main.
+GitHub Actions builds and pushes multi-arch Docker images to `ghcr.io/caseyi/the-vault-{backend,frontend}:latest` on push to main.
 
 ### Update Script (`update.sh`)
 
@@ -561,7 +561,7 @@ Creates directory structure, downloads `docker-compose.yml`, runs initial pull a
 ## 11. File Inventory
 
 ```
-stlvault/
+the-vault/
 ├── .gitignore
 ├── CLAUDE.md                # AI assistant context file
 ├── SPEC.md                  # This file

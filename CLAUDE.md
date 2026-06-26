@@ -5,7 +5,7 @@
 **The Vault** is a self-hosted 3D print library manager. It runs on a Synology NAS ("Dagobah" at 192.168.1.140) via Docker Compose, indexing a folder tree of STL/3D print models and providing a dark-themed gallery UI.
 
 **Owner:** Casey (caseyi@uw.edu)
-**Repo:** github.com/caseyi/stlvault
+**Repo:** github.com/caseyi/The-Vault
 **Version:** 0.2.0 (build auto-incremented via pre-commit hook)
 **Host:** Synology NAS "Dagobah" — library at `/volume1/STL Archive`
 
@@ -20,7 +20,7 @@
 ## Project Structure
 
 ```
-stlvault/
+the-vault/
 ├── backend/
 │   ├── server.js        # Express API (~1300 lines) — all endpoints
 │   ├── scanner.js       # Library indexer (~560 lines) — folder discovery, hashing, image extraction
@@ -113,7 +113,7 @@ git push
 
 # 3. On NAS (Dagobah), pull and restart
 ssh casey@192.168.1.140
-cd /path/to/stlvault
+cd /path/to/the-vault
 ./update.sh
 ```
 
