@@ -1,0 +1,56 @@
+name: Native build (macOS + Windows)
+
+# Builds the Tauri desktop app for both OSes from one source and attaches the
+# (unsigned) installers to a draft GitHub Release. Tag with `native-vX.Y.Z`.
+on:
+  push:
+    tags: ["native-v*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build frontend
+        run: cd frontend && npm ci && npm run build
+
+      - name: Stage backend resource
+        shell: bash
+        run: bash native/scripts/bundle-backend.sh
+
+      - name: Generate placeholder app icons
+        shell: bash
+        run: |
+          cd native
+          npm ci
+          mkdir -p src-tauri/icons
+          # Placeholder icon — replace with a real logo via `npx tauri icon logo.png`.
+          if command -v magick >/dev/null 2>&1; then magick -size 1024x1024 xc:#c17f3a src-tauri/icons/icon.png;
+          elif command -v convert >/dev/null 2>&1; then convert -size 1024x1024 xc:#c17f3a src-tauri/icons/icon.png; fi
+          if [ -f src-tauri/icons/icon.png ]; then npx --yes @tauri-apps/cli icon src-tauri/icons/icon.png; fi
+
+      # TODO(M2): bundle a Node 22 runtime into native/src-tauri/resources/node/
+      # for this matrix.platform before the build step.
+
+      - name: Build Tauri app
+        uses: tauri-apps/tauri-action@v0
+        with:
+          projectPath: native
+          tagName: ${{ github.ref_name }}
+          releaseName: "The Vault ${{ github.ref_name }}"
+          releaseDraft: true
+          releaseBody: "Unsigned dev build. macOS: right-click → Open. Windows: More info → Run anyway."
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

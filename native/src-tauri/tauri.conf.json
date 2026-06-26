@@ -1,0 +1,22 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "The Vault",
+  "version": "0.1.0",
+  "identifier": "org.thevault.desktop",
+  "build": {
+    "frontendDist": "../../frontend/build"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["dmg", "nsis"],
+    "icon": ["icons/icon.png", "icons/icon.icns", "icons/icon.ico"],
+    "resources": ["resources/**/*"]
+  }
+}
