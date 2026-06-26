@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import Gallery from './pages/Gallery';
 import ModelDetail from './pages/ModelDetail';
 import PrintQueue from './pages/PrintQueue';
@@ -49,6 +49,9 @@ export default function App() {
   const [recentlyViewed, setRecentlyViewed] = useState(() => {
     try { return JSON.parse(localStorage.getItem('vault_recently_viewed') || '[]'); } catch { return []; }
   });
+  const [scanStatus, setScanStatus] = useState({ inProgress: false, count: 0, last: '' });
+  const [scanToast, setScanToast] = useState(null);
+  const scanWasRunning = useRef(false);
 
   const fetchQueueCount = useCallback(() => {
     fetch('/api/queue').then(r => r.json()).then(q => setQueueCount(q.length)).catch(() => {});
@@ -76,6 +79,34 @@ export default function App() {
   }, []);
 
   useEffect(() => { fetchStats(); fetchQueueCount(); fetchCollections(); fetchWishlistCount(); }, [fetchStats, fetchQueueCount, fetchCollections, fetchWishlistCount]);
+
+  // Poll background scan progress so a running scan is visible app-wide (even
+  // with the Scan window closed), and auto-refresh the gallery when it finishes.
+  useEffect(() => {
+    let active = true;
+    const poll = async () => {
+      try {
+        const r = await fetch(`${API}/api/scan/progress`);
+        const s = await r.json();
+        if (!active) return;
+        setScanStatus(s);
+        if (scanWasRunning.current && !s.inProgress) {
+          fetchStats();
+          setRefreshKey(k => k + 1);
+          if (s.summary) {
+            setScanToast(s.summary.success
+              ? `✓ Scan complete — ${s.summary.modelsAdded ?? 0} added, ${s.summary.modelsFound ?? 0} found`
+              : `✗ Scan failed: ${s.summary.error || 'unknown error'}`);
+            setTimeout(() => setScanToast(null), 7000);
+          }
+        }
+        scanWasRunning.current = s.inProgress;
+      } catch {}
+    };
+    poll();
+    const id = setInterval(poll, 3500);
+    return () => { active = false; clearInterval(id); };
+  }, [fetchStats]);
 
   // Auto-open scan modal if a scan is already in progress on page load
   useEffect(() => {
@@ -135,6 +166,8 @@ export default function App() {
         theme={theme}
         onToggleTheme={toggleTheme}
         onTagsChange={() => { fetchStats(); setRefreshKey(k => k + 1); }}
+        scanRunning={scanStatus.inProgress}
+        scanCount={scanStatus.count}
       />
       <main className="main-content">
         {view === 'gallery' && (
@@ -182,6 +215,24 @@ export default function App() {
         <OrganizeModal
           onClose={() => { setShowOrganize(false); fetchStats(); }}
         />
+      )}
+
+      {/* Background-scan toast (completion) */}
+      {scanToast && (
+        <div
+          onClick={() => setScanToast(null)}
+          style={{
+            position: 'fixed', bottom: 20, right: 20, zIndex: 500,
+            background: 'var(--bg2)', border: '1px solid var(--border-bright)',
+            borderLeft: '3px solid var(--accent)', borderRadius: 8,
+            padding: '12px 16px', maxWidth: 320, cursor: 'pointer',
+            boxShadow: '0 8px 28px rgba(0,0,0,0.5)',
+            fontSize: 13, color: 'var(--text)', fontFamily: 'var(--font-body)',
+          }}
+          title="Dismiss"
+        >
+          {scanToast}
+        </div>
       )}
     </div>
   );

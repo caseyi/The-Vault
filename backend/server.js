@@ -36,11 +36,13 @@ function pushLog(level, msg) {
 // the main server. The main thread owns scan state and relays worker messages.
 const { Worker } = require('worker_threads');
 let scanWorker = null;
+let scanProgress = { count: 0, last: '' }; // lightweight live progress for the global indicator
 
 function startScanWorker(workerData, startLogLines) {
   scanInProgress = true;
   scanLog = [];
   scanSummary = null;
+  scanProgress = { count: 0, last: '' };
   for (const [level, msg] of startLogLines) pushLog(level, msg);
 
   scanWorker = new Worker(path.join(__dirname, 'scan-worker.js'), { workerData });
@@ -48,6 +50,8 @@ function startScanWorker(workerData, startLogLines) {
   scanWorker.on('message', (m) => {
     if (m.type === 'log') {
       pushLog(m.level, m.msg);
+      if (m.level === 'scan') scanProgress.count++;
+      if (m.msg) scanProgress.last = String(m.msg).trim();
     } else if (m.type === 'done') {
       if (m.success) {
         const r = m.result || {};
@@ -124,6 +128,18 @@ app.post('/api/scan', (req, res) => {
 // Legacy status endpoint (still used by anything polling)
 app.get('/api/scan/status', (req, res) => {
   res.json({ inProgress: scanInProgress, log: scanLog, summary: scanSummary });
+});
+
+// Lightweight progress — for the app-wide background scan indicator (no full log)
+app.get('/api/scan/progress', (req, res) => {
+  res.json({
+    inProgress: scanInProgress,
+    count: scanProgress.count,
+    last: scanProgress.last,
+    summary: scanSummary
+      ? { success: scanSummary.success, modelsFound: scanSummary.modelsFound, modelsAdded: scanSummary.modelsAdded, error: scanSummary.error }
+      : null,
+  });
 });
 
 // Cancel a running scan (terminates the worker thread)

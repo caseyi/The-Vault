@@ -64,7 +64,7 @@ const STATUS_OPTIONS = [
   { value: 'failed', label: 'Failed', dot: '#cf7272' },
 ];
 
-export default function Sidebar({ open, onToggle, stats, creators, tags, filters, onFilterChange, onScanClick, onOrganizeClick, onHomeClick, showHidden, onToggleHidden, appVersion, onRescanCreator, franchises, collections, queueCount, onQueueClick, onWishlistClick, wishlistCount, onCollectionClick, onCollectionsChange, recentlyViewed, onRecentClick, folderTree, onFolderSelect, density, onToggleDensity, theme, onToggleTheme, onTagsChange }) {
+export default function Sidebar({ open, onToggle, stats, creators, tags, filters, onFilterChange, onScanClick, onOrganizeClick, onHomeClick, showHidden, onToggleHidden, appVersion, onRescanCreator, franchises, collections, queueCount, onQueueClick, onWishlistClick, wishlistCount, onCollectionClick, onCollectionsChange, recentlyViewed, onRecentClick, folderTree, onFolderSelect, density, onToggleDensity, theme, onToggleTheme, onTagsChange, scanRunning, scanCount }) {
   const [showTagManager, setShowTagManager] = useState(false);
   const [hintCreator, setHintCreator] = useState(null); // { id, name, render_zip_hint }
   const [showAllTags, setShowAllTags] = useState(false);
@@ -169,7 +169,15 @@ export default function Sidebar({ open, onToggle, stats, creators, tags, filters
           <>
             {/* Always-visible scan/organize actions, pinned just under the header */}
             <div className="sidebar-actions">
-              <button className="scan-btn" onClick={onScanClick} style={{ margin: 0, flex: 1 }}>⟳ SCAN LIBRARY</button>
+              <button className="scan-btn" onClick={onScanClick} style={{ margin: 0, flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6 }}
+                title={scanRunning ? 'Scan running — click to view progress' : 'Scan library'}>
+                {scanRunning ? (
+                  <>
+                    <span style={{ display: 'inline-block', animation: 'spin 0.8s linear infinite' }}>⟳</span>
+                    SCANNING…{scanCount ? ` ${scanCount.toLocaleString()}` : ''}
+                  </>
+                ) : '⟳ SCAN LIBRARY'}
+              </button>
               <button className="scan-btn" onClick={onOrganizeClick} title="Organize Library"
                 style={{ margin: 0, flex: '0 0 auto', background: 'rgba(193,127,58,0.12)', color: 'var(--accent)', padding: '10px 12px' }}>🗂</button>
             </div>
@@ -595,7 +603,8 @@ export default function Sidebar({ open, onToggle, stats, creators, tags, filters
 
         {!open && (
           <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '16px', padding: '16px 0' }}>
-            <button onClick={onScanClick} title="Scan Library" style={{ background: 'none', border: 'none', color: 'var(--accent)', cursor: 'pointer', fontSize: '18px' }}>⟳</button>
+            <button onClick={onScanClick} title={scanRunning ? 'Scan running — click to view' : 'Scan Library'}
+              style={{ background: 'none', border: 'none', color: 'var(--accent)', cursor: 'pointer', fontSize: '18px', animation: scanRunning ? 'spin 0.8s linear infinite' : 'none' }}>⟳</button>
             <button onClick={onOrganizeClick} title="Organize Library" style={{ background: 'none', border: 'none', color: 'var(--accent)', cursor: 'pointer', fontSize: '18px' }}>🗂</button>
             <button onClick={onHomeClick} title="Gallery" style={{ background: 'none', border: 'none', color: 'var(--text-muted)', cursor: 'pointer', fontSize: '16px' }}>⊞</button>
           </div>
