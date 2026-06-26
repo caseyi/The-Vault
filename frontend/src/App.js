@@ -26,6 +26,17 @@ export default function App() {
     try { localStorage.setItem('vault_density', n); } catch {}
     return n;
   });
+  const [theme, setTheme] = useState(() => {
+    try { return localStorage.getItem('vault_theme') || 'dark'; } catch { return 'dark'; }
+  });
+  const toggleTheme = () => setTheme(t => {
+    const n = t === 'light' ? 'dark' : 'light';
+    try { localStorage.setItem('vault_theme', n); } catch {}
+    return n;
+  });
+  useEffect(() => {
+    document.documentElement.classList.toggle('theme-light', theme === 'light');
+  }, [theme]);
   const [showScan, setShowScan] = useState(false);
   const [showOrganize, setShowOrganize] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
@@ -121,6 +132,8 @@ export default function App() {
         onFolderSelect={(p) => { setFilters(f => ({ ...f, folder: p })); setView('gallery'); }}
         density={density}
         onToggleDensity={toggleDensity}
+        theme={theme}
+        onToggleTheme={toggleTheme}
         onTagsChange={() => { fetchStats(); setRefreshKey(k => k + 1); }}
       />
       <main className="main-content">

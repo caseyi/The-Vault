@@ -28,3 +28,7 @@ npm-debug.log*
 # Environment
 .env
 .env.local
+
+# Per-machine library config (may contain SMB credentials)
+docker-compose.override.yml
+.vault-libraries

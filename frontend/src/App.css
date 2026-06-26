@@ -25,6 +25,21 @@
   --font-mono: 'JetBrains Mono', monospace;
 }
 
+/* Light theme — applied by toggling .theme-light on <html>. Overrides the
+   surface/text variables; the accent and status colors stay the same. */
+.theme-light {
+  --bg: #f5f6f8;
+  --bg2: #ffffff;
+  --bg3: #eef0f3;
+  --bg4: #e4e7ec;
+  --border: #d9dce1;
+  --border-bright: #c3c7ce;
+  --text: #1b1c22;
+  --text-muted: #5c5f6b;
+  --text-faint: #9aa0ab;
+  --accent-glow: rgba(193,127,58,0.18);
+}
+
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
 body {

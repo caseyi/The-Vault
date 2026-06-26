@@ -64,7 +64,7 @@ const STATUS_OPTIONS = [
   { value: 'failed', label: 'Failed', dot: '#cf7272' },
 ];
 
-export default function Sidebar({ open, onToggle, stats, creators, tags, filters, onFilterChange, onScanClick, onOrganizeClick, onHomeClick, showHidden, onToggleHidden, appVersion, onRescanCreator, franchises, collections, queueCount, onQueueClick, onWishlistClick, wishlistCount, onCollectionClick, onCollectionsChange, recentlyViewed, onRecentClick, folderTree, onFolderSelect, density, onToggleDensity, onTagsChange }) {
+export default function Sidebar({ open, onToggle, stats, creators, tags, filters, onFilterChange, onScanClick, onOrganizeClick, onHomeClick, showHidden, onToggleHidden, appVersion, onRescanCreator, franchises, collections, queueCount, onQueueClick, onWishlistClick, wishlistCount, onCollectionClick, onCollectionsChange, recentlyViewed, onRecentClick, folderTree, onFolderSelect, density, onToggleDensity, theme, onToggleTheme, onTagsChange }) {
   const [showTagManager, setShowTagManager] = useState(false);
   const [hintCreator, setHintCreator] = useState(null); // { id, name, render_zip_hint }
   const [showAllTags, setShowAllTags] = useState(false);
@@ -198,12 +198,20 @@ export default function Sidebar({ open, onToggle, stats, creators, tags, filters
                 ☆ Wishlist
                 <span style={{ marginLeft: 'auto', fontFamily: 'var(--font-mono)', fontSize: 10 }}>{wishlistCount > 0 ? wishlistCount : ''}</span>
               </button>
-              <button
-                onClick={onToggleDensity}
-                title="Toggle compact / comfortable spacing"
-                style={{ marginTop: 4, width: '100%', background: 'var(--bg3)', border: '1px solid var(--border)', borderRadius: 4, color: 'var(--text-muted)', padding: '5px 10px', cursor: 'pointer', fontSize: 12, fontFamily: 'var(--font-body)', display: 'flex', alignItems: 'center', gap: 6 }}>
-                {density === 'compact' ? '▦ Comfortable view' : '▤ Compact view'}
-              </button>
+              <div style={{ display: 'flex', gap: 4, marginTop: 4 }}>
+                <button
+                  onClick={onToggleDensity}
+                  title="Toggle compact / comfortable spacing"
+                  style={{ flex: 1, background: 'var(--bg3)', border: '1px solid var(--border)', borderRadius: 4, color: 'var(--text-muted)', padding: '5px 8px', cursor: 'pointer', fontSize: 11, fontFamily: 'var(--font-body)', display: 'flex', alignItems: 'center', gap: 5, justifyContent: 'center' }}>
+                  {density === 'compact' ? '▦ Comfortable' : '▤ Compact'}
+                </button>
+                <button
+                  onClick={onToggleTheme}
+                  title={theme === 'light' ? 'Switch to dark mode' : 'Switch to light mode'}
+                  style={{ flex: 1, background: 'var(--bg3)', border: '1px solid var(--border)', borderRadius: 4, color: 'var(--text-muted)', padding: '5px 8px', cursor: 'pointer', fontSize: 11, fontFamily: 'var(--font-body)', display: 'flex', alignItems: 'center', gap: 5, justifyContent: 'center' }}>
+                  {theme === 'light' ? '🌙 Dark' : '☀ Light'}
+                </button>
+              </div>
             </div>
 
             <div className="sidebar-section">
