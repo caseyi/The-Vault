@@ -1531,7 +1531,7 @@ app.get('/api/files/:fileId/stl', (req, res) => {
 
 app.get('/api/queue', (req, res) => {
   const rows = db.prepare(`
-    SELECT pq.model_id, pq.position, pq.added_at,
+    SELECT pq.model_id, pq.position, pq.added_at, pq.note,
            m.name, m.thumbnail_path, m.print_status, m.franchise,
            c.name AS creator_name
     FROM print_queue pq
@@ -1559,6 +1559,15 @@ app.post('/api/queue', (req, res) => {
 
 app.delete('/api/queue/:modelId', (req, res) => {
   db.prepare('DELETE FROM print_queue WHERE model_id = ?').run(req.params.modelId);
+  res.json({ success: true });
+});
+
+// Update a queue entry's note
+app.patch('/api/queue/:modelId', (req, res) => {
+  const { note } = req.body;
+  const row = db.prepare('SELECT model_id FROM print_queue WHERE model_id = ?').get(req.params.modelId);
+  if (!row) return res.status(404).json({ error: 'Not in queue' });
+  db.prepare('UPDATE print_queue SET note = ? WHERE model_id = ?').run(note || null, req.params.modelId);
   res.json({ success: true });
 });
 
@@ -1616,11 +1625,15 @@ app.get('/api/models/:id/tag-suggestions', (req, res) => {
 
 app.get('/api/collections', (req, res) => {
   const cols = db.prepare(`
-    SELECT c.id, c.name, c.color, c.created_at,
-           COUNT(cm.id) AS model_count
+    SELECT c.id, c.name, c.color, c.created_at, c.pinned,
+           COUNT(cm.id) AS model_count,
+           (SELECT m.thumbnail_path FROM collection_models cm2
+              JOIN models m ON m.id = cm2.model_id
+              WHERE cm2.collection_id = c.id AND m.thumbnail_path IS NOT NULL
+              ORDER BY cm2.sort_order, cm2.id LIMIT 1) AS cover
     FROM collections c
     LEFT JOIN collection_models cm ON cm.collection_id = c.id
-    GROUP BY c.id ORDER BY c.name ASC
+    GROUP BY c.id ORDER BY c.pinned DESC, c.name ASC
   `).all();
   res.json(cols);
 });
@@ -1638,8 +1651,10 @@ app.patch('/api/collections/:id', (req, res) => {
   const { name, color } = req.body;
   const col = db.prepare('SELECT id FROM collections WHERE id = ?').get(req.params.id);
   if (!col) return res.status(404).json({ error: 'Not found' });
+  const { pinned } = req.body;
   if (name) db.prepare('UPDATE collections SET name = ? WHERE id = ?').run(name.trim(), req.params.id);
   if (color) db.prepare('UPDATE collections SET color = ? WHERE id = ?').run(color, req.params.id);
+  if (pinned !== undefined) db.prepare('UPDATE collections SET pinned = ? WHERE id = ?').run(pinned ? 1 : 0, req.params.id);
   res.json({ success: true });
 });
 

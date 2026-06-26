@@ -114,6 +114,7 @@ try { db.exec(`
   )
 `); } catch {}
 try { db.exec(`CREATE INDEX IF NOT EXISTS idx_queue_position ON print_queue(position)`); } catch {}
+try { db.exec(`ALTER TABLE print_queue ADD COLUMN note TEXT`); } catch {}
 
 // Collections
 try { db.exec(`
@@ -134,6 +135,7 @@ try { db.exec(`
     UNIQUE(collection_id, model_id)
   )
 `); } catch {}
+try { db.exec(`ALTER TABLE collections ADD COLUMN pinned INTEGER DEFAULT 0`); } catch {}
 try { db.exec(`CREATE INDEX IF NOT EXISTS idx_coll_models_coll ON collection_models(collection_id)`); } catch {}
 try { db.exec(`CREATE INDEX IF NOT EXISTS idx_coll_models_model ON collection_models(model_id)`); } catch {}
 

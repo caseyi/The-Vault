@@ -69,6 +69,8 @@ export default function Sidebar({ open, onToggle, stats, creators, tags, filters
   const [rescanningId, setRescanningId] = useState(null);
   const [newCollectionName, setNewCollectionName] = useState('');
   const [showNewCollection, setShowNewCollection] = useState(false);
+  const [editingCollectionId, setEditingCollectionId] = useState(null);
+  const [editCollectionName, setEditCollectionName] = useState('');
 
   // Remembered collapse state for the big sections
   const [foldersOpen, toggleFolders] = useCollapsed('folders');
@@ -92,6 +94,37 @@ export default function Sidebar({ open, onToggle, stats, creators, tags, filters
     await fetch(`/api/collections/${id}`, { method: 'DELETE' });
     if (onCollectionsChange) onCollectionsChange();
     if (filters.collection === String(id)) onFilterChange({ ...filters, collection: '' });
+  };
+
+  const COLLECTION_COLORS = ['#5b9bd5', '#4caf7d', '#c17f3a', '#a78bd4', '#cf7272', '#d4aa4c'];
+
+  const handleTogglePin = async (e, c) => {
+    e.stopPropagation();
+    await fetch(`/api/collections/${c.id}`, {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pinned: !c.pinned }),
+    });
+    if (onCollectionsChange) onCollectionsChange();
+  };
+
+  const startEditCollection = (e, c) => {
+    e.stopPropagation();
+    setEditingCollectionId(c.id);
+    setEditCollectionName(c.name);
+  };
+
+  const saveEditCollection = async (c, color) => {
+    const body = {};
+    if (editCollectionName.trim() && editCollectionName.trim() !== c.name) body.name = editCollectionName.trim();
+    if (color) body.color = color;
+    if (Object.keys(body).length) {
+      await fetch(`/api/collections/${c.id}`, {
+        method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      if (onCollectionsChange) onCollectionsChange();
+    }
+    setEditingCollectionId(null);
   };
 
   const handleRescanCreator = async (e, creator) => {
@@ -292,18 +325,46 @@ export default function Sidebar({ open, onToggle, stats, creators, tags, filters
                 </div>
               )}
               {collections && collections.length > 0 ? (
-                <div className="creator-list" style={{ maxHeight: 180, overflowY: 'auto' }}>
+                <div className="creator-list" style={{ maxHeight: 220, overflowY: 'auto' }}>
                   {collections.map(c => (
+                    editingCollectionId === c.id ? (
+                      <div key={c.id} style={{ padding: '6px 8px', background: 'var(--bg3)', borderRadius: 4, margin: '2px 0' }}>
+                        <input value={editCollectionName} autoFocus
+                          onChange={e => setEditCollectionName(e.target.value)}
+                          onKeyDown={e => { if (e.key === 'Enter') saveEditCollection(c); if (e.key === 'Escape') setEditingCollectionId(null); }}
+                          style={{ width: '100%', boxSizing: 'border-box', background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 4, color: 'var(--text)', padding: '4px 7px', fontSize: 11, outline: 'none', fontFamily: 'var(--font-body)' }} />
+                        <div style={{ display: 'flex', gap: 5, marginTop: 6, alignItems: 'center' }}>
+                          {COLLECTION_COLORS.map(col => (
+                            <span key={col} onClick={() => saveEditCollection(c, col)} title="Set color"
+                              style={{ width: 15, height: 15, borderRadius: '50%', background: col, cursor: 'pointer', border: c.color === col ? '2px solid var(--text)' : '2px solid transparent' }} />
+                          ))}
+                          <button onClick={() => saveEditCollection(c)}
+                            style={{ marginLeft: 'auto', background: 'var(--accent)', border: 'none', borderRadius: 4, color: '#0d0d0f', padding: '3px 8px', cursor: 'pointer', fontSize: 10, fontFamily: 'var(--font-display)' }}>SAVE</button>
+                        </div>
+                      </div>
+                    ) : (
                     <button key={c.id}
                       className={`creator-btn ${filters.collection === String(c.id) ? 'active' : ''}`}
                       onClick={() => { onFilterChange({ ...filters, collection: filters.collection === String(c.id) ? '' : String(c.id) }); }}>
-                      <span style={{ width: 8, height: 8, borderRadius: '50%', background: c.color, flexShrink: 0 }} />
+                      {c.cover ? (
+                        <img src={`/images/${c.cover.split('/images/').pop()}`} alt=""
+                          style={{ width: 18, height: 18, borderRadius: 3, objectFit: 'cover', flexShrink: 0, border: `1px solid ${c.color}` }} />
+                      ) : (
+                        <span style={{ width: 8, height: 8, borderRadius: '50%', background: c.color, flexShrink: 0 }} />
+                      )}
                       <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', flex: 1 }}>{c.name}</span>
                       <span className="count">{c.model_count}</span>
+                      <span onClick={e => handleTogglePin(e, c)}
+                        style={{ color: c.pinned ? 'var(--accent)' : 'var(--text-faint)', fontSize: 10, padding: '0 2px', opacity: c.pinned ? 1 : 0.6 }}
+                        title={c.pinned ? 'Unpin' : 'Pin to top'}>📌</span>
+                      <span onClick={e => startEditCollection(e, c)}
+                        style={{ color: 'var(--text-faint)', fontSize: 10, padding: '0 2px', opacity: 0.6 }}
+                        title="Rename / recolor">✎</span>
                       <span onClick={e => handleDeleteCollection(e, c.id)}
                         style={{ color: 'var(--text-faint)', fontSize: 10, padding: '0 2px', opacity: 0.6 }}
                         title="Delete collection">✕</span>
                     </button>
+                    )
                   ))}
                 </div>
               ) : (
