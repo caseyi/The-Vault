@@ -64,7 +64,7 @@ const STATUS_OPTIONS = [
   { value: 'failed', label: 'Failed', dot: '#cf7272' },
 ];
 
-export default function Sidebar({ open, onToggle, stats, creators, tags, filters, onFilterChange, onScanClick, onOrganizeClick, onHomeClick, showHidden, onToggleHidden, appVersion, onRescanCreator, franchises, collections, queueCount, onQueueClick, onWishlistClick, wishlistCount, onCollectionClick, onCollectionsChange, recentlyViewed, onRecentClick, folderTree, onFolderSelect, density, onToggleDensity, theme, onToggleTheme, onTagsChange, scanRunning, scanCount }) {
+export default function Sidebar({ open, onToggle, stats, creators, tags, filters, onFilterChange, onScanClick, onOrganizeClick, onHomeClick, showHidden, onToggleHidden, appVersion, onRescanCreator, franchises, collections, queueCount, onQueueClick, onWishlistClick, wishlistCount, onCollectionClick, onCollectionsChange, recentlyViewed, onRecentClick, folderTree, onFolderSelect, density, onToggleDensity, theme, onToggleTheme, onTagsChange, scanRunning, scanCount, scanLast }) {
   const [showTagManager, setShowTagManager] = useState(false);
   const [hintCreator, setHintCreator] = useState(null); // { id, name, render_zip_hint }
   const [showAllTags, setShowAllTags] = useState(false);
@@ -181,6 +181,12 @@ export default function Sidebar({ open, onToggle, stats, creators, tags, filters
               <button className="scan-btn" onClick={onOrganizeClick} title="Organize Library"
                 style={{ margin: 0, flex: '0 0 auto', background: 'rgba(193,127,58,0.12)', color: 'var(--accent)', padding: '10px 12px' }}>🗂</button>
             </div>
+            {scanRunning && scanLast && (
+              <div title={scanLast}
+                style={{ padding: '4px 14px 0', fontSize: 10, fontFamily: 'var(--font-mono)', color: 'var(--text-faint)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                {scanLast.trim()}
+              </div>
+            )}
 
             <div className="sidebar-scroll">
             <div className="sidebar-section">

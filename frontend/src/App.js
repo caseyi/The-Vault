@@ -168,6 +168,7 @@ export default function App() {
         onTagsChange={() => { fetchStats(); setRefreshKey(k => k + 1); }}
         scanRunning={scanStatus.inProgress}
         scanCount={scanStatus.count}
+        scanLast={scanStatus.last}
       />
       <main className="main-content">
         {view === 'gallery' && (
