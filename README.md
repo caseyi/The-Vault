@@ -1,8 +1,11 @@
+
 # The Vault 🗃️
 
 Self-hosted 3D print library manager for your NAS. Indexes STL/ZIP/slicer files,
 extracts render images, tracks print status, and lets you ask Claude AI to help
 organise your collection.
+
+<img width="1647" height="1114" alt="Screenshot 2026-06-26 at 12 35 21 PM" src="https://github.com/user-attachments/assets/35daf5fc-b167-426b-9724-e1458a8fbbeb" />
 
 - 🖼️ Auto-extracts preview images from render ZIPs
 - 🗂️ Browse by folder tree, creator, franchise, tags, or collections
