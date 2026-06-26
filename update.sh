@@ -35,16 +35,16 @@ if [ "$1" = "rollback" ]; then
   echo ""
 
   # Check if rollback tags exist
-  if ! docker image inspect ghcr.io/caseyi/the-vault-backend:rollback >/dev/null 2>&1 || \
-     ! docker image inspect ghcr.io/caseyi/the-vault-frontend:rollback >/dev/null 2>&1; then
+  if ! docker image inspect ghcr.io/caseyi/stlvault-backend:rollback >/dev/null 2>&1 || \
+     ! docker image inspect ghcr.io/caseyi/stlvault-frontend:rollback >/dev/null 2>&1; then
     echo "✗ No rollback images found. You need to run a normal update first"
     echo "  (rollback images are saved automatically before each update)."
     exit 1
   fi
 
   echo "▸ Restoring previous images..."
-  docker tag ghcr.io/caseyi/the-vault-backend:rollback  ghcr.io/caseyi/the-vault-backend:latest
-  docker tag ghcr.io/caseyi/the-vault-frontend:rollback ghcr.io/caseyi/the-vault-frontend:latest
+  docker tag ghcr.io/caseyi/stlvault-backend:rollback  ghcr.io/caseyi/stlvault-backend:latest
+  docker tag ghcr.io/caseyi/stlvault-frontend:rollback ghcr.io/caseyi/stlvault-frontend:latest
 
   echo ""
   echo "▸ Restarting containers with previous version..."
@@ -66,12 +66,12 @@ echo ""
 
 # Save current images as rollback (if they exist)
 echo "▸ Saving current images as rollback point..."
-if docker tag ghcr.io/caseyi/the-vault-backend:latest ghcr.io/caseyi/the-vault-backend:rollback 2>/dev/null; then
+if docker tag ghcr.io/caseyi/stlvault-backend:latest ghcr.io/caseyi/stlvault-backend:rollback 2>/dev/null; then
   echo "  ✓ backend saved"
 else
   echo "  · backend (no previous image)"
 fi
-if docker tag ghcr.io/caseyi/the-vault-frontend:latest ghcr.io/caseyi/the-vault-frontend:rollback 2>/dev/null; then
+if docker tag ghcr.io/caseyi/stlvault-frontend:latest ghcr.io/caseyi/stlvault-frontend:rollback 2>/dev/null; then
   echo "  ✓ frontend saved"
 else
   echo "  · frontend (no previous image)"

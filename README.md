@@ -365,10 +365,10 @@ To build images locally instead of pulling from GHCR, edit `docker-compose.yml`:
 ```yaml
 services:
   backend:
-    # image: ghcr.io/caseyi/the-vault-backend:latest  ← comment this out
+    # image: ghcr.io/caseyi/stlvault-backend:latest  ← comment this out
     build: ./backend                                   ← uncomment this
   frontend:
-    # image: ghcr.io/caseyi/the-vault-frontend:latest ← comment this out
+    # image: ghcr.io/caseyi/stlvault-frontend:latest ← comment this out
     build: ./frontend                                  ← uncomment this
 ```
 
@@ -391,8 +391,8 @@ cd frontend && npm install && CI=true npm test
 Pushing to `main` (or pushing a `v*` tag) triggers the GitHub Actions workflow
 at `.github/workflows/docker-publish.yml`, which:
 
-1. Builds `the-vault-backend` and `the-vault-frontend` Docker images
-2. Pushes them to `ghcr.io/caseyi/the-vault-{backend,frontend}:latest`
+1. Builds `stlvault-backend` and `stlvault-frontend` Docker images
+2. Pushes them to `ghcr.io/caseyi/stlvault-{backend,frontend}:latest`
 3. Also tags each image with `sha-<commit>` for rollback
 
 The images are public and require no authentication to pull.

@@ -481,7 +481,7 @@ location / {
 
 ### CI/CD Pipeline
 
-GitHub Actions builds and pushes multi-arch Docker images to `ghcr.io/caseyi/the-vault-{backend,frontend}:latest` on push to main.
+GitHub Actions builds and pushes multi-arch Docker images to `ghcr.io/caseyi/stlvault-{backend,frontend}:latest` on push to main.
 
 ### Update Script (`update.sh`)
 
