@@ -416,8 +416,6 @@ saved you some headaches organising your print library, you can chip in:
 
 - **GitHub Sponsors** — use the **Sponsor ❤** button at the top of the repo
   (one-time or recurring, no fees).
-- **Ko-fi / Buy Me a Coffee** — quick one-off tip *(add your link in
-  `.github/FUNDING.yml` to make these appear).*
 
 Either way, ⭐ starring the repo and filing good bug reports helps just as much.
 Thank you! 🙏
