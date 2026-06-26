@@ -387,7 +387,13 @@ export default function ScanModal({ onClose, onScanComplete }) {
           )}
         </div>
         <div className="modal-hint" style={{ marginTop: 2 }}>
-          Required for Generate Tags and Find Online. Stored in browser only.
+          Required for the AI actions below (marked <b style={{ color: 'var(--accent)' }}>$</b> — they use your Claude API credits). Stored in your browser only.
+          {!apiKey && (
+            <> Need a key?{' '}
+              <a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noreferrer"
+                style={{ color: 'var(--accent)' }}>Create one at console.anthropic.com</a>.
+            </>
+          )}
         </div>
 
         {/* AI model + cost estimate */}
@@ -449,39 +455,39 @@ export default function ScanModal({ onClose, onScanComplete }) {
           <button
             className="btn-primary"
             onClick={generateTags}
-            disabled={running || tagging || findingImages || visionTagging}
-            style={{ background: tagging ? 'var(--bg-card)' : 'rgba(155,114,207,0.15)', color: '#9b72cf', border: '1px solid rgba(155,114,207,0.3)' }}
-            title="Use Claude AI to auto-generate tags for all models based on names, creators, and folder structure"
+            disabled={running || tagging || findingImages || visionTagging || !apiKey}
+            style={{ background: tagging ? 'var(--bg-card)' : 'rgba(155,114,207,0.15)', color: '#9b72cf', border: '1px solid rgba(155,114,207,0.3)', opacity: !apiKey ? 0.5 : 1 }}
+            title={apiKey ? 'Uses Claude API credits — auto-generate tags for all models from names, creators, and folder structure' : 'Add a Claude API key above to enable'}
           >
-            {tagging ? 'Tagging…' : 'Generate Tags'}
+            {tagging ? 'Tagging…' : '$ Generate Tags'}
           </button>
           <button
             className="btn-primary"
             onClick={() => visionTags(true)}
-            disabled={running || tagging || findingImages || visionTagging}
-            style={{ background: visionTagging ? 'var(--bg-card)' : 'rgba(155,114,207,0.15)', color: '#9b72cf', border: '1px solid rgba(155,114,207,0.3)' }}
-            title="Use Claude vision on each model's render image to identify it and generate accurate tags (trial: 10 models)"
+            disabled={running || tagging || findingImages || visionTagging || !apiKey}
+            style={{ background: visionTagging ? 'var(--bg-card)' : 'rgba(155,114,207,0.15)', color: '#9b72cf', border: '1px solid rgba(155,114,207,0.3)', opacity: !apiKey ? 0.5 : 1 }}
+            title={apiKey ? 'Uses Claude API credits (vision — costs more) — analyses each render image to identify and tag the model' : 'Add a Claude API key above to enable'}
           >
-            {visionTagging ? 'Looking…' : '👁 Tags from Images (trial 10)'}
+            {visionTagging ? 'Looking…' : '$ 👁 Tags from Images (trial 10)'}
           </button>
           <button
             className="btn-primary"
             onClick={() => findImages(true)}
-            disabled={running || tagging || findingImages || visionTagging}
-            style={{ background: findingImages ? 'var(--bg-card)' : 'rgba(91,155,213,0.15)', color: '#5b9bd5', border: '1px solid rgba(91,155,213,0.3)' }}
-            title="Trial run: process 10 best candidates first, then decide whether to continue"
+            disabled={running || tagging || findingImages || visionTagging || !apiKey}
+            style={{ background: findingImages ? 'var(--bg-card)' : 'rgba(91,155,213,0.15)', color: '#5b9bd5', border: '1px solid rgba(91,155,213,0.3)', opacity: !apiKey ? 0.5 : 1 }}
+            title={apiKey ? 'Uses Claude API credits — finds missing thumbnails online (trial: 10 best candidates first)' : 'Add a Claude API key above to enable'}
           >
-            {findingImages ? 'Finding…' : 'Find Images (trial 10)'}
+            {findingImages ? 'Finding…' : '$ Find Images (trial 10)'}
           </button>
           {imgResult && imgResult.remaining > 0 && (
             <button
               className="btn-primary"
               onClick={() => findImages(false)}
-              disabled={running || tagging || findingImages || visionTagging}
-              style={{ background: 'rgba(91,155,213,0.25)', color: '#5b9bd5', border: '1px solid rgba(91,155,213,0.4)' }}
-              title={`Process all ${imgResult.remaining} remaining eligible models`}
+              disabled={running || tagging || findingImages || visionTagging || !apiKey}
+              style={{ background: 'rgba(91,155,213,0.25)', color: '#5b9bd5', border: '1px solid rgba(91,155,213,0.4)', opacity: !apiKey ? 0.5 : 1 }}
+              title={apiKey ? `Uses Claude API credits — process all ${imgResult.remaining} remaining models` : 'Add a Claude API key above to enable'}
             >
-              Continue All ({imgResult.remaining})
+              $ Continue All ({imgResult.remaining})
             </button>
           )}
           {done && (

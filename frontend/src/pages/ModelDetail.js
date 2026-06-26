@@ -179,6 +179,20 @@ export default function ModelDetail({ modelId, onBack, onSaved, onQueueChange, c
   const [sourceUrl, setSourceUrl] = useState('');
   const [activeImg, setActiveImg] = useState(0);
   const [printMode, setPrintMode] = useState(false);
+  const [zoomOpen, setZoomOpen] = useState(false);
+
+  // Keyboard nav for the fullscreen image lightbox
+  useEffect(() => {
+    if (!zoomOpen) return;
+    const onKey = (e) => {
+      const imgs = (model?.images) || [];
+      if (e.key === 'Escape') setZoomOpen(false);
+      else if (e.key === 'ArrowRight') setActiveImg(i => (i + 1) % Math.max(imgs.length, 1));
+      else if (e.key === 'ArrowLeft') setActiveImg(i => (i - 1 + imgs.length) % Math.max(imgs.length, 1));
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [zoomOpen, model]);
 
   const handleApiKeyChange = (key) => {
     setApiKey(key);
@@ -399,7 +413,27 @@ export default function ModelDetail({ modelId, onBack, onSaved, onQueueChange, c
               <div className="detail-images" style={{ marginBottom: 16 }}>
                 {images.length > 0 ? (
                   <>
-                    <img className="detail-main-img" src={images[activeImg]} alt={model.name} />
+                    <img className="detail-main-img" src={images[activeImg]} alt={model.name}
+                      style={{ cursor: 'zoom-in' }} onClick={() => setZoomOpen(true)}
+                      title="Click to view full size" />
+                    {zoomOpen && (
+                      <div onClick={() => setZoomOpen(false)}
+                        style={{ position: 'fixed', inset: 0, zIndex: 1000, background: 'rgba(8,8,10,0.92)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                        <img src={images[activeImg]} alt={model.name} onClick={e => e.stopPropagation()}
+                          style={{ maxWidth: '95vw', maxHeight: '92vh', objectFit: 'contain', boxShadow: '0 8px 40px rgba(0,0,0,0.6)' }} />
+                        <button onClick={() => setZoomOpen(false)} title="Close (Esc)"
+                          style={{ position: 'absolute', top: 16, right: 20, background: 'rgba(0,0,0,0.5)', border: '1px solid #ffffff33', color: '#fff', borderRadius: 6, fontSize: 18, padding: '4px 12px', cursor: 'pointer' }}>✕</button>
+                        {images.length > 1 && (
+                          <>
+                            <button onClick={e => { e.stopPropagation(); setActiveImg(i => (i - 1 + images.length) % images.length); }} title="Previous (←)"
+                              style={{ position: 'absolute', left: 16, top: '50%', transform: 'translateY(-50%)', background: 'rgba(0,0,0,0.5)', border: '1px solid #ffffff33', color: '#fff', borderRadius: '50%', width: 44, height: 44, fontSize: 22, cursor: 'pointer' }}>‹</button>
+                            <button onClick={e => { e.stopPropagation(); setActiveImg(i => (i + 1) % images.length); }} title="Next (→)"
+                              style={{ position: 'absolute', right: 16, top: '50%', transform: 'translateY(-50%)', background: 'rgba(0,0,0,0.5)', border: '1px solid #ffffff33', color: '#fff', borderRadius: '50%', width: 44, height: 44, fontSize: 22, cursor: 'pointer' }}>›</button>
+                            <div style={{ position: 'absolute', bottom: 18, left: '50%', transform: 'translateX(-50%)', background: 'rgba(0,0,0,0.5)', color: '#fff', borderRadius: 12, padding: '3px 12px', fontFamily: 'var(--font-mono)', fontSize: 12 }}>{activeImg + 1} / {images.length}</div>
+                          </>
+                        )}
+                      </div>
+                    )}
                     {images.length > 1 && (
                       <div className="detail-thumbs">
                         {images.map((img, i) => (
