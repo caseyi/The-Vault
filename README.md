@@ -316,6 +316,8 @@ donation is appreciated but never required (see below).
 The Vault is built and maintained in spare time and given away for free. If it
 saved you some headaches organising your print library, you can chip in:
 
+> **If you like The Vault, please feel free to donate with the Sponsors button — and if you have suggestions or hit a bug, [open a GitHub issue](https://github.com/caseyi/stlvault/issues) on this repo!**
+
 - **GitHub Sponsors** — use the **Sponsor ❤** button at the top of the repo
   (one-time or recurring, no fees).
 - **Ko-fi / Buy Me a Coffee** — quick one-off tip *(add your link in
