@@ -278,7 +278,7 @@ export default function ScanModal({ onClose, onScanComplete }) {
   }
 
   return (
-    <div className="modal-overlay" onClick={e => { if (e.target === e.currentTarget && !running) onClose(); }}>
+    <div className="modal-overlay" onClick={e => { if (e.target === e.currentTarget && !tagging && !findingImages && !visionTagging) onClose(); }}>
       <div className="modal" style={{ width: 580 }}>
         <div className="modal-title">SCAN LIBRARY</div>
         <div className="modal-subtitle">Index your NAS folder to discover models and extract images</div>
@@ -439,8 +439,9 @@ export default function ScanModal({ onClose, onScanComplete }) {
         )}
 
         <div className="modal-actions" style={{ marginTop: 16, flexWrap: 'wrap' }}>
-          <button className="btn-cancel" onClick={onClose} disabled={running || tagging || findingImages || visionTagging}>
-            {done ? 'Close' : 'Cancel'}
+          <button className="btn-cancel" onClick={onClose} disabled={tagging || findingImages || visionTagging}
+            title={running ? 'Hide this window — the scan keeps running in the background' : undefined}>
+            {running ? '▸ Minimize (keep scanning)' : done ? 'Close' : 'Cancel'}
           </button>
           {running && (
             <button className="btn-cancel" onClick={cancelScan}
