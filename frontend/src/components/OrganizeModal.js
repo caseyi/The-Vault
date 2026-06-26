@@ -1176,7 +1176,6 @@ function LooseTab() {
   const [editName, setEditName] = useState('');
   const [expanded, setExpanded] = useState(new Set());
   const [scriptResult, setScriptResult] = useState(null); // { script, summary, errors }
-  const [executing, setExecuting] = useState(false);
   const [copied, setCopied] = useState(false);
   const [error, setError] = useState('');
 
@@ -1228,7 +1227,7 @@ function LooseTab() {
 
   const generateScript = async (dryRun = true) => {
     setError(''); setScriptResult(null);
-    if (dryRun) setScanning(true); else setExecuting(true);
+    setScanning(true);
     try {
       const res = await fetch('/api/organize/group-files', {
         method: 'POST',
@@ -1239,7 +1238,7 @@ function LooseTab() {
       if (!res.ok) { setError(d.error || `Error ${res.status}`); }
       else { setScriptResult(d); }
     } catch (e) { setError(e.message); }
-    if (dryRun) setScanning(false); else setExecuting(false);
+    setScanning(false);
   };
 
   const copyScript = () => {
@@ -1351,14 +1350,15 @@ function LooseTab() {
           </div>
 
           {groups.length > 0 && !scriptResult && (
-            <div style={{ display: 'flex', gap: 8, marginTop: 16 }}>
+            <div style={{ marginTop: 16 }}>
               <button className="org-btn org-btn-primary" onClick={() => generateScript(true)} disabled={scanning}>
-                📋 Generate Script
+                📋 Generate Move Script
               </button>
-              <button className="org-btn" onClick={() => generateScript(false)} disabled={executing} style={{ opacity: 0.7 }}
-                title="Requires the library to be mounted read-write in docker-compose.yml">
-                {executing ? '⏳ Moving…' : '⚡ Try Direct Move'}
-              </button>
+              <div className="org-hint" style={{ marginTop: 6 }}>
+                The library is mounted read-only, so The Vault can't move files itself.
+                This generates a safe bash script — review it, run it over SSH on your NAS,
+                then rescan.
+              </div>
             </div>
           )}
         </>
@@ -1400,13 +1400,32 @@ function LooseTab() {
   );
 }
 
+// Advanced — less-used tools grouped under one tab with secondary sub-tabs,
+// so the top level stays uncluttered.
+function AdvancedTab() {
+  const [sub, setSub] = useState('batch');
+  const subTabs = [
+    { id: 'batch',  label: 'Bulk & Merge',       icon: '⚡' },
+    { id: 'gaps',   label: 'Gap Analysis',       icon: '🔍' },
+    { id: 'unpack', label: 'Unpack Loose Files', icon: '📦' },
+  ];
+  return (
+    <div>
+      <div style={{ padding: '8px 16px 0' }}>
+        <TabBar tabs={subTabs} active={sub} onChange={setSub} />
+      </div>
+      {sub === 'batch'  && <BatchTab />}
+      {sub === 'gaps'   && <GapTab />}
+      {sub === 'unpack' && <LooseTab />}
+    </div>
+  );
+}
+
 const TABS = [
   { id: 'annotate',  label: 'Annotate',  icon: '✦' },
   { id: 'health',    label: 'Health',    icon: '⚕' },
   { id: 'franchise', label: 'Franchise', icon: '🗂' },
-  { id: 'batch',     label: 'Batch',     icon: '⚡' },
-  { id: 'gaps',      label: 'Gaps',      icon: '🔍' },
-  { id: 'unpack',    label: 'Unpack',    icon: '📦' },
+  { id: 'advanced',  label: 'Advanced',  icon: '⚙' },
 ];
 
 export default function OrganizeModal({ onClose }) {
@@ -1424,7 +1443,7 @@ export default function OrganizeModal({ onClose }) {
       <div className="org-header">
         <div>
           <div className="org-title">🗂 ORGANIZE LIBRARY</div>
-          <div className="org-subtitle">AI annotation · Health · Franchise · Batch · Gap analysis · Unpack</div>
+          <div className="org-subtitle">Annotate with AI · Health & fixes · Franchises · Advanced tools</div>
         </div>
         <button className="org-close" onClick={onClose}>✕</button>
       </div>
@@ -1434,9 +1453,7 @@ export default function OrganizeModal({ onClose }) {
       {tab === 'annotate'  && <AnnotateTab target={annotateTarget} onClearTarget={() => setAnnotateTarget(null)} />}
       {tab === 'health'    && <HealthTab onAnnotateThese={handleAnnotateThese} />}
       {tab === 'franchise' && <FranchiseTab onAnnotateThese={handleAnnotateThese} />}
-      {tab === 'batch'     && <BatchTab />}
-      {tab === 'gaps'      && <GapTab />}
-      {tab === 'unpack'    && <LooseTab />}
+      {tab === 'advanced'  && <AdvancedTab />}
     </ModalOverlay>
   );
 }

@@ -499,23 +499,38 @@ router.post('/annotate/apply', (req, res) => {
 router.get('/health', (req, res) => {
   const models = db.prepare(`
     SELECT m.id, m.name, m.folder_path, m.file_count, m.thumbnail_path,
-           m.source_url, m.tags, m.franchise, c.name AS creator_name
+           m.source_url, m.tags, m.franchise, m.creator_id, c.name AS creator_name
     FROM models m
     LEFT JOIN creators c ON m.creator_id = c.id
     WHERE (m.hidden IS NULL OR m.hidden = 0)
     ORDER BY m.name
   `).all();
 
-  // Duplicates: O(n²) is fine for typical library sizes
+  // Similar-name duplicates. Full O(n²) Levenshtein blocks the event loop on
+  // large libraries, so bucket models by a cheap normalized-name prefix and only
+  // compare within a bucket (near-duplicates almost always share a prefix).
+  const simBuckets = new Map();
+  for (const m of models) {
+    const key = normName(m.name).slice(0, 6);
+    if (!key) continue;
+    if (!simBuckets.has(key)) simBuckets.set(key, []);
+    simBuckets.get(key).push(m);
+  }
   const duplicates = [];
-  for (let i = 0; i < models.length; i++) {
-    for (let j = i + 1; j < models.length; j++) {
-      const score = similarity(models[i].name, models[j].name);
-      if (score >= 0.85) {
-        duplicates.push({ score: Math.round(score * 100) / 100, a: models[i], b: models[j] });
+  let comparisons = 0;
+  const MAX_COMPARISONS = 1_500_000; // hard safety cap
+  for (const group of simBuckets.values()) {
+    for (let i = 0; i < group.length && comparisons < MAX_COMPARISONS; i++) {
+      for (let j = i + 1; j < group.length && comparisons < MAX_COMPARISONS; j++) {
+        comparisons++;
+        const score = similarity(group[i].name, group[j].name);
+        if (score >= 0.85) {
+          duplicates.push({ score: Math.round(score * 100) / 100, a: group[i], b: group[j] });
+        }
       }
     }
   }
+  duplicates.sort((a, b) => b.score - a.score);
 
   const emptyFolders  = models.filter(m => !m.file_count || m.file_count === 0);
   const noThumbnail   = models.filter(m => !m.thumbnail_path);
