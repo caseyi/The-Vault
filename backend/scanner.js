@@ -412,15 +412,26 @@ function isPassthrough(name, info, depth) {
  * Resolve the real creator folders under basePath, descending through
  * pass-through containers (mount roots, download dumps, single-child wrappers).
  */
-function resolveCreatorDirs(basePath, depth = 0, log = () => {}) {
+function resolveCreatorDirs(basePath, depth = 0, log = () => {}, overrides = new Map()) {
   const info = dirInfo(basePath);
   const results = [];
   for (const dir of info.childDirs) {
     const dirPath = path.join(basePath, dir.name);
+
+    // Manual overrides win over the heuristic
+    const ov = overrides.get(dirPath);
+    if (ov === 'ignore') { log('info', `Skipping "${dir.name}" (manual override: ignore)`); continue; }
+    if (ov === 'creator') { results.push({ name: dir.name, path: dirPath }); continue; }
+    if (ov === 'passthrough' && depth < MAX_PASSTHROUGH_DEPTH) {
+      log('info', `"${dir.name}" → descending (manual override: container)`);
+      results.push(...resolveCreatorDirs(dirPath, depth + 1, log, overrides));
+      continue;
+    }
+
     const childInfo = dirInfo(dirPath);
     if (depth < MAX_PASSTHROUGH_DEPTH && isPassthrough(dir.name, childInfo, depth)) {
       log('info', `"${dir.name}" looks like a container — descending to find creators inside it`);
-      results.push(...resolveCreatorDirs(dirPath, depth + 1, log));
+      results.push(...resolveCreatorDirs(dirPath, depth + 1, log, overrides));
     } else {
       results.push({ name: dir.name, path: dirPath });
     }
@@ -452,7 +463,9 @@ async function scanLibrary(libraryPath, progressCallback, logger) {
     // it's likely a library root like "STL Archive" and its children are the
     // actual creators. We flatten these out so we don't attribute everything
     // to the library root name.
-    const creatorDirs = resolveCreatorDirs(libraryPath, 0, log);
+    let folderOverrides = new Map();
+    try { folderOverrides = new Map(db.prepare('SELECT path, role FROM folder_overrides').all().map(r => [r.path, r.role])); } catch {}
+    const creatorDirs = resolveCreatorDirs(libraryPath, 0, log, folderOverrides);
     log('info', `Found ${creatorDirs.length} creator folder(s)`);
 
     for (const creatorDir of creatorDirs) {

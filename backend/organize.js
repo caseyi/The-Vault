@@ -1099,4 +1099,60 @@ router.post('/group-files', (req, res) => {
   });
 });
 
+// ── Folder role overrides ──────────────────────────────────────────────────
+// Let the user pin how the scanner treats a folder (creator | passthrough |
+// ignore), overriding the heuristic. Used by scanner.resolveCreatorDirs.
+
+router.get('/folder-overrides', (req, res) => {
+  res.json(db.prepare('SELECT path, role, created_at FROM folder_overrides ORDER BY path').all());
+});
+
+router.post('/folder-overrides', (req, res) => {
+  const p = req.body?.path;
+  const role = req.body?.role;
+  if (!p) return res.status(400).json({ error: 'path required' });
+  if (!role) {
+    db.prepare('DELETE FROM folder_overrides WHERE path = ?').run(p);
+    return res.json({ ok: true, cleared: true });
+  }
+  if (!['creator', 'passthrough', 'ignore'].includes(role)) return res.status(400).json({ error: 'invalid role' });
+  db.prepare('INSERT INTO folder_overrides (path, role) VALUES (?, ?) ON CONFLICT(path) DO UPDATE SET role = excluded.role').run(p, role);
+  res.json({ ok: true });
+});
+
+// Raw filesystem tree (bounded) for the folder-roles UI — shows the ACTUAL
+// directory structure (not the indexed grouping) so misclassifications are fixable.
+router.get('/fs-tree', (req, res) => {
+  const base = req.query.path || LIBRARY_PATH;
+  const maxDepth = Math.min(parseInt(req.query.depth, 10) || 3, 5);
+  const MAX_CHILDREN = 300;
+  let overrides;
+  try { overrides = new Map(db.prepare('SELECT path, role FROM folder_overrides').all().map(r => [r.path, r.role])); }
+  catch { overrides = new Map(); }
+
+  function walk(dir, depth) {
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return null; }
+    entries = entries.filter(e => !e.name.startsWith('@') && !e.name.startsWith('#') && !e.name.startsWith('.'));
+    const dirs = entries.filter(e => e.isDirectory());
+    const node = {
+      name: path.basename(dir), path: dir, role: overrides.get(dir) || null,
+      dirCount: dirs.length, fileCount: entries.length - dirs.length, children: [],
+    };
+    if (depth < maxDepth) {
+      for (const c of dirs.slice(0, MAX_CHILDREN)) {
+        const child = walk(path.join(dir, c.name), depth + 1);
+        if (child) node.children.push(child);
+      }
+    } else {
+      node.truncated = dirs.length > 0;
+    }
+    return node;
+  }
+
+  const tree = walk(base, 0);
+  if (!tree) return res.status(400).json({ error: `Cannot read ${base}` });
+  res.json(tree);
+});
+
 module.exports = router;

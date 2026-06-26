@@ -1,4 +1,5 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
+import FolderRoles from './FolderRoles';
 
 // ── shared helpers ────────────────────────────────────────────────────────────
 
@@ -1406,6 +1407,7 @@ function AdvancedTab() {
   const [sub, setSub] = useState('batch');
   const subTabs = [
     { id: 'batch',  label: 'Bulk & Merge',       icon: '⚡' },
+    { id: 'roles',  label: 'Folder Roles',       icon: '🗃' },
     { id: 'gaps',   label: 'Gap Analysis',       icon: '🔍' },
     { id: 'unpack', label: 'Unpack Loose Files', icon: '📦' },
   ];
@@ -1415,6 +1417,7 @@ function AdvancedTab() {
         <TabBar tabs={subTabs} active={sub} onChange={setSub} />
       </div>
       {sub === 'batch'  && <BatchTab />}
+      {sub === 'roles'  && <FolderRoles />}
       {sub === 'gaps'   && <GapTab />}
       {sub === 'unpack' && <LooseTab />}
     </div>

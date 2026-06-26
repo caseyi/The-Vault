@@ -106,6 +106,15 @@ try { db.exec(`ALTER TABLE models ADD COLUMN is_favorite INTEGER DEFAULT 0`); } 
 try { db.exec(`CREATE INDEX IF NOT EXISTS idx_models_favorite ON models(is_favorite)`); } catch {}
 try { db.exec(`ALTER TABLE model_files ADD COLUMN printed_at TEXT`); } catch {}
 
+// Per-folder role overrides for the scanner (creator | passthrough | ignore)
+try { db.exec(`
+  CREATE TABLE IF NOT EXISTS folder_overrides (
+    path TEXT PRIMARY KEY,
+    role TEXT NOT NULL CHECK(role IN ('creator','passthrough','ignore')),
+    created_at TEXT DEFAULT (datetime('now'))
+  )
+`); } catch {}
+
 // Print queue
 try { db.exec(`
   CREATE TABLE IF NOT EXISTS print_queue (
