@@ -70,6 +70,36 @@ function pickRenderArchives(analysis, hint) {
   return analysis.renderArchives; // auto-detected by keyword
 }
 
+// Deterministic thumbnail ranking — score image paths by filename so the best
+// render becomes the thumbnail (and the viewer shows images best-first), no AI.
+const THUMB_POSITIVE = [
+  [/\b(hero|main|cover|render|thumb(nail)?|beauty|promo|presentation)\b/, 6],
+  [/\b(front|preview|display|key ?art)\b/, 4],
+  [/\b0*1\b/, 2], // "01", "1" — often the primary shot
+];
+const THUMB_NEGATIVE = [
+  [/\b(back|rear|bottom|underside)\b/, 3],
+  [/\b(wip|sprue|raft|support(s|ed)?|presupport(ed)?|unsupported|cut|hollow)\b/, 4],
+  [/\b(scale|size|dimension|measure|ruler|comparison)\b/, 3],
+  [/\b(logo|watermark|banner|nsfw|sticker)\b/, 2],
+];
+function imageScore(p) {
+  // Normalize separators (_ - . etc.) to spaces so \b matches around them
+  // (underscores are "word" chars, so "render_main" wouldn't match \brender\b).
+  const name = String(p).toLowerCase().split('/').pop().replace(/[^a-z0-9]+/g, ' ');
+  let score = 0;
+  for (const [re, w] of THUMB_POSITIVE) if (re.test(name)) score += w;
+  for (const [re, w] of THUMB_NEGATIVE) if (re.test(name)) score -= w;
+  return score;
+}
+// Returns images sorted best-thumbnail-first (stable for equal scores).
+function rankImages(images) {
+  return images
+    .map((p, i) => ({ p, i, s: imageScore(p) }))
+    .sort((a, b) => (b.s - a.s) || (a.i - b.i))
+    .map(x => x.p);
+}
+
 function isRenderImage(filename) {
   return IMAGE_EXTS.has(path.extname(filename).toLowerCase());
 }
@@ -549,8 +579,11 @@ async function scanLibrary(libraryPath, progressCallback, logger) {
             if (freshImages.length > 0) {
               allImages = [...new Set([...freshImages, ...allImages])];
             }
-
-            const thumbnail = allImages[0] || null;
+            // Rank so the best render is the thumbnail and leads the viewer order
+            allImages = rankImages(allImages);
+            // Preserve a manually-chosen thumbnail if it's still present
+            const thumbnail = (existing && existing.thumbnail_path && allImages.includes(existing.thumbnail_path))
+              ? existing.thumbnail_path : (allImages[0] || null);
 
             if (existing) {
               stmts.updateModel.run(
@@ -667,7 +700,9 @@ async function scanSingleCreator(creatorPath, creatorId, creatorName, progressCa
           if (freshImages.length > 0) {
             allImages = [...new Set([...freshImages, ...allImages])];
           }
-          const thumbnail = allImages[0] || null;
+          allImages = rankImages(allImages);
+          const thumbnail = (existing && existing.thumbnail_path && allImages.includes(existing.thumbnail_path))
+            ? existing.thumbnail_path : (allImages[0] || null);
 
           if (existing) {
             stmts.updateModel.run(
