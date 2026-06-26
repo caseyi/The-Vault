@@ -100,6 +100,8 @@ try { db.exec(`ALTER TABLE models ADD COLUMN franchise TEXT`); } catch {}
 try { db.exec(`CREATE INDEX IF NOT EXISTS idx_models_franchise ON models(franchise)`); } catch {}
 try { db.exec(`ALTER TABLE models ADD COLUMN team TEXT`); } catch {}
 try { db.exec(`CREATE INDEX IF NOT EXISTS idx_models_team ON models(team)`); } catch {}
+try { db.exec(`ALTER TABLE models ADD COLUMN is_favorite INTEGER DEFAULT 0`); } catch {}
+try { db.exec(`CREATE INDEX IF NOT EXISTS idx_models_favorite ON models(is_favorite)`); } catch {}
 try { db.exec(`ALTER TABLE model_files ADD COLUMN printed_at TEXT`); } catch {}
 
 // Print queue

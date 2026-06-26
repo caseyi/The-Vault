@@ -15,7 +15,7 @@ export default function App() {
   const [selectedModel, setSelectedModel] = useState(null);
   const [stats, setStats] = useState(null);
   const [creators, setCreators] = useState([]);
-  const [filters, setFilters] = useState({ search: '', creator: '', status: '', tags: '', franchise: '', collection: '', folder: '', has_thumbnail: false, recently_added: false })
+  const [filters, setFilters] = useState({ search: '', creator: '', status: '', tags: '', franchise: '', collection: '', folder: '', has_thumbnail: false, recently_added: false, favorite: false })
   const [tags, setTags] = useState([]);
   const [folderTree, setFolderTree] = useState(null);
   const [showScan, setShowScan] = useState(false);

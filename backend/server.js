@@ -151,7 +151,7 @@ const SORT_MAP = {
 };
 
 app.get('/api/models', (req, res) => {
-  const { search, creator, status, tags, franchise, collection, folder, page = 1, limit = 48, show_hidden, has_thumbnail, recently_added, sort } = req.query;
+  const { search, creator, status, tags, franchise, collection, folder, favorite, page = 1, limit = 48, show_hidden, has_thumbnail, recently_added, sort } = req.query;
   const offset = (parseInt(page) - 1) * parseInt(limit);
 
   let where = ['1=1'];
@@ -165,6 +165,11 @@ app.get('/api/models', (req, res) => {
   // Thumbnail filter
   if (has_thumbnail === '1') {
     where.push('m.thumbnail_path IS NOT NULL');
+  }
+
+  // Favorites filter
+  if (favorite === '1') {
+    where.push('m.is_favorite = 1');
   }
 
   // Recently added: models created since the last scan started
@@ -252,7 +257,7 @@ app.get('/api/models/:id', (req, res) => {
 });
 
 app.patch('/api/models/:id', (req, res) => {
-  const { print_status, tags, notes, source_url, name, thumbnail_path, hidden, franchise, team } = req.body;
+  const { print_status, tags, notes, source_url, name, thumbnail_path, hidden, franchise, team, is_favorite } = req.body;
   const model = db.prepare('SELECT id, print_status FROM models WHERE id = ?').get(req.params.id);
   if (!model) return res.status(404).json({ error: 'Not found' });
 
@@ -275,6 +280,7 @@ app.patch('/api/models/:id', (req, res) => {
   if (hidden !== undefined) { updates.push('hidden = ?'); params.push(hidden ? 1 : 0); }
   if (franchise !== undefined) { updates.push('franchise = ?'); params.push(franchise || null); }
   if (team !== undefined) { updates.push('team = ?'); params.push(team || null); }
+  if (is_favorite !== undefined) { updates.push('is_favorite = ?'); params.push(is_favorite ? 1 : 0); }
 
   if (updates.length === 0) return res.status(400).json({ error: 'Nothing to update' });
   updates.push("updated_at = datetime('now')");
@@ -458,6 +464,7 @@ app.get('/api/stats', (req, res) => {
   `).all();
   const creators = db.prepare('SELECT COUNT(*) as n FROM creators').get().n;
   const withImages = db.prepare("SELECT COUNT(*) as n FROM models WHERE thumbnail_path IS NOT NULL AND (hidden IS NULL OR hidden = 0)").get().n;
+  const favorites = db.prepare("SELECT COUNT(*) as n FROM models WHERE is_favorite = 1 AND (hidden IS NULL OR hidden = 0)").get().n;
   const lastScan = db.prepare('SELECT * FROM scan_log ORDER BY id DESC LIMIT 1').get();
 
   // Count models added since the last scan started
@@ -473,7 +480,7 @@ app.get('/api/stats', (req, res) => {
     GROUP BY franchise ORDER BY count DESC, franchise
   `).all();
 
-  res.json({ total, totalHidden, byStatus, creators, withImages, lastScan, recentlyAdded, franchises });
+  res.json({ total, totalHidden, byStatus, creators, withImages, favorites, lastScan, recentlyAdded, franchises });
 });
 
 // General creator update (notes, name)

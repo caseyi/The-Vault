@@ -10,13 +10,14 @@ const STATUS_COLORS = {
   printed: '#4caf7d', painted: '#9b72cf', failed: '#cf7272'
 };
 
-function ModelCard({ model, onClick, bulkMode, selected, onToggle, onHide }) {
+function ModelCard({ model, onClick, bulkMode, selected, onToggle, onHide, onFavorite }) {
   const imgs = model.images || [];
   const [imgIdx, setImgIdx] = useState(0);
   const [hovered, setHovered] = useState(false);
   const [imgLoaded, setImgLoaded] = useState(false);
   const currentImg = imgs[imgIdx] || model.thumbnail_path || imgs[0];
   const isHidden = model.hidden === 1 || model.hidden === true;
+  const isFav = model.is_favorite === 1 || model.is_favorite === true;
 
   const handleClick = (e) => {
     if (bulkMode) { onToggle(model.id); return; }
@@ -36,6 +37,11 @@ function ModelCard({ model, onClick, bulkMode, selected, onToggle, onHide }) {
   const handleHide = (e) => {
     e.stopPropagation();
     onHide(model.id, !isHidden);
+  };
+
+  const handleFav = (e) => {
+    e.stopPropagation();
+    onFavorite(model.id, !isFav);
   };
 
   return (
@@ -67,11 +73,24 @@ function ModelCard({ model, onClick, bulkMode, selected, onToggle, onHide }) {
           border: '1px solid #3f3f4d', backdropFilter: 'blur(4px)',
         }}>HIDDEN</div>
       )}
+      {/* Favorite star — always visible when favorited, else on hover */}
+      {(isFav || hovered) && !bulkMode && (
+        <button onClick={handleFav} title={isFav ? 'Remove from favorites' : 'Add to favorites'}
+          style={{
+            position: 'absolute', top: 8, right: 8, zIndex: 4,
+            background: 'rgba(13,13,15,0.85)', border: `1px solid ${isFav ? '#d4aa4c' : '#3f3f4d'}`,
+            borderRadius: 4, color: isFav ? '#f0c050' : '#7a7a8c',
+            cursor: 'pointer', fontSize: 13, padding: '3px 6px',
+            lineHeight: 1, backdropFilter: 'blur(4px)',
+          }}>
+          {isFav ? '★' : '☆'}
+        </button>
+      )}
       {/* Hide/unhide button on hover */}
       {hovered && !bulkMode && (
         <button onClick={handleHide} title={isHidden ? 'Unhide model' : 'Hide model'}
           style={{
-            position: 'absolute', top: 8, right: 8, zIndex: 4,
+            position: 'absolute', top: 8, right: 38, zIndex: 4,
             background: 'rgba(13,13,15,0.85)', border: '1px solid #3f3f4d',
             borderRadius: 4, color: isHidden ? '#c17f3a' : '#7a7a8c',
             cursor: 'pointer', fontSize: 13, padding: '3px 6px',
@@ -334,6 +353,7 @@ export default function Gallery({ filters, onFilterChange, onModelClick, showHid
       ...(filters.franchise && { franchise: filters.franchise }),
       ...(filters.collection && { collection: filters.collection }),
       ...(filters.folder && { folder: filters.folder }),
+      ...(filters.favorite && { favorite: '1' }),
       ...(showHidden && { show_hidden: '1' }),
     });
     return `/api/export?${params}`;
@@ -355,6 +375,7 @@ export default function Gallery({ filters, onFilterChange, onModelClick, showHid
         ...(filters.franchise && { franchise: filters.franchise }),
         ...(filters.collection && { collection: filters.collection }),
         ...(filters.folder && { folder: filters.folder }),
+        ...(filters.favorite && { favorite: '1' }),
         ...(showHidden && { show_hidden: '1' }),
         sort,
       });
@@ -440,6 +461,18 @@ export default function Gallery({ filters, onFilterChange, onModelClick, showHid
     });
     reload();
     if (onRefreshStats) onRefreshStats();
+  };
+
+  const handleFavorite = async (id, fav) => {
+    // Optimistic update so the star flips instantly
+    setModels(prev => prev.map(m => m.id === id ? { ...m, is_favorite: fav ? 1 : 0 } : m));
+    await fetch(`/api/models/${id}`, {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ is_favorite: fav })
+    });
+    if (onRefreshStats) onRefreshStats();
+    // If we're currently viewing only favorites, drop unfavorited items
+    if (filters.favorite && !fav) reload();
   };
 
   return (
@@ -544,7 +577,7 @@ export default function Gallery({ filters, onFilterChange, onModelClick, showHid
             {models.map(m => (
               <ModelCard key={m.id} model={m} onClick={onModelClick}
                 bulkMode={bulkMode} selected={selectedIds.includes(m.id)}
-                onToggle={toggleSelect} onHide={handleHideModel} />
+                onToggle={toggleSelect} onHide={handleHideModel} onFavorite={handleFavorite} />
             ))}
           </div>
         )}

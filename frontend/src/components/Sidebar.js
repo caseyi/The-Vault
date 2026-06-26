@@ -176,6 +176,17 @@ export default function Sidebar({ open, onToggle, stats, creators, tags, filters
 
             {/* Thumbnail filter + Recently Added */}
             <div className="sidebar-section" style={{ paddingTop: 0 }}>
+              <button
+                className={`status-filter-btn ${filters.favorite ? 'active' : ''}`}
+                onClick={() => onFilterChange({ ...filters, favorite: !filters.favorite })}
+                style={{ color: filters.favorite ? '#f0c050' : 'var(--text-muted)', marginBottom: 2 }}
+              >
+                <span className="dot" style={{ background: filters.favorite ? '#f0c050' : '#2a2a35' }} />
+                ★ Favorites
+                <span style={{ marginLeft: 'auto', fontFamily: 'var(--font-mono)', fontSize: '10px', color: 'var(--text-faint)' }}>
+                  {stats?.favorites ?? 0}
+                </span>
+              </button>
               {(stats?.recentlyAdded > 0 || filters.recently_added) && (
                 <button
                   className={`status-filter-btn ${filters.recently_added ? 'active' : ''}`}
