@@ -434,6 +434,10 @@ async function scanLibrary(libraryPath, progressCallback, logger) {
     log('info', `Found ${creatorDirs.length} creator folder(s)`);
 
     for (const creatorDir of creatorDirs) {
+      // Yield before each creator so /api/scan/status, the SSE stream, and the
+      // rest of the app stay responsive during long scans (esp. slow SMB mounts).
+      await new Promise(resolve => setImmediate(resolve));
+
       const creatorPath = creatorDir.path;
       const creatorName = creatorDir.name;
       const creatorId = getOrCreateCreator(creatorName, creatorPath);

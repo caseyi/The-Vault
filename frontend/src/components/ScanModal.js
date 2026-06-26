@@ -56,12 +56,16 @@ export default function ScanModal({ onClose, onScanComplete }) {
     };
   }, [onScanComplete]);
 
-  // On mount: check if a scan is already running and reconnect
+  // On mount: check if a scan is already running and reconnect.
+  // A scan in progress can keep the server busy, so time the status check out
+  // after a few seconds and show the form anyway rather than hanging forever.
   useEffect(() => {
     let cancelled = false;
     (async () => {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 5000);
       try {
-        const res = await fetch('/api/scan/status');
+        const res = await fetch('/api/scan/status', { signal: controller.signal });
         const status = await res.json();
         if (cancelled) return;
 
@@ -77,8 +81,14 @@ export default function ScanModal({ onClose, onScanComplete }) {
           setDone(true);
         }
       } catch {
-        // API unreachable — just show the start form
+        // Timed out or unreachable (server may be busy scanning). Show the form;
+        // try to attach to any running scan's progress stream in the background.
+        if (!cancelled) {
+          setLines(l => [...l, { level: 'info', msg: 'Could not confirm scan status (the server may be busy). A scan may already be running — its progress will appear below if so.', ts: new Date().toISOString() }]);
+          try { connectToStream(); } catch {}
+        }
       } finally {
+        clearTimeout(timeout);
         if (!cancelled) setChecking(false);
       }
     })();
@@ -265,6 +275,11 @@ export default function ScanModal({ onClose, onScanComplete }) {
       <div className="modal" style={{ width: 580 }}>
         <div className="modal-title">SCAN LIBRARY</div>
         <div className="modal-subtitle">Index your NAS folder to discover models and extract images</div>
+        <div className="modal-hint" style={{ marginTop: 4 }}>
+          Scans run on the server — you can close this window and the scan keeps going.
+          Reopen Scan Library anytime to check progress. The first scan of a large or
+          network (SMB) folder can take a while.
+        </div>
 
         {/* Mounted library roots — quick pick */}
         {roots && roots.length > 0 && (
