@@ -17,6 +17,9 @@
     "active": true,
     "targets": ["dmg", "nsis"],
     "icon": ["icons/icon.png", "icons/icon.icns", "icons/icon.ico"],
-    "resources": ["resources/**/*"]
+    "resources": ["resources/**/*"],
+    "macOS": {
+      "signingIdentity": "-"
+    }
   }
 }

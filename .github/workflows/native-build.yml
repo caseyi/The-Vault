@@ -51,6 +51,8 @@ jobs:
               tar xzf node.tgz
               cp "node-$NODE_VERSION-darwin-$N/bin/node" native/src-tauri/resources/node/node
               chmod +x native/src-tauri/resources/node/node
+              # Ad-hoc sign the bundled Node so macOS will execute it (arm64 requires a valid signature)
+              codesign --force --sign - native/src-tauri/resources/node/node
               ;;
             windows-latest)
               curl -fsSL "https://nodejs.org/dist/$NODE_VERSION/node-$NODE_VERSION-win-x64.zip" -o node.zip
