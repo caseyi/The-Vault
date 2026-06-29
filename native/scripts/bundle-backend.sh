@@ -10,8 +10,9 @@ DEST="$ROOT/native/src-tauri/resources/backend"
 echo "▸ Staging backend → $DEST"
 rm -rf "$DEST"
 mkdir -p "$DEST"
-# Copy backend source (excluding node_modules/tests — deps reinstalled fresh below)
-( cd "$ROOT/backend" && cp -R ./*.js ./package.json "$DEST/" 2>/dev/null || true )
+# Copy backend source (excluding node_modules/tests — deps reinstalled fresh below).
+# version.json is included so the app reports a real version, not 0.0.0.
+( cd "$ROOT/backend" && cp -R ./*.js ./package.json ./version.json "$DEST/" 2>/dev/null || true )
 
 cd "$DEST"
 npm install --omit=dev --no-audit --no-fund

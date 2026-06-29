@@ -28,6 +28,13 @@ jobs:
       - name: Build frontend
         run: cd frontend && npm install --no-audit --no-fund && npm run build
 
+      - name: Stamp build version
+        shell: bash
+        run: |
+          SHA=$(git rev-parse --short HEAD)
+          printf '{"version":"0.1.0","build":"%s","builtAt":"%s"}\n' "$SHA" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > backend/version.json
+          cat backend/version.json
+
       - name: Stage backend resource
         shell: bash
         run: bash native/scripts/bundle-backend.sh
