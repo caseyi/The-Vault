@@ -24,7 +24,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Build frontend
-        run: cd frontend && npm ci && npm run build
+        run: cd frontend && npm install --no-audit --no-fund && npm run build
 
       - name: Stage backend resource
         shell: bash
@@ -34,7 +34,7 @@ jobs:
         shell: bash
         run: |
           cd native
-          npm ci
+          npm install --no-audit --no-fund
           npx --yes @tauri-apps/cli icon src-tauri/icon-source.png
 
       - name: Bundle Node 22 runtime (M2)
