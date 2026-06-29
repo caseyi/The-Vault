@@ -103,7 +103,42 @@ cd native && npm run tauri build
 - **M2 — backend + Node bundling**: done — `scripts/bundle-backend.sh` stages the backend + prod deps; CI downloads a pinned Node 22 binary into `resources/node/` per OS; `main.rs` spawns it (falls back to a `node` on PATH).
 - **M3 — native config**: done — `set_library_path`/`get_library_path` commands persist the folder to `config.json` and restart the backend; the Scan dialog shows a **📁 Choose library folder…** button in the desktop build (hidden in the browser/Docker build).
 - **M4 — CI matrix**: done — `.github/workflows/native-build.yml` builds macOS + Windows, unsigned, attaching installers to a draft GitHub Release on a `native-v*` tag.
-- **M5 — polish**: app icon **done** — real logo committed at `src-tauri/icon-source.png`, generated into the full icon set by `npx tauri icon` (CI does this automatically). Remaining: Tauri auto-updater + first-run onboarding.
+- **M5 — polish**: app icon **done** (`src-tauri/icon-source.png` → `tauri icon`). First-run **onboarding done** (welcome modal when the library is empty, shared by web + native). **Auto-update**: enablement recipe below (needs a one-time signing key, so it's opt-in to keep the build green).
+
+### Enabling auto-update (one-time)
+
+Tauri's updater needs its own signing keypair (separate from code signing) so clients trust update payloads.
+
+```sh
+# 1. Generate an updater keypair (keep the private key + password secret)
+cd native && npx tauri signer generate -w vault-updater.key
+
+# 2. Add the plugin
+#    Cargo.toml:  tauri-plugin-updater = "2"
+#    main.rs:     .plugin(tauri_plugin_updater::Builder::new().build())
+```
+
+```jsonc
+// 3. tauri.conf.json
+"bundle": { "createUpdaterArtifacts": true },
+"plugins": {
+  "updater": {
+    "pubkey": "<PASTE the public key printed in step 1>",
+    "endpoints": ["https://github.com/caseyi/The-Vault/releases/latest/download/latest.json"]
+  }
+}
+```
+
+```yaml
+# 4. CI (.github/workflows/native-build.yml) — pass the private key to tauri-action:
+#    env:
+#      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+#      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+#    and set `includeUpdaterJson: true` in the tauri-action `with:` block.
+```
+
+Then the app checks the release's `latest.json` on launch and offers to update. Add the
+JS check (or do it in `main.rs`) once the keys/secrets are in place.
 
 > Still requires a local Rust + Tauri toolchain to compile and a real test run; the cloud sandbox can't build native binaries.
 

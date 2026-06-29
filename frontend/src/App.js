@@ -52,6 +52,13 @@ export default function App() {
   const [scanStatus, setScanStatus] = useState({ inProgress: false, count: 0, last: '' });
   const [scanToast, setScanToast] = useState(null);
   const scanWasRunning = useRef(false);
+  const [onboarded, setOnboarded] = useState(() => {
+    try { return localStorage.getItem('vault_onboarded') === '1'; } catch { return true; }
+  });
+  const dismissOnboarding = () => {
+    try { localStorage.setItem('vault_onboarded', '1'); } catch {}
+    setOnboarded(true);
+  };
 
   const fetchQueueCount = useCallback(() => {
     fetch('/api/queue').then(r => r.json()).then(q => setQueueCount(q.length)).catch(() => {});
@@ -216,6 +223,26 @@ export default function App() {
         <OrganizeModal
           onClose={() => { setShowOrganize(false); fetchStats(); }}
         />
+      )}
+
+      {/* First-run onboarding (shown once, when the library is empty) */}
+      {!onboarded && stats && (stats.total || 0) === 0 && !scanStatus.inProgress && (
+        <div className="modal-overlay" onClick={e => { if (e.target === e.currentTarget) dismissOnboarding(); }}>
+          <div className="modal" style={{ width: 460, textAlign: 'center' }}>
+            <div style={{ fontSize: 40, marginBottom: 6 }}>🗃️</div>
+            <div className="modal-title" style={{ textAlign: 'center' }}>WELCOME TO THE VAULT</div>
+            <div className="modal-subtitle" style={{ textAlign: 'center' }}>Your self-hosted 3D-print library. Three quick things:</div>
+            <div style={{ textAlign: 'left', margin: '14px auto', maxWidth: 380, display: 'flex', flexDirection: 'column', gap: 10, fontSize: 13, color: 'var(--text-muted)' }}>
+              <div><b style={{ color: 'var(--accent)' }}>1. Scan</b> &nbsp;Point it at your prints folder to index models and pull preview images.</div>
+              <div><b style={{ color: 'var(--accent)' }}>2. Organize</b> &nbsp;Browse by folder, creator, tags, favorites ⭐, and collections.</div>
+              <div><b style={{ color: 'var(--accent)' }}>3. AI (optional)</b> &nbsp;Add a Claude API key for auto-tagging and finding thumbnails.</div>
+            </div>
+            <div className="modal-actions" style={{ justifyContent: 'center', marginTop: 8 }}>
+              <button className="btn-cancel" onClick={dismissOnboarding}>Skip</button>
+              <button className="btn-primary" onClick={() => { dismissOnboarding(); setShowScan(true); }}>⟳ Scan your library</button>
+            </div>
+          </div>
+        </div>
       )}
 
       {/* Background-scan toast (completion) */}
