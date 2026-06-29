@@ -42,22 +42,21 @@ jobs:
       - name: Bundle Node 22 runtime (M2)
         shell: bash
         run: |
-          NODE_VERSION=v22.11.0
+          # Bundle the runner's already-installed Node 22 (from setup-node above).
+          # It's a current 22.x where node:sqlite is unflagged — pinning an older
+          # patch (e.g. 22.11) breaks because node:sqlite still needs a flag there.
           mkdir -p native/src-tauri/resources/node
+          NODE_BIN="$(command -v node)"
+          node --version
           case "${{ matrix.platform }}" in
             macos-latest)
-              if [ "$(uname -m)" = "arm64" ]; then N=arm64; else N=x64; fi
-              curl -fsSL "https://nodejs.org/dist/$NODE_VERSION/node-$NODE_VERSION-darwin-$N.tar.gz" -o node.tgz
-              tar xzf node.tgz
-              cp "node-$NODE_VERSION-darwin-$N/bin/node" native/src-tauri/resources/node/node
+              cp "$NODE_BIN" native/src-tauri/resources/node/node
               chmod +x native/src-tauri/resources/node/node
-              # Ad-hoc sign the bundled Node so macOS will execute it (arm64 requires a valid signature)
+              # Ad-hoc sign so macOS will execute it (arm64 requires a valid signature)
               codesign --force --sign - native/src-tauri/resources/node/node
               ;;
             windows-latest)
-              curl -fsSL "https://nodejs.org/dist/$NODE_VERSION/node-$NODE_VERSION-win-x64.zip" -o node.zip
-              unzip -q node.zip
-              cp "node-$NODE_VERSION-win-x64/node.exe" native/src-tauri/resources/node/node.exe
+              cp "$NODE_BIN" native/src-tauri/resources/node/node.exe
               ;;
           esac
           ls -la native/src-tauri/resources/node
