@@ -2,6 +2,18 @@ const express = require('express');
 const cors = require('cors');
 const path = require('path');
 const fs = require('fs');
+
+// Move to a stable, simple working directory before anything spawns a worker.
+// When launched from a macOS .app bundle the inherited cwd can make
+// worker_threads fail with "uv_cwd ENOENT"; chdir to the data dir (or temp)
+// avoids it. chdir takes an absolute path, so it works even if the current cwd
+// is already broken.
+try {
+  const cwdTarget = process.env.DB_PATH ? path.dirname(process.env.DB_PATH) : require('os').tmpdir();
+  fs.mkdirSync(cwdTarget, { recursive: true });
+  process.chdir(cwdTarget);
+} catch {}
+
 const db = require('./db');
 const { scanLibrary, scanSingleCreator, LIBRARY_PATH, matchesHint, pickRenderArchives, analyzeFolder, inferReleaseName } = require('./scanner');
 const { scrapeImagesFromUrl, detectUrlFromFolderName } = require('./scraper');
