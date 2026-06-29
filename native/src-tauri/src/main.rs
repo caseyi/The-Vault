@@ -63,7 +63,11 @@ fn spawn_backend(app: &AppHandle, library_path: &str) -> Option<Child> {
         .env("PORT", PORT.to_string())
         .env("DB_PATH", data_dir.join("vault.db"))
         .env("IMAGES_DIR", data_dir.join("images"))
-        .current_dir(&backend_dir);
+        // Use the stable app-data dir as cwd, not the app bundle: a quarantined/
+        // translocated bundle path can vanish mid-run and break worker_threads
+        // with "uv_cwd ENOENT". The backend resolves its own files via absolute
+        // paths, so cwd doesn't otherwise matter.
+        .current_dir(&data_dir);
     if !library_path.is_empty() {
         cmd.env("LIBRARY_PATH", library_path);
     }
