@@ -30,19 +30,33 @@ jobs:
         shell: bash
         run: bash native/scripts/bundle-backend.sh
 
-      - name: Generate placeholder app icons
+      - name: Generate app icons from committed logo
         shell: bash
         run: |
           cd native
           npm ci
-          mkdir -p src-tauri/icons
-          # Placeholder icon — replace with a real logo via `npx tauri icon logo.png`.
-          if command -v magick >/dev/null 2>&1; then magick -size 1024x1024 xc:#c17f3a src-tauri/icons/icon.png;
-          elif command -v convert >/dev/null 2>&1; then convert -size 1024x1024 xc:#c17f3a src-tauri/icons/icon.png; fi
-          if [ -f src-tauri/icons/icon.png ]; then npx --yes @tauri-apps/cli icon src-tauri/icons/icon.png; fi
+          npx --yes @tauri-apps/cli icon src-tauri/icon-source.png
 
-      # TODO(M2): bundle a Node 22 runtime into native/src-tauri/resources/node/
-      # for this matrix.platform before the build step.
+      - name: Bundle Node 22 runtime (M2)
+        shell: bash
+        run: |
+          NODE_VERSION=v22.11.0
+          mkdir -p native/src-tauri/resources/node
+          case "${{ matrix.platform }}" in
+            macos-latest)
+              if [ "$(uname -m)" = "arm64" ]; then N=arm64; else N=x64; fi
+              curl -fsSL "https://nodejs.org/dist/$NODE_VERSION/node-$NODE_VERSION-darwin-$N.tar.gz" -o node.tgz
+              tar xzf node.tgz
+              cp "node-$NODE_VERSION-darwin-$N/bin/node" native/src-tauri/resources/node/node
+              chmod +x native/src-tauri/resources/node/node
+              ;;
+            windows-latest)
+              curl -fsSL "https://nodejs.org/dist/$NODE_VERSION/node-$NODE_VERSION-win-x64.zip" -o node.zip
+              unzip -q node.zip
+              cp "node-$NODE_VERSION-win-x64/node.exe" native/src-tauri/resources/node/node.exe
+              ;;
+          esac
+          ls -la native/src-tauri/resources/node
 
       - name: Build Tauri app
         uses: tauri-apps/tauri-action@v0

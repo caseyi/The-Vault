@@ -25,8 +25,10 @@ cargo install tauri-cli --version "^2"
 cd frontend && npm install && npm run build && cd ..
 # 2. Stage the backend as a bundled resource (installs prod deps for THIS OS)
 native/scripts/bundle-backend.sh
-# 3. Launch the desktop app
-cd native && npm install && npm run tauri dev
+# 3. Generate the app icons from the committed logo (once, or when the logo changes)
+cd native && npm install && npx tauri icon src-tauri/icon-source.png
+# 4. Launch the desktop app
+npm run tauri dev
 ```
 
 ## Build installers
@@ -52,11 +54,14 @@ cd native && npm run tauri build
 
 ## Milestone status
 
-- **M0 — shell + spawn**: scaffolded here (`tauri.conf.json`, `main.rs`, fetch-patch). Run `tauri dev` to verify.
-- **M2 — backend bundling**: `scripts/bundle-backend.sh` stages backend + deps; CI does it per-OS. **TODO:** bundle a Node runtime (or require Node 22 installed) — see script comments.
-- **M3 — native config**: folder picker + Settings + app-data paths. **TODO:** wire the picker UI (a Settings button calling the dialog plugin) and persist `LIBRARY_PATH`.
-- **M4 — CI matrix**: `.github/workflows/native-build.yml` builds macOS + Windows, unsigned, and attaches artifacts to a GitHub Release on a `native-v*` tag.
-- **M5 — polish**: auto-updater, icon, onboarding. **TODO.**
+- **M0 — shell + spawn**: done — `main.rs` spawns the backend + injects the fetch/SSE patch. Run `tauri dev` to verify locally.
+- **M1 — DB de-risk**: done — backend uses `node:sqlite` (Node 22), no native `better-sqlite3`.
+- **M2 — backend + Node bundling**: done — `scripts/bundle-backend.sh` stages the backend + prod deps; CI downloads a pinned Node 22 binary into `resources/node/` per OS; `main.rs` spawns it (falls back to a `node` on PATH).
+- **M3 — native config**: done — `set_library_path`/`get_library_path` commands persist the folder to `config.json` and restart the backend; the Scan dialog shows a **📁 Choose library folder…** button in the desktop build (hidden in the browser/Docker build).
+- **M4 — CI matrix**: done — `.github/workflows/native-build.yml` builds macOS + Windows, unsigned, attaching installers to a draft GitHub Release on a `native-v*` tag.
+- **M5 — polish**: app icon **done** — real logo committed at `src-tauri/icon-source.png`, generated into the full icon set by `npx tauri icon` (CI does this automatically). Remaining: Tauri auto-updater + first-run onboarding.
+
+> Still requires a local Rust + Tauri toolchain to compile and a real test run; the cloud sandbox can't build native binaries.
 
 ## Known TODOs / decisions
 

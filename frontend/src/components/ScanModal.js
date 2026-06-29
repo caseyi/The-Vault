@@ -168,6 +168,21 @@ export default function ScanModal({ onClose, onScanComplete }) {
     connectToStream();
   };
 
+  // Desktop (Tauri) only: native folder picker that sets LIBRARY_PATH and
+  // restarts the bundled backend. Hidden in the browser/Docker build.
+  const isTauri = typeof window !== 'undefined' && !!window.__TAURI__;
+  const chooseLibraryFolder = async () => {
+    try {
+      const dir = await window.__TAURI__.dialog.open({ directory: true, multiple: false, title: 'Choose your 3D print folder' });
+      if (!dir) return;
+      await window.__TAURI__.core.invoke('set_library_path', { path: dir });
+      setLines(l => [...l, { level: 'info', msg: `Library folder set to ${dir} — restarting indexer…`, ts: new Date().toISOString() }]);
+      setTimeout(() => { fetch('/api/library/roots').then(r => r.json()).then(d => setRoots(d.roots || [])).catch(() => {}); }, 1800);
+    } catch (e) {
+      setLines(l => [...l, { level: 'error', msg: `Folder pick failed: ${e}`, ts: new Date().toISOString() }]);
+    }
+  };
+
   const cancelScan = async () => {
     try {
       await fetch('/api/scan/cancel', { method: 'POST' });
@@ -287,6 +302,13 @@ export default function ScanModal({ onClose, onScanComplete }) {
           Reopen Scan Library anytime to check progress. The first scan of a large or
           network (SMB) folder can take a while.
         </div>
+
+        {isTauri && (
+          <button className="btn-primary" onClick={chooseLibraryFolder} disabled={running}
+            style={{ marginBottom: 10 }}>
+            📁 Choose library folder…
+          </button>
+        )}
 
         {/* Mounted library roots — quick pick */}
         {roots && roots.length > 0 && (

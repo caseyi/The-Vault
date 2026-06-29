@@ -1,54 +1,107 @@
 // Prevent an extra console window on Windows in release.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use std::fs;
+use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::sync::Mutex;
-use tauri::{Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent};
+use serde::{Deserialize, Serialize};
+use tauri::{AppHandle, Manager, State, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 
 // Fixed loopback port the bundled backend listens on.
 const PORT: u16 = 8484;
 
-// Holds the spawned backend process so we can kill it on quit.
+// Holds the spawned backend process so we can kill/restart it.
 struct Backend(Mutex<Option<Child>>);
+
+#[derive(Default, Serialize, Deserialize)]
+struct Config {
+    #[serde(default, rename = "libraryPath")]
+    library_path: String,
+}
+
+fn config_path(app: &AppHandle) -> Option<PathBuf> {
+    Some(app.path().app_data_dir().ok()?.join("config.json"))
+}
+
+fn read_config(app: &AppHandle) -> Config {
+    config_path(app)
+        .and_then(|p| fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn write_config(app: &AppHandle, cfg: &Config) {
+    if let (Some(p), Ok(s)) = (config_path(app), serde_json::to_string_pretty(cfg)) {
+        if let Some(dir) = p.parent() { let _ = fs::create_dir_all(dir); }
+        let _ = fs::write(p, s);
+    }
+}
+
+// Start the Node backend with the given library path (empty = none yet).
+fn spawn_backend(app: &AppHandle, library_path: &str) -> Option<Child> {
+    let resource_dir = app.path().resource_dir().ok()?;
+    let data_dir = app.path().app_data_dir().ok()?;
+    let _ = fs::create_dir_all(&data_dir);
+    let _ = fs::create_dir_all(data_dir.join("images"));
+
+    let backend_dir = resource_dir.join("resources").join("backend");
+    let server_js = backend_dir.join("server.js");
+
+    let bundled_node = resource_dir
+        .join("resources").join("node")
+        .join(if cfg!(windows) { "node.exe" } else { "node" });
+    let node_bin = if bundled_node.exists() {
+        bundled_node.to_string_lossy().to_string()
+    } else {
+        "node".to_string()
+    };
+
+    let mut cmd = Command::new(node_bin);
+    cmd.arg("--disable-warning=ExperimentalWarning")
+        .arg(&server_js)
+        .env("PORT", PORT.to_string())
+        .env("DB_PATH", data_dir.join("vault.db"))
+        .env("IMAGES_DIR", data_dir.join("images"))
+        .current_dir(&backend_dir);
+    if !library_path.is_empty() {
+        cmd.env("LIBRARY_PATH", library_path);
+    }
+    cmd.spawn().ok()
+}
+
+#[tauri::command]
+fn get_library_path(app: AppHandle) -> String {
+    read_config(&app).library_path
+}
+
+// Persist a chosen library folder and restart the backend so it indexes it.
+#[tauri::command]
+fn set_library_path(app: AppHandle, state: State<Backend>, path: String) -> Result<(), String> {
+    let mut cfg = read_config(&app);
+    cfg.library_path = path.clone();
+    write_config(&app, &cfg);
+
+    if let Some(mut child) = state.0.lock().unwrap().take() {
+        let _ = child.kill();
+    }
+    let child = spawn_backend(&app, &path).ok_or("failed to restart backend")?;
+    *state.0.lock().unwrap() = Some(child);
+    Ok(())
+}
 
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(Backend(Mutex::new(None)))
+        .invoke_handler(tauri::generate_handler![get_library_path, set_library_path])
         .setup(|app| {
-            let resource_dir = app.path().resource_dir()?;
-            let data_dir = app.path().app_data_dir()?;
-            std::fs::create_dir_all(&data_dir).ok();
-            std::fs::create_dir_all(data_dir.join("images")).ok();
-
-            let backend_dir = resource_dir.join("resources").join("backend");
-            let server_js = backend_dir.join("server.js");
-
-            // Prefer a bundled Node runtime; fall back to a `node` on PATH.
-            let bundled_node = resource_dir
-                .join("resources")
-                .join("node")
-                .join(if cfg!(windows) { "node.exe" } else { "node" });
-            let node_bin = if bundled_node.exists() {
-                bundled_node.to_string_lossy().to_string()
+            let handle = app.handle().clone();
+            let cfg = read_config(&handle);
+            if let Some(child) = spawn_backend(&handle, &cfg.library_path) {
+                *app.state::<Backend>().0.lock().unwrap() = Some(child);
             } else {
-                "node".to_string()
-            };
-
-            // TODO(M3): read a saved LIBRARY_PATH from app config and pass it here;
-            // until then the user sets it via the in-app folder picker + Settings.
-            let child = Command::new(node_bin)
-                .arg("--disable-warning=ExperimentalWarning")
-                .arg(&server_js)
-                .env("PORT", PORT.to_string())
-                .env("DB_PATH", data_dir.join("vault.db"))
-                .env("IMAGES_DIR", data_dir.join("images"))
-                .current_dir(&backend_dir)
-                .spawn();
-
-            match child {
-                Ok(c) => { *app.state::<Backend>().0.lock().unwrap() = Some(c); }
-                Err(e) => { eprintln!("Failed to start backend: {e}"); }
+                eprintln!("Failed to start backend");
             }
 
             // Rewrite the frontend's relative API/SSE calls to the local backend,
