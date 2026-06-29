@@ -10,6 +10,8 @@ export default function ScanModal({ onClose, onScanComplete }) {
   const [lines, setLines] = useState([]);
   const [checking, setChecking] = useState(true); // loading state while checking scan status
   const [roots, setRoots] = useState(null); // mounted library roots (read-only)
+  const [libraryPath, setLibraryPath] = useState(''); // backend LIBRARY_PATH (scan-everything target)
+  const [rootFilter, setRootFilter] = useState('');
   const [aiModel, setAiModel] = useState(() => localStorage.getItem('vault_ai_model') || '');
   const [aiModels, setAiModels] = useState([]);
   const [estimate, setEstimate] = useState(null);
@@ -99,7 +101,15 @@ export default function ScanModal({ onClose, onScanComplete }) {
   useEffect(() => {
     fetch('/api/library/roots')
       .then(r => r.json())
-      .then(d => setRoots(d.roots || []))
+      .then(d => {
+        setRoots(d.roots || []);
+        if (d.libraryPath) {
+          setLibraryPath(d.libraryPath);
+          // Default the scan target to the real library root (in the native app
+          // that's the chosen folder, not "/library").
+          setPath(p => (p === '/library' ? d.libraryPath : p));
+        }
+      })
       .catch(() => setRoots([]));
   }, []);
 
@@ -310,36 +320,63 @@ export default function ScanModal({ onClose, onScanComplete }) {
           </button>
         )}
 
-        {/* Mounted library roots — quick pick */}
-        {roots && roots.length > 0 && (
+        {/* What will be scanned + optional single-folder pick */}
+        {roots && (
           <div style={{ marginBottom: 10 }}>
-            <div style={{ fontSize: 10, fontFamily: 'var(--font-mono)', color: 'var(--text-faint)', letterSpacing: 1, marginBottom: 5 }}>
-              MOUNTED LIBRARY FOLDERS
-            </div>
-            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
-              {roots.map(r => (
-                <button
-                  key={r.path}
-                  onClick={() => setPath(r.path)}
-                  disabled={running || !r.accessible}
-                  title={r.accessible ? `Scan ${r.path}` : `Not readable: ${r.path}`}
-                  style={{
-                    display: 'inline-flex', alignItems: 'center', gap: 6,
-                    background: path === r.path ? 'rgba(193,127,58,0.18)' : 'var(--bg3)',
-                    border: `1px solid ${path === r.path ? 'var(--accent)' : 'var(--border)'}`,
-                    borderRadius: 4, padding: '5px 10px', cursor: r.accessible ? 'pointer' : 'not-allowed',
-                    color: path === r.path ? 'var(--accent)' : 'var(--text-muted)',
-                    fontSize: 12, fontFamily: 'var(--font-body)',
-                  }}>
-                  <span style={{ opacity: 0.85 }}>{r.accessible ? '🗂' : '⚠'}</span>
-                  {r.name}
-                  <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--text-faint)' }}>{r.modelCount}</span>
-                </button>
-              ))}
-            </div>
-            <div className="modal-hint" style={{ marginTop: 5 }}>
-              Pick a folder to scan just that root, or scan <code>/library</code> for everything. Add folders in your <code>.env</code> file.
-            </div>
+            {roots.length > 0 && (() => {
+              const shown = roots.filter(r => r.name.toLowerCase().includes(rootFilter.trim().toLowerCase()));
+              const scanningAll = !libraryPath || path === libraryPath;
+              return (
+                <>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6, flexWrap: 'wrap' }}>
+                    <span style={{ fontSize: 10, fontFamily: 'var(--font-mono)', color: 'var(--text-faint)', letterSpacing: 1 }}>
+                      SCAN A FOLDER ({roots.length})
+                    </span>
+                    {libraryPath && (
+                      <button onClick={() => setPath(libraryPath)} disabled={running}
+                        title={`Scan everything under ${libraryPath}`}
+                        style={{
+                          background: scanningAll ? 'rgba(193,127,58,0.18)' : 'var(--bg3)',
+                          border: `1px solid ${scanningAll ? 'var(--accent)' : 'var(--border)'}`,
+                          color: scanningAll ? 'var(--accent)' : 'var(--text-muted)',
+                          borderRadius: 4, padding: '3px 9px', cursor: 'pointer', fontSize: 11, fontFamily: 'var(--font-body)',
+                        }}>
+                        ⬚ Entire library
+                      </button>
+                    )}
+                  </div>
+                  {roots.length > 10 && (
+                    <input className="modal-input" value={rootFilter} onChange={e => setRootFilter(e.target.value)}
+                      placeholder={`Filter ${roots.length} folders…`} style={{ marginBottom: 6 }} />
+                  )}
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, maxHeight: 132, overflowY: 'auto', padding: 6, border: '1px solid var(--border)', borderRadius: 6, background: 'var(--bg)' }}>
+                    {shown.slice(0, 400).map(r => (
+                      <button
+                        key={r.path}
+                        onClick={() => setPath(r.path)}
+                        disabled={running || !r.accessible}
+                        title={r.accessible ? `Scan only ${r.path}` : `Not readable: ${r.path}`}
+                        style={{
+                          display: 'inline-flex', alignItems: 'center', gap: 6,
+                          background: path === r.path ? 'rgba(193,127,58,0.18)' : 'var(--bg3)',
+                          border: `1px solid ${path === r.path ? 'var(--accent)' : 'var(--border)'}`,
+                          borderRadius: 4, padding: '4px 9px', cursor: r.accessible ? 'pointer' : 'not-allowed',
+                          color: path === r.path ? 'var(--accent)' : 'var(--text-muted)',
+                          fontSize: 12, fontFamily: 'var(--font-body)', maxWidth: '100%',
+                        }}>
+                        <span style={{ opacity: 0.85, flexShrink: 0 }}>{r.accessible ? '🗂' : '⚠'}</span>
+                        <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{r.name}</span>
+                        <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--text-faint)', flexShrink: 0 }}>{r.modelCount}</span>
+                      </button>
+                    ))}
+                    {shown.length === 0 && <span style={{ fontSize: 11, color: 'var(--text-faint)', padding: 4 }}>No folders match "{rootFilter}".</span>}
+                  </div>
+                  <div className="modal-hint" style={{ marginTop: 5 }}>
+                    Defaults to your whole library. Click a folder above to scan just that one.
+                  </div>
+                </>
+              );
+            })()}
           </div>
         )}
 
@@ -351,7 +388,7 @@ export default function ScanModal({ onClose, onScanComplete }) {
           disabled={running}
         />
         <div className="modal-hint">
-          Default: <code>/library</code> — mapped to your NAS folder(s) via Docker Compose / <code>.env</code>.
+          The folder that will be scanned. Set it above, or edit directly.
         </div>
 
         <label style={{
