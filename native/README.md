@@ -9,6 +9,50 @@ source via one CI matrix.
 > be compiled in the cloud sandbox, so treat this as a working scaffold to run + iterate
 > locally, not a pre-verified binary.
 
+## First launch (installing a downloaded build)
+
+These builds are **ad-hoc signed but not notarized** (no paid Apple/Windows certificate
+yet), so the OS shows a one-time warning. This is expected — here's how to get past it.
+
+### macOS
+
+1. Open the `.dmg` and drag **The Vault** to **Applications**.
+2. **Right-click** the app in Applications → **Open** → **Open** (don't double-click the
+   first time). After this once, it launches normally.
+
+If you instead see **"The Vault is damaged and can't be opened"**, that build wasn't
+ad-hoc signed (older artifact) — grab the latest release, or fix the installed copy from
+**Terminal**:
+
+```sh
+APP="/Applications/The Vault.app"
+sudo xattr -rd com.apple.quarantine "$APP"
+sudo codesign --force --sign - "$APP/Contents/Resources/resources/node/node"
+sudo codesign --force --deep --sign - "$APP"
+```
+
+> If those commands return **"Operation not permitted"**, grant your terminal **Full Disk
+> Access** (System Settings → Privacy & Security → Full Disk Access), or just download the
+> latest ad-hoc-signed release and use right-click → Open.
+
+### Windows
+
+SmartScreen will warn on first run: click **More info → Run anyway**.
+
+### Making the warnings go away for good
+
+Ship a notarized build: an Apple **Developer ID** ($99/yr) + macOS notarization, and a
+Windows code-signing certificate. Wire the signing secrets into
+`.github/workflows/native-build.yml` (tauri-action supports `APPLE_*` / Windows signing
+env). Deferred for v1 by choice.
+
+### First run inside the app
+
+On first launch the library is empty. Open **⟳ Scan Library** → click
+**📁 Choose library folder…**, pick your 3D-print folder (for a NAS, mount the share in
+Finder/Explorer first and pick the mounted path), then **Start Scan**. The database and
+extracted images live in the OS app-data dir, so they persist across updates.
+
 ## Prerequisites (one-time, on your Mac)
 
 ```sh

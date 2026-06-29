@@ -69,6 +69,12 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseName: "The Vault ${{ github.ref_name }}"
           releaseDraft: true
-          releaseBody: "Unsigned dev build. macOS: right-click → Open. Windows: More info → Run anyway."
+          releaseBody: |
+            Ad-hoc signed (not notarized) desktop build of The Vault.
+
+            **macOS:** open the .dmg, drag the app to Applications, then **right-click the app → Open → Open** the first time (don't double-click). If it says "damaged", you have an older artifact — download the latest, or see native/README.md.
+            **Windows:** on first run click **More info → Run anyway**.
+
+            First launch: open **Scan Library → 📁 Choose library folder…**, pick your 3D-print folder, then Start Scan.
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
