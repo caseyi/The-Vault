@@ -1200,4 +1200,44 @@ Use folder NAMES as the main signal (e.g. "...Studios"/"...3D Models" = creator;
   }
 });
 
+// Resolve a duplicate set: keep one model, hide the rest. Non-destructive —
+// consolidates tags + collection memberships into the keeper and adopts a
+// thumbnail if it lacks one; the dropped models are hidden, never deleted.
+router.post('/dedupe/resolve', (req, res) => {
+  const { keepId, dropIds } = req.body || {};
+  if (!keepId || !Array.isArray(dropIds) || dropIds.length === 0) {
+    return res.status(400).json({ error: 'keepId and dropIds[] required' });
+  }
+  const keep = db.prepare('SELECT * FROM models WHERE id = ?').get(keepId);
+  if (!keep) return res.status(404).json({ error: 'Keeper model not found' });
+
+  const placeholders = dropIds.map(() => '?').join(',');
+  const drops = db.prepare(`SELECT * FROM models WHERE id IN (${placeholders})`).all(...dropIds);
+
+  db.transaction(() => {
+    const tags = new Set();
+    try { for (const t of JSON.parse(keep.tags || '[]')) tags.add(t); } catch {}
+    let thumb = keep.thumbnail_path;
+
+    for (const d of drops) {
+      try { for (const t of JSON.parse(d.tags || '[]')) tags.add(t); } catch {}
+      if (!thumb && d.thumbnail_path) thumb = d.thumbnail_path;
+      // Move the dropped model's collection memberships onto the keeper
+      const cols = db.prepare('SELECT collection_id FROM collection_models WHERE model_id = ?').all(d.id);
+      for (const c of cols) {
+        try {
+          db.prepare('INSERT OR IGNORE INTO collection_models (collection_id, model_id) VALUES (?, ?)')
+            .run(c.collection_id, keepId);
+        } catch {}
+      }
+      db.prepare("UPDATE models SET hidden = 1, updated_at = datetime('now') WHERE id = ?").run(d.id);
+    }
+
+    db.prepare("UPDATE models SET tags = ?, thumbnail_path = ?, updated_at = datetime('now') WHERE id = ?")
+      .run(JSON.stringify([...tags].slice(0, 12)), thumb || null, keepId);
+  })();
+
+  res.json({ success: true, kept: keepId, hidden: dropIds.length });
+});
+
 module.exports = router;

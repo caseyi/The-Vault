@@ -463,6 +463,22 @@ function HealthTab({ onAnnotateThese }) {
   const [thumbResult, setThumbResult] = useState('');
   const [integrityData, setIntegrityData] = useState(null);
   const [integrityLoading, setIntegrityLoading] = useState(false);
+  const [resolvedKeys, setResolvedKeys] = useState(new Set()); // dup groups already handled this session
+  const [resolvingKey, setResolvingKey] = useState(null);
+
+  const resolveDup = async (groupKey, keepId, allIds) => {
+    const dropIds = allIds.filter(id => id !== keepId);
+    if (!dropIds.length) return;
+    setResolvingKey(groupKey);
+    try {
+      await fetch('/api/organize/dedupe/resolve', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ keepId, dropIds }),
+      });
+      setResolvedKeys(prev => new Set(prev).add(groupKey));
+    } catch (e) { setError(e.message); }
+    setResolvingKey(null);
+  };
 
   const run = useCallback(async () => {
     setLoading(true); setError('');
@@ -590,33 +606,65 @@ function HealthTab({ onAnnotateThese }) {
     return null;
   }
 
+  function DupGroup({ groupKey, models, label }) {
+    const best = [...models].sort((a, b) =>
+      (Number(!!b.thumbnail_path) - Number(!!a.thumbnail_path)) || ((b.file_count || 0) - (a.file_count || 0))
+    )[0];
+    const [keepId, setKeepId] = useState(best?.id);
+    const busy = resolvingKey === groupKey;
+    return (
+      <div className="org-dupe-pair">
+        <div className="org-dupe-score" style={{ color: '#5b9bd5' }}>{label}</div>
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, padding: '4px 8px' }}>
+          {models.map(m => {
+            const sel = keepId === m.id;
+            let tagCount = 0; try { tagCount = JSON.parse(m.tags || '[]').length; } catch {}
+            return (
+              <label key={m.id} style={{ flex: '1 1 200px', minWidth: 180, display: 'flex', gap: 8, alignItems: 'center', padding: 8, borderRadius: 6, cursor: 'pointer', background: sel ? 'rgba(76,175,125,0.1)' : 'var(--bg2)', border: `1px solid ${sel ? '#4caf7d' : 'var(--border)'}` }}>
+                <input type="radio" name={`keep-${groupKey}`} checked={sel} onChange={() => setKeepId(m.id)} style={{ accentColor: '#4caf7d', flexShrink: 0 }} />
+                {m.thumbnail_path
+                  ? <img src={m.thumbnail_path} alt="" style={{ width: 40, height: 40, objectFit: 'cover', borderRadius: 4, flexShrink: 0, background: 'var(--bg3)' }} />
+                  : <div style={{ width: 40, height: 40, borderRadius: 4, background: 'var(--bg3)', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>🧩</div>}
+                <div style={{ minWidth: 0 }}>
+                  <div style={{ fontSize: 12, color: 'var(--text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{m.name}</div>
+                  <div style={{ fontSize: 10, color: 'var(--text-faint)', fontFamily: 'var(--font-mono)' }}>{m.creator_name || '?'} · {m.file_count || 0}f · {tagCount}t{m.thumbnail_path ? ' · 🖼' : ''}</div>
+                </div>
+              </label>
+            );
+          })}
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '4px 8px 8px', flexWrap: 'wrap' }}>
+          <button className="org-btn org-btn-success" disabled={busy}
+            onClick={() => resolveDup(groupKey, keepId, models.map(m => m.id))}>
+            {busy ? 'Merging…' : `✓ Keep selected · hide ${models.length - 1} other${models.length - 1 !== 1 ? 's' : ''}`}
+          </button>
+          <span style={{ fontSize: 10, color: 'var(--text-faint)' }}>Tags & collections fold into the kept model; the rest are hidden (not deleted).</span>
+        </div>
+      </div>
+    );
+  }
+
   function renderSection() {
     if (!data) return null;
     switch (activeSection) {
-      case 'crossCreator':
-        return !data.crossCreatorDupes || data.crossCreatorDupes.length === 0
-          ? <div className="org-empty">No cross-creator duplicates found 🎉</div>
-          : data.crossCreatorDupes.map((group, i) => (
-            <div key={i} className="org-dupe-pair">
-              <div className="org-dupe-score" style={{ color: '#5b9bd5' }}>
-                "{group.key}" — {group.models.length} copies across {new Set(group.models.map(m => m.creator_name)).size} creators
-              </div>
-              {group.models.map(m => (
-                <ModelRow key={m.id} m={m} extra={`${m.file_count} files`} onHide={() => {}} />
-              ))}
-            </div>
+      case 'crossCreator': {
+        const groups = (data.crossCreatorDupes || []).filter(g => !resolvedKeys.has(`xc-${g.key}`));
+        return groups.length === 0
+          ? <div className="org-empty">No cross-creator duplicates to resolve 🎉</div>
+          : groups.map(g => (
+            <DupGroup key={g.key} groupKey={`xc-${g.key}`} models={g.models}
+              label={`"${g.key}" — ${g.models.length} copies across ${new Set(g.models.map(m => m.creator_name)).size} creators`} />
           ));
-      case 'duplicates':
-        return data.duplicates.length === 0
-          ? <div className="org-empty">No similar-name pairs found 🎉</div>
-          : data.duplicates.map((pair, i) => (
-            <div key={i} className="org-dupe-pair">
-              <div className="org-dupe-score">{Math.round(pair.score * 100)}% similar</div>
-              <ModelRow m={pair.a} />
-              <div style={{ color: 'var(--text-faint)', fontSize: 11, padding: '0 12px' }}>vs</div>
-              <ModelRow m={pair.b} />
-            </div>
+      }
+      case 'duplicates': {
+        const pairs = (data.duplicates || []).filter(p => !resolvedKeys.has(`dup-${p.a.id}-${p.b.id}`));
+        return pairs.length === 0
+          ? <div className="org-empty">No similar-name pairs to resolve 🎉</div>
+          : pairs.map(p => (
+            <DupGroup key={`${p.a.id}-${p.b.id}`} groupKey={`dup-${p.a.id}-${p.b.id}`} models={[p.a, p.b]}
+              label={`${Math.round(p.score * 100)}% similar`} />
           ));
+      }
       case 'integrity':
         if (!integrityData) return (
           <div style={{ textAlign: 'center', padding: '20px 0' }}>
