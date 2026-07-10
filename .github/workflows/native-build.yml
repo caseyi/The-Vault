@@ -49,21 +49,27 @@ jobs:
       - name: Bundle Node 22 runtime (M2)
         shell: bash
         run: |
-          # Bundle the runner's already-installed Node 22 (from setup-node above).
-          # It's a current 22.x where node:sqlite is unflagged — pinning an older
-          # patch (e.g. 22.11) breaks because node:sqlite still needs a flag there.
+          # Download the LATEST v22 from nodejs.org. This gets both things right:
+          #  - it's Apple-notarized, so Gatekeeper runs it inside our unsigned app
+          #    (copying the runner's node + ad-hoc re-signing STRIPS notarization →
+          #    the app hangs forever when it spawns node);
+          #  - it's new enough that node:sqlite is unflagged (22.11 was too old).
+          # Do NOT re-sign the macOS binary — that would remove the notarization.
+          NODE_VERSION=$(curl -fsSL https://nodejs.org/dist/index.json | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{console.log(JSON.parse(d).find(r=>r.version.startsWith('v22.')).version)})")
+          echo "Using Node $NODE_VERSION"
           mkdir -p native/src-tauri/resources/node
-          NODE_BIN="$(command -v node)"
-          node --version
           case "${{ matrix.platform }}" in
             macos-latest)
-              cp "$NODE_BIN" native/src-tauri/resources/node/node
+              if [ "$(uname -m)" = "arm64" ]; then N=arm64; else N=x64; fi
+              curl -fsSL "https://nodejs.org/dist/$NODE_VERSION/node-$NODE_VERSION-darwin-$N.tar.gz" -o node.tgz
+              tar xzf node.tgz
+              cp "node-$NODE_VERSION-darwin-$N/bin/node" native/src-tauri/resources/node/node
               chmod +x native/src-tauri/resources/node/node
-              # Ad-hoc sign so macOS will execute it (arm64 requires a valid signature)
-              codesign --force --sign - native/src-tauri/resources/node/node
               ;;
             windows-latest)
-              cp "$NODE_BIN" native/src-tauri/resources/node/node.exe
+              curl -fsSL "https://nodejs.org/dist/$NODE_VERSION/node-$NODE_VERSION-win-x64.zip" -o node.zip
+              unzip -q node.zip
+              cp "node-$NODE_VERSION-win-x64/node.exe" native/src-tauri/resources/node/node.exe
               ;;
           esac
           ls -la native/src-tauri/resources/node
