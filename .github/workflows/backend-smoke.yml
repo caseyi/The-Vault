@@ -9,7 +9,7 @@ on:
     paths:
       - 'backend/**'
       - 'native/scripts/**'
-      - '.github/scripts/smoke-scan.sh'
+      - '.github/scripts/smoke-scan.js'
       - '.github/workflows/backend-smoke.yml'
   workflow_dispatch:
 
@@ -28,5 +28,4 @@ jobs:
       - name: Install backend production deps
         run: cd backend && npm install --omit=dev --no-audit --no-fund
       - name: Scan smoke test
-        shell: bash
-        run: bash .github/scripts/smoke-scan.sh
+        run: node .github/scripts/smoke-scan.js
