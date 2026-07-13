@@ -8,7 +8,23 @@ on:
   workflow_dispatch:
 
 jobs:
+  # Delete any existing release for this tag FIRST (keeping the tag), so the
+  # build always publishes fresh installers instead of leaving stale assets.
+  prepare-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Clear stale release for tag
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete "${{ github.ref_name }}" --yes --cleanup-tag=false --repo "$GITHUB_REPOSITORY" || echo "no existing release"
+
   build:
+    needs: prepare-release
     permissions:
       contents: write
     strategy:
