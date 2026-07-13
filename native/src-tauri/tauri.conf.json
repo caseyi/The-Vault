@@ -19,7 +19,8 @@
     "icon": ["icons/icon.png", "icons/icon.icns", "icons/icon.ico"],
     "resources": ["resources/**/*"],
     "macOS": {
-      "signingIdentity": "-"
+      "signingIdentity": "-",
+      "entitlements": "entitlements.plist"
     }
   }
 }
