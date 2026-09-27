@@ -459,6 +459,7 @@ describe('B15 scan status ring buffer + cancel (worker thread)', () => {
       await new Promise(r => setTimeout(r, 100));
     }
     // One assertion so a CI failure prints the whole picture.
+    expect(JSON.stringify({ err: st.summary && st.summary.error, tail: st.log.slice(-6).map(l => l.msg) })).toBe(JSON.stringify({ err: undefined, tail: st.log.slice(-6).map(l => l.msg) }));
     expect({ summary: st.summary, lines: st.log.length, truncated: st.truncated, tail: st.log.slice(-5).map(l => l.msg) })
       .toMatchObject({ summary: { success: true }, truncated: true });
     expect(st.log.length).toBeLessThanOrEqual(500);
