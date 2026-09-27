@@ -458,9 +458,10 @@ describe('B15 scan status ring buffer + cancel (worker thread)', () => {
       if (st.summary) break;
       await new Promise(r => setTimeout(r, 100));
     }
+    // One assertion so a CI failure prints the whole picture.
+    expect({ summary: st.summary, lines: st.log.length, truncated: st.truncated, tail: st.log.slice(-5).map(l => l.msg) })
+      .toMatchObject({ summary: { success: true }, truncated: true });
     expect(st.log.length).toBeLessThanOrEqual(500);
-    expect(st.truncated).toBe(true);
-    expect(st.summary.success).toBe(true);
   }, 30000);
 
   test('a cancelled scan never leaves a scan_log row stuck at running', async () => {
