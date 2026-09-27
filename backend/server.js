@@ -2076,10 +2076,11 @@ function startServer() {
   // Anything left 'running' from a previous process was interrupted.
   markRunningScans('interrupted', 'Server restarted during scan');
 
-  // Daily DB snapshot (startup if none today, then re-checked hourly)
-  try { require('./lib/backup').startDailyBackups({ db }); } catch (e) { console.error('[backup]', e.message); }
-
   const server = app.listen(PORT, HOST, () => console.log(`The Vault v${APP_VERSION.version} (build ${APP_VERSION.build}) running on ${HOST}:${PORT}`));
+
+  // Daily DB snapshot: first check 60s after start (never delays the
+  // healthcheck), then hourly; writes one file per day.
+  try { require('./lib/backup').startDailyBackups({ db, delayMs: 60 * 1000 }); } catch (e) { console.error('[backup]', e.message); }
 
   function shutdown(signal, code = 0) {
     if (shuttingDown) return;

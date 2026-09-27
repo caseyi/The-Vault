@@ -32,37 +32,41 @@ NAS update path).
   (`.github/workflows/native-build.yml`) building **unsigned** mac+win installers to a draft
   GitHub Release on `native-v*` tags. Ad-hoc signed (fixes "damaged"); see `native/README.md`.
 
-## After merging review/2026-09-hardening (DRAFT - lead to finalize)
+## After merging review/2026-09-hardening
 
 One-time, in this order:
 
-1. **Lockfiles**: commit `backend/package-lock.json`, `frontend/package-lock.json`,
-   `native/package-lock.json` and `native/src-tauri/Cargo.lock` (no longer gitignored;
-   Docker + CI use `npm ci`, and `setup-node` caching needs them).
-2. **Merge → watch CI**: `docker-publish.yml` must go green on the PR (tests, image
-   build, container boot + scan smoke) before merge; on `main` it pushes `latest` and
-   `sha-<7>`. No new secrets needed (uses `GITHUB_TOKEN`). Optional: enable Dependabot
-   in repo settings (config is in `.github/dependabot.yml`).
-3. **On Dagobah** (File Station, into the existing app folder - check which one first
-   with `sudo docker volume ls | grep vault_data`: the folder name must match the volume
-   prefix, e.g. `/volume1/docker/the-vault` ↔ `the-vault_vault_data`):
-   - upload the new `docker-compose.yml` and `update.sh` (keep the existing `.env`;
-     optionally add `TZ`, `BACKUP_KEEP`, `ORGANIZE_SSH_TARGET` from `.env.example`);
-   - run `sudo sh update.sh`. First run: it snapshots the DB via the *old* container
-     (copied out with `docker cp` since the old container has no `/backups` mount),
-     checks the volume, pulls, restarts, and prints the new `gitSha`.
-   - If it stops with "DIFFERENT data volume" / "NEW, EMPTY data volume": nothing was
-     changed; set `COMPOSE_PROJECT_NAME=<prefix of the volume with your data>` in `.env`
-     and re-run.
-4. **Verify**: sidebar shows version + commit; `backups/` contains
-   `vault-pre-update-*.db`; next day a `vault-YYYYMMDD.db` appears. Add
-   `/volume1/docker/the-vault` to Hyper Backup.
-5. **Cleanup (optional)**: `sudo docker rmi ghcr.io/caseyi/stlvault-backend:rollback
+1. **Watch CI on the PR**: `docker-publish.yml` must go green (tests, image build,
+   container boot + scan smoke) before merge. On `main` it pushes `latest` and
+   `sha-<7>`. No new secrets needed. Optional: enable Dependabot (`.github/dependabot.yml`).
+2. **Before uploading anything to Dagobah**: diff the NAS copy of `docker-compose.yml`
+   against the new one. Uncommented LIBRARY2 / SMB lines in the old file would be lost;
+   `docker-compose.override.yml` from add-library.sh is kept as is.
+3. **Check the volume name**: `sudo docker volume ls | grep vault_data`. The app folder
+   name must match the volume prefix (e.g. `/volume1/docker/the-vault` <-> `the-vault_vault_data`),
+   or set `COMPOSE_PROJECT_NAME=<prefix>` in `.env`.
+4. **Upload + update**: put the new `docker-compose.yml` and `update.sh` in that folder
+   (keep `.env`; optionally add `TZ`, `BACKUP_KEEP`, `ORGANIZE_SSH_TARGET` from
+   `.env.example`), then `sudo sh update.sh`. It snapshots the DB through the old
+   container, checks the volume, pulls, restarts and prints the new commit.
+   If it stops with "DIFFERENT data volume" or "NEW, EMPTY data volume", nothing was
+   changed: fix `COMPOSE_PROJECT_NAME` and re-run.
+5. **Verify**: sidebar shows version + commit; `backups/` has `vault-pre-update-*.db`;
+   about a minute after start a `vault-YYYYMMDD.db` appears. Add the app folder to Hyper Backup.
+6. **First scan**: a normal (non-forced) scan regroups variant folders (FDM/Resin/Supported)
+   into their parent model; the old "FDM"/"Resin" cards are hidden, not deleted, and
+   their tags/status/collections move to the parent. Spot-check a few creators.
+   Force-rescan is now safe (keeps renames and franchises, snapshots first) but is only
+   needed if grouping still looks wrong.
+7. **Cleanup (optional)**: `sudo docker rmi ghcr.io/caseyi/stlvault-backend:rollback
    ghcr.io/caseyi/stlvault-frontend:rollback` (old script's rollback tags).
-6. **Optional**: DSM Task Scheduler weekly `sh /volume1/docker/the-vault/update.sh` as
-   root (README → Updating).
-7. **Force-rescan** only if the library still shows mis-grouped creators (it now
-   snapshots the DB first).
+8. **Optional**: DSM Task Scheduler weekly `sh /volume1/docker/the-vault/update.sh` as root.
+
+Known follow-ups (not in this branch): desktop app thumbnails/STL preview need the
+`/images` URLs and three's `Request` fetches routed to the sidecar port (pre-existing);
+native app has no auto-restart if the backend exits; SSE endpoints still take the
+API key as `?key=` (kept out of nginx access logs; moving it to headers needs a
+fetch-stream rewrite); scan modal still mixes scan + AI settings; hash routing.
 
 ## Pending / next
 - **Native auto-update**: documented opt-in recipe in `native/README.md` (needs a one-time

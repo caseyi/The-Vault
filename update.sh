@@ -455,4 +455,8 @@ say "  done"
 say ""
 say "✓ The Vault is up:  http://<your-nas-ip>:$WEB_PORT"
 say "  Snapshots: $(pwd)/backups    Undo: sudo sh update.sh pre-update"
+if [ "$EFFECTIVE_TAG" != "latest" ]; then
+  say "  Note: pinned to '$EFFECTIVE_TAG' (VAULT_TAG in .env). Plain updates stay on it;"
+  say "        run  sudo sh update.sh latest  to follow new builds again."
+fi
 say ""

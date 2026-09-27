@@ -84,14 +84,19 @@ function prune({ log = console } = {}) {
 
 let timer = null;
 /** Take today's snapshot if missing, then re-check hourly (so a daily file appears every day). */
-function startDailyBackups({ db, log = console } = {}) {
+let firstTick = null;
+function startDailyBackups({ db, log = console, delayMs = 0 } = {}) {
   const tick = () => { if (!fs.existsSync(dailyFile())) snapshot('daily', { db, log }); };
-  tick();
+  // The server passes a delay so the first VACUUM INTO never runs before it is
+  // listening (a big DB on NAS disks would otherwise delay the healthcheck).
+  if (firstTick) clearTimeout(firstTick);
+  if (delayMs > 0) { firstTick = setTimeout(tick, delayMs); if (firstTick.unref) firstTick.unref(); }
+  else tick();
   if (timer) clearInterval(timer);
   timer = setInterval(tick, CHECK_MS);
   if (timer.unref) timer.unref();
   return timer;
 }
-function stopDailyBackups() { if (timer) clearInterval(timer); timer = null; }
+function stopDailyBackups() { if (timer) clearInterval(timer); if (firstTick) clearTimeout(firstTick); timer = null; firstTick = null; }
 
 module.exports = { snapshot, prune, startDailyBackups, stopDailyBackups, backupDir, dailyFile, DAY_MS };

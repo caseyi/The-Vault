@@ -2142,3 +2142,6 @@ input:focus-visible, textarea:focus-visible, select:focus-visible { outline-offs
 @media (max-width: 420px) {
   .size-toggle { display: none; }
 }
+
+/* Claude assistant typing dots (moved out of an inline <style> so a strict CSP allows it) */
+@keyframes pulse { 0%,100% { opacity:0.3; transform:scale(0.8); } 50% { opacity:1; transform:scale(1.1); } }

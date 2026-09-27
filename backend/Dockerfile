@@ -48,7 +48,7 @@ ENV NODE_ENV=production \
 
 EXPOSE 3001
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=3 \
   CMD wget -q -O /dev/null "http://127.0.0.1:${PORT}/api/health" || exit 1
 
 # --disable-warning hushes the node:sqlite "experimental" notice (inherited by the scan worker too)

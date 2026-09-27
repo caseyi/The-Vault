@@ -370,6 +370,27 @@ function containsPrintable(dir, depth) {
   return entries.some(e => e.isDirectory() && containsPrintable(path.join(dir, e.name), depth - 1));
 }
 
+/**
+ * A variant folder is "flat" when it holds the model's printables itself
+ * (Supported/*.stl), or only nested variant/media folders that do
+ * (Supported/STL/*.stl). A variant-named folder that instead holds OTHER
+ * sub-folders with printables (e.g. a Patreon release laid out as
+ * "Pre-Supported/<Model A>/", "Pre-Supported/<Model B>/") is a container of
+ * separate models and must never be merged into one card.
+ */
+function isFlatVariant(dir, depth = 2) {
+  const entries = listDir(dir);
+  const subdirs = entries.filter(e => e.isDirectory());
+  for (const sub of subdirs) {
+    const full = path.join(dir, sub.name);
+    const n = sub.name.trim();
+    if (MEDIA_DIR.test(n)) continue;
+    if (VARIANT_DIR.test(n) && depth > 0 && (isFlatVariant(full, depth - 1) || !containsPrintable(full, 3))) continue;
+    if (containsPrintable(full, 3)) return false; // holds an independent model folder
+  }
+  return true;
+}
+
 /** A generic "Files"/"STLs" folder that actually holds 3+ separate model folders. */
 function looksLikeModelContainer(dir) {
   const kids = listDir(dir).filter(e => e.isDirectory() && !VARIANT_DIR.test(e.name.trim()));
@@ -403,13 +424,11 @@ function classifyVariantContainer(dir, subdirs, overrides) {
   if (!hasVariantName) return { merge: false, absorbed: [] }; // plain category folder — cheap exit
   for (const { sub, name, full } of needsCheck) {
     if (MEDIA_DIR.test(name)) { absorbed.push(sub.name); continue; }
-    if (STRONG_VARIANT_DIR.test(name)) {
-      absorbed.push(sub.name);
-      if (containsPrintable(full, 3)) variantWithPrintables = true;
-      continue;
-    }
-    if (GENERIC_CONTAINER_DIR.test(name)) {
-      if (looksLikeModelContainer(full)) return { merge: false, absorbed: [] };
+    if (STRONG_VARIANT_DIR.test(name) || GENERIC_CONTAINER_DIR.test(name)) {
+      // A variant-named folder full of separate model folders is a container,
+      // not a variant: keep the old per-folder behaviour (recurse).
+      if (!isFlatVariant(full)) return { merge: false, absorbed: [] };
+      if (GENERIC_CONTAINER_DIR.test(name) && looksLikeModelContainer(full)) return { merge: false, absorbed: [] };
       absorbed.push(sub.name);
       if (containsPrintable(full, 3)) variantWithPrintables = true;
       continue;
@@ -459,8 +478,9 @@ function discoverModelFolders(rootDir, namePrefix, maxDepth, overrides) {
       for (const sub of subdirs) {
         const full = path.join(dir, sub.name);
         const n = sub.name.trim();
-        const isVariant = !ov.has(full) && (STRONG_VARIANT_DIR.test(n) || MEDIA_DIR.test(n) ||
-          (GENERIC_CONTAINER_DIR.test(n) && !looksLikeModelContainer(full)));
+        const isVariant = !ov.has(full) && (MEDIA_DIR.test(n) ||
+          (STRONG_VARIANT_DIR.test(n) && isFlatVariant(full)) ||
+          (GENERIC_CONTAINER_DIR.test(n) && isFlatVariant(full) && !looksLikeModelContainer(full)));
         if (isVariant) variantDirs.push(sub.name); else descend.push(sub);
       }
       results.push({ name, fullPath: dir, variantDirs });
@@ -525,7 +545,7 @@ const stmts = {
   // Stale models that sit INSIDE a variant sub-folder of a model (left over from
   // before variant folders were merged — e.g. a model called "Supported").
   staleUnder:    db.prepare(`
-    SELECT id, tags, is_favorite, print_status, notes FROM models
+    SELECT id, folder_path, tags, is_favorite, print_status, notes FROM models
     WHERE (folder_path = ? OR (folder_path > ? AND folder_path < ?))
       AND (hidden IS NULL OR hidden = 0)
   `),
@@ -634,7 +654,12 @@ function findStaleVariantModels(model) {
   for (const v of model.variantDirs) {
     const vp = path.join(model.fullPath, v);
     const [lo, hi] = nextPathBound(vp);
-    out.push(...stmts.staleUnder.all(vp, lo, hi));
+    // Only models sitting IN the variant folder or in nested variant/media
+    // folders (Supported/STL) are stale; anything else is a real model.
+    for (const row of stmts.staleUnder.all(vp, lo, hi)) {
+      const rest = path.relative(vp, row.folder_path);
+      if (rest === '' || rest.split(path.sep).every(seg => VARIANT_DIR.test(seg.trim()))) out.push(row);
+    }
   }
   return out;
 }

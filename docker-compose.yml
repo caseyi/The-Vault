@@ -34,7 +34,6 @@ services:
     restart: unless-stopped
     # Reap zombie processes (scan worker threads, unrar/zip helpers) and forward
     # SIGTERM so `docker compose stop` shuts the server down cleanly.
-    init: true
     volumes:
       # ── Primary library (a folder on THIS machine / local NAS volume) ────────
       # Set LIBRARY_HOST_PATH and LIBRARY_NAME in .env. It is mounted read-only
@@ -92,7 +91,7 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 30s
+      start_period: 120s
 
   frontend:
     image: ghcr.io/caseyi/stlvault-frontend:${VAULT_TAG:-latest}
