@@ -1,7 +1,11 @@
 import React from 'react';
-import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+import { render, screen, fireEvent, waitFor, act } from '@testing-library/react';
 import '@testing-library/jest-dom';
-import ModelDetail from './ModelDetail';
+import ModelDetail, { AUTOSAVE_DELAY } from './ModelDetail';
+
+const patchCalls = () => global.fetch.mock.calls.filter(([url, opts]) => url === '/api/models/42' && opts && opts.method === 'PATCH');
+const patchBodies = () => patchCalls().map(([, opts]) => JSON.parse(opts.body));
+const nameInput = () => screen.getByLabelText('Model name');
 
 // ── Mock child components that have their own complex dependencies ────────────
 
@@ -67,13 +71,13 @@ describe('ModelDetail', () => {
     render(<ModelDetail {...defaultProps} />);
     expect(screen.getByText(/Loading/)).toBeInTheDocument();
     await waitFor(() => {
-      expect(screen.getByText('Dragon Bust')).toBeInTheDocument();
+      expect(nameInput()).toHaveValue('Dragon Bust');
     });
   });
 
   test('shows back button that calls onBack', async () => {
     render(<ModelDetail {...defaultProps} />);
-    await waitFor(() => screen.getByText('Dragon Bust'));
+    await waitFor(() => nameInput());
     fireEvent.click(screen.getByText('← Back'));
     expect(defaultProps.onBack).toHaveBeenCalled();
   });
@@ -141,23 +145,16 @@ describe('ModelDetail', () => {
     });
   });
 
-  test('save button triggers PATCH and calls onSaved', async () => {
+  test('there is no manual Save button any more (edits autosave)', async () => {
     render(<ModelDetail {...defaultProps} />);
-    await waitFor(() => screen.getByText('Dragon Bust'));
-
-    fireEvent.click(screen.getByText('SAVE CHANGES'));
-
-    await waitFor(() => {
-      expect(global.fetch).toHaveBeenCalledWith(
-        '/api/models/42',
-        expect.objectContaining({ method: 'PATCH' })
-      );
-    });
+    await waitFor(() => nameInput());
+    expect(screen.queryByText('SAVE CHANGES')).not.toBeInTheDocument();
+    expect(screen.getByText('Changes save automatically.')).toBeInTheDocument();
   });
 
   test('Ask Claude button toggles assistant panel', async () => {
     render(<ModelDetail {...defaultProps} />);
-    await waitFor(() => screen.getByText('Dragon Bust'));
+    await waitFor(() => nameInput());
 
     expect(screen.queryByTestId('claude-assistant')).not.toBeInTheDocument();
     fireEvent.click(screen.getByText(/Ask Claude/));
@@ -166,9 +163,9 @@ describe('ModelDetail', () => {
 
   test('hide button toggles hidden state', async () => {
     render(<ModelDetail {...defaultProps} />);
-    await waitFor(() => screen.getByText('Dragon Bust'));
+    await waitFor(() => nameInput());
 
-    fireEvent.click(screen.getByText(/Hide/));
+    fireEvent.click(screen.getByText('🙈 Hide'));
 
     await waitFor(() => {
       expect(global.fetch).toHaveBeenCalledWith(
@@ -189,5 +186,94 @@ describe('ModelDetail', () => {
     await waitFor(() => {
       expect(screen.getByText('Model not found')).toBeInTheDocument();
     });
+  });
+});
+
+describe('ModelDetail autosave', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    global.fetch = jest.fn((url, opts) => {
+      if (opts && opts.method === 'PATCH') return Promise.resolve({ ok: true, json: () => Promise.resolve({ success: true }) });
+      if (url.includes('/detect-url')) return Promise.resolve({ ok: true, json: () => Promise.resolve({ url: null }) });
+      if (url.includes('/status-log') || url.includes('/tag-suggestions') || url.includes('/collections') || url === '/api/queue') {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve([]) });
+      }
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({ ...mockModel }) });
+    });
+  });
+  afterEach(() => { jest.useRealTimers(); });
+
+  test('status change saves immediately and shows "Saved"', async () => {
+    render(<ModelDetail {...defaultProps} />);
+    await waitFor(() => nameInput());
+    fireEvent.change(screen.getByDisplayValue('Unprinted'), { target: { value: 'sliced' } });
+    await waitFor(() => expect(patchBodies()).toContainEqual({ print_status: 'sliced' }));
+    expect(await screen.findByText('✓ Saved')).toBeInTheDocument();
+    expect(defaultProps.onSaved).toHaveBeenCalled();
+  });
+
+  test('adding and removing tags saves immediately', async () => {
+    render(<ModelDetail {...defaultProps} />);
+    await waitFor(() => nameInput());
+    const input = screen.getByLabelText('Tags');
+    fireEvent.change(input, { target: { value: 'Dragon' } });
+    fireEvent.keyDown(input, { key: 'Enter' });
+    await waitFor(() => expect(patchBodies()).toContainEqual({ tags: ['fantasy', 'bust', 'dragon'] }));
+    fireEvent.click(screen.getByRole('button', { name: 'Remove tag fantasy' }));
+    await waitFor(() => expect(patchBodies()).toContainEqual({ tags: ['bust', 'dragon'] }));
+  });
+
+  test('notes are debounced into one PATCH with the final text', async () => {
+    jest.useFakeTimers();
+    render(<ModelDetail {...defaultProps} />);
+    await act(async () => { await Promise.resolve(); });
+    await waitFor(() => nameInput());
+    const notes = screen.getByDisplayValue('Great detail');
+    fireEvent.change(notes, { target: { value: 'Great detail, 0.05mm' } });
+    act(() => { jest.advanceTimersByTime(300); });
+    fireEvent.change(notes, { target: { value: 'Great detail, 0.05mm layers' } });
+    expect(screen.getByText('Saving…')).toBeInTheDocument();
+    act(() => { jest.advanceTimersByTime(AUTOSAVE_DELAY - 50); });
+    expect(patchCalls()).toHaveLength(0);
+    await act(async () => { jest.advanceTimersByTime(100); });
+    expect(patchBodies()).toEqual([{ notes: 'Great detail, 0.05mm layers' }]);
+  });
+
+  test('Back flushes pending edits instead of dropping them', async () => {
+    render(<ModelDetail {...defaultProps} />);
+    await waitFor(() => nameInput());
+    fireEvent.change(screen.getByLabelText('Source URL'), { target: { value: 'https://www.printables.com/model/999' } });
+    fireEvent.click(screen.getByText('← Back'));
+    expect(defaultProps.onBack).toHaveBeenCalled();
+    await waitFor(() => expect(patchBodies()).toContainEqual({ source_url: 'https://www.printables.com/model/999' }));
+  });
+
+  test('unmounting with a pending edit sends it (keepalive)', async () => {
+    const { unmount } = render(<ModelDetail {...defaultProps} />);
+    await waitFor(() => nameInput());
+    fireEvent.change(nameInput(), { target: { value: 'Dragon Bust v2' } });
+    unmount();
+    const call = patchCalls().find(([, o]) => JSON.parse(o.body).name === 'Dragon Bust v2');
+    expect(call).toBeDefined();
+    expect(call[1].keepalive).toBe(true);
+  });
+
+  test('a failed save shows "Save failed – retry" and retry re-sends the edit', async () => {
+    let fail = true;
+    const base = global.fetch;
+    global.fetch = jest.fn((url, opts) => {
+      if (opts && opts.method === 'PATCH' && fail) {
+        return Promise.resolve({ ok: false, status: 500, json: () => Promise.resolve({ error: 'Database is locked' }) });
+      }
+      return base(url, opts);
+    });
+    render(<ModelDetail {...defaultProps} />);
+    await waitFor(() => nameInput());
+    fireEvent.change(screen.getByDisplayValue('Unprinted'), { target: { value: 'printed' } });
+    expect(await screen.findByText(/Save failed/)).toBeInTheDocument();
+    fail = false;
+    fireEvent.click(screen.getByRole('button', { name: 'retry' }));
+    expect(await screen.findByText('✓ Saved')).toBeInTheDocument();
+    expect(patchBodies().filter(b => b.print_status === 'printed')).toHaveLength(2);
   });
 });

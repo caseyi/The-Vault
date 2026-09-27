@@ -1,5 +1,23 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import TaskLog from './TaskLog';
+import Modal, { useUniqueId } from './Modal';
+
+const RECONNECT_BASE_MS = 1000;
+const RECONNECT_MAX_MS = 15000;
+const RECONNECT_MAX_TRIES = 12;
+const now = () => new Date().toISOString();
+
+async function fetchScanStatus(timeoutMs = 5000) {
+  const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  const t = setTimeout(() => controller && controller.abort(), timeoutMs);
+  try {
+    const res = await fetch('/api/scan/status', controller ? { signal: controller.signal } : undefined);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return await res.json();
+  } finally {
+    clearTimeout(t);
+  }
+}
 
 export default function ScanModal({ onClose, onScanComplete }) {
   const [path, setPath] = useState('/library');
@@ -18,7 +36,7 @@ export default function ScanModal({ onClose, onScanComplete }) {
   const [visionTagging, setVisionTagging] = useState(false);
   const visionEsRef = useRef(null);
   const [tagging, setTagging] = useState(false);
-  const [tagResult, setTagResult] = useState(null);
+  const [, setTagResult] = useState(null);
   const [findingImages, setFindingImages] = useState(false);
   const [apiKey, setApiKey] = useState(() => localStorage.getItem('claude_api_key') || '');
   const [showKey, setShowKey] = useState(false);
@@ -27,36 +45,106 @@ export default function ScanModal({ onClose, onScanComplete }) {
   const esRef = useRef(null);
   const imgEsRef = useRef(null);
 
-  // Connect (or reconnect) to the SSE stream
-  const connectToStream = useCallback(() => {
+  const [reconnecting, setReconnecting] = useState(false);
+  const reconnectTimer = useRef(null);
+  const reconnectTries = useRef(0);
+  const replaceOnNext = useRef(false); // server replays the whole log on reconnect
+  const unmounted = useRef(false);
+  const onScanCompleteRef = useRef(onScanComplete);
+  onScanCompleteRef.current = onScanComplete;
+  const titleId = useUniqueId('scan-title');
+
+  // Connect (or reconnect) to the SSE stream. If the stream drops while a scan
+  // is still running, poll /api/scan/status and reconnect with backoff; the
+  // server replays the log to late joiners, so the view catches up.
+  const connectToStream = useCallback(function connect() {
     if (esRef.current) esRef.current.close();
+    clearTimeout(reconnectTimer.current);
 
     const es = new EventSource('/api/scan/stream');
     esRef.current = es;
 
     es.onmessage = (e) => {
-      const data = JSON.parse(e.data);
+      let data;
+      try { data = JSON.parse(e.data); } catch { return; }
+      reconnectTries.current = 0;
+      setReconnecting(false);
       if (data.type === 'done') {
+        replaceOnNext.current = false;
         setSummary(data);
         setDone(true);
         setRunning(false);
         es.close();
-        if (onScanComplete) onScanComplete();
+        if (onScanCompleteRef.current) onScanCompleteRef.current();
       } else if (data.type === 'idle') {
         // No scan running and no results — just close stream
+        replaceOnNext.current = false;
         es.close();
         setRunning(false);
+      } else if (replaceOnNext.current) {
+        replaceOnNext.current = false;
+        setLines([data]);
       } else {
         setLines(l => [...l, data]);
       }
     };
 
-    es.onerror = () => {
-      setLines(l => [...l, { level: 'error', msg: 'Connection lost — scan may still be running.', ts: new Date().toISOString() }]);
-      setRunning(false);
+    es.onerror = async () => {
       es.close();
+      if (esRef.current !== es || unmounted.current) return;
+      let status = null;
+      try { status = await fetchScanStatus(); } catch { status = null; }
+      if (unmounted.current || esRef.current !== es) return;
+
+      if (status && !status.inProgress) {
+        // Finished while we were disconnected: show the final state
+        setReconnecting(false);
+        setRunning(false);
+        if (status.log) setLines(status.log);
+        if (status.summary) {
+          setSummary(status.summary);
+          setDone(true);
+          if (onScanCompleteRef.current) onScanCompleteRef.current();
+        }
+        return;
+      }
+
+      // Still running (or server too busy to answer): reconnect with backoff
+      const attempt = ++reconnectTries.current;
+      if (attempt > RECONNECT_MAX_TRIES) {
+        setReconnecting(false);
+        setRunning(false);
+        setLines(l => [...l, { level: 'error', msg: 'Lost connection to the scan progress stream. The scan may still be running — reopen this window to check.', ts: now() }]);
+        return;
+      }
+      setRunning(true);
+      setReconnecting(true);
+      const delay = Math.min(RECONNECT_MAX_MS, RECONNECT_BASE_MS * 2 ** (attempt - 1));
+      reconnectTimer.current = setTimeout(() => {
+        if (unmounted.current) return;
+        replaceOnNext.current = true;
+        connect();
+      }, delay);
     };
-  }, [onScanComplete]);
+  }, []);
+
+  useEffect(() => () => { unmounted.current = true; clearTimeout(reconnectTimer.current); }, []);
+
+  // Attach to a scan that is already running (e.g. POST /api/scan returned 409)
+  const attachToRunningScan = useCallback(async () => {
+    try {
+      const status = await fetchScanStatus();
+      if (status.log) setLines(status.log);
+      if (!status.inProgress) {
+        setRunning(false);
+        if (status.summary) { setSummary(status.summary); setDone(true); }
+        return;
+      }
+    } catch { /* stream below will retry */ }
+    setRunning(true);
+    setLines(l => [...l, { level: 'info', msg: 'A scan is already running — showing its progress.', ts: now() }]);
+    connectToStream();
+  }, [connectToStream]);
 
   // On mount: check if a scan is already running and reconnect.
   // A scan in progress can keep the server busy, so time the status check out
@@ -162,6 +250,10 @@ export default function ScanModal({ onClose, onScanComplete }) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ path, force }),
       });
+      if (res.status === 409) {
+        await attachToRunningScan();
+        return;
+      }
       if (!res.ok) {
         const err = await res.json().catch(() => ({ error: 'Scan request failed' }));
         setLines(l => [...l, { level: 'error', msg: err.error || 'Failed to start scan', ts: new Date().toISOString() }]);
@@ -289,23 +381,23 @@ export default function ScanModal({ onClose, onScanComplete }) {
   // Cleanup SSE connections on unmount
   useEffect(() => () => { imgEsRef.current?.close(); tagEsRef.current?.close(); visionEsRef.current?.close(); }, []);
 
+  const busyAi = tagging || findingImages || visionTagging;
+
   if (checking) {
     return (
-      <div className="modal-overlay">
-        <div className="modal" style={{ width: 580 }}>
-          <div className="modal-title">SCAN LIBRARY</div>
-          <div style={{ padding: '24px 0', textAlign: 'center', color: 'var(--text-muted)', fontSize: 12, fontFamily: 'var(--font-mono)' }}>
-            Checking scan status…
-          </div>
+      <Modal onClose={onClose} labelledBy={titleId} className="modal modal-wide">
+        <div className="modal-title" id={titleId}>SCAN LIBRARY</div>
+        <div style={{ padding: '24px 0', textAlign: 'center', color: 'var(--text-muted)', fontSize: 12, fontFamily: 'var(--font-mono)' }}>
+          Checking scan status…
         </div>
-      </div>
+      </Modal>
     );
   }
 
   return (
-    <div className="modal-overlay" onClick={e => { if (e.target === e.currentTarget && !tagging && !findingImages && !visionTagging) onClose(); }}>
-      <div className="modal" style={{ width: 580 }}>
-        <div className="modal-title">SCAN LIBRARY</div>
+    <Modal onClose={onClose} labelledBy={titleId} className="modal modal-wide"
+      closeOnBackdrop={!busyAi} closeOnEscape={!busyAi}>
+        <div className="modal-title" id={titleId}>SCAN LIBRARY</div>
         <div className="modal-subtitle">Index your NAS folder to discover models and extract images</div>
         <div className="modal-hint" style={{ marginTop: 4 }}>
           Scans run on the server — you can close this window and the scan keeps going.
@@ -334,36 +426,25 @@ export default function ScanModal({ onClose, onScanComplete }) {
                     </span>
                     {libraryPath && (
                       <button onClick={() => setPath(libraryPath)} disabled={running}
-                        title={`Scan everything under ${libraryPath}`}
-                        style={{
-                          background: scanningAll ? 'rgba(193,127,58,0.18)' : 'var(--bg3)',
-                          border: `1px solid ${scanningAll ? 'var(--accent)' : 'var(--border)'}`,
-                          color: scanningAll ? 'var(--accent)' : 'var(--text-muted)',
-                          borderRadius: 4, padding: '3px 9px', cursor: 'pointer', fontSize: 11, fontFamily: 'var(--font-body)',
-                        }}>
+                        title={`Scan everything under ${libraryPath}`} aria-pressed={scanningAll}
+                        className={`root-chip ${scanningAll ? 'active' : ''}`} style={{ fontSize: 11, padding: '3px 9px' }}>
                         ⬚ Entire library
                       </button>
                     )}
                   </div>
                   {roots.length > 10 && (
                     <input className="modal-input" value={rootFilter} onChange={e => setRootFilter(e.target.value)}
-                      placeholder={`Filter ${roots.length} folders…`} style={{ marginBottom: 6 }} />
+                      aria-label="Filter folders" placeholder={`Filter ${roots.length} folders…`} style={{ marginBottom: 6 }} />
                   )}
-                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, maxHeight: 132, overflowY: 'auto', padding: 6, border: '1px solid var(--border)', borderRadius: 6, background: 'var(--bg)' }}>
+                  <div className="root-list">
                     {shown.slice(0, 400).map(r => (
                       <button
                         key={r.path}
                         onClick={() => setPath(r.path)}
                         disabled={running || !r.accessible}
                         title={r.accessible ? `Scan only ${r.path}` : `Not readable: ${r.path}`}
-                        style={{
-                          display: 'inline-flex', alignItems: 'center', gap: 6,
-                          background: path === r.path ? 'rgba(193,127,58,0.18)' : 'var(--bg3)',
-                          border: `1px solid ${path === r.path ? 'var(--accent)' : 'var(--border)'}`,
-                          borderRadius: 4, padding: '4px 9px', cursor: r.accessible ? 'pointer' : 'not-allowed',
-                          color: path === r.path ? 'var(--accent)' : 'var(--text-muted)',
-                          fontSize: 12, fontFamily: 'var(--font-body)', maxWidth: '100%',
-                        }}>
+                        aria-pressed={path === r.path}
+                        className={`root-chip ${path === r.path ? 'active' : ''}`}>
                         <span style={{ opacity: 0.85, flexShrink: 0 }}>{r.accessible ? '🗂' : '⚠'}</span>
                         <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{r.name}</span>
                         <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--text-faint)', flexShrink: 0 }}>{r.modelCount}</span>
@@ -386,8 +467,10 @@ export default function ScanModal({ onClose, onScanComplete }) {
           onChange={e => setPath(e.target.value)}
           placeholder="/library"
           disabled={running}
+          aria-label="Folder to scan"
+          aria-describedby="scan-path-hint"
         />
-        <div className="modal-hint">
+        <div className="modal-hint" id="scan-path-hint">
           The folder that will be scanned. Set it above, or edit directly.
         </div>
 
@@ -415,6 +498,8 @@ export default function ScanModal({ onClose, onScanComplete }) {
               value={apiKey}
               onChange={e => { setApiKey(e.target.value); localStorage.setItem('claude_api_key', e.target.value); }}
               placeholder="sk-ant-... (Claude API key for AI features)"
+              aria-label="Claude API key"
+              autoComplete="off"
             />
             <button
               onClick={() => setShowKey(s => !s)}
@@ -424,6 +509,8 @@ export default function ScanModal({ onClose, onScanComplete }) {
                 color: 'var(--text-faint)', fontSize: 13,
               }}
               title={showKey ? 'Hide key' : 'Show key'}
+              aria-label={showKey ? 'Hide API key' : 'Show API key'}
+              aria-pressed={showKey}
             >
               {showKey ? '◉' : '○'}
             </button>
@@ -432,13 +519,7 @@ export default function ScanModal({ onClose, onScanComplete }) {
             <button
               onClick={testApiKey}
               disabled={testingKey}
-              style={{
-                background: keyStatus === 'ok' ? 'rgba(76,175,125,0.15)' : keyStatus === 'error' ? 'rgba(207,114,114,0.15)' : 'rgba(255,255,255,0.05)',
-                border: `1px solid ${keyStatus === 'ok' ? 'rgba(76,175,125,0.4)' : keyStatus === 'error' ? 'rgba(207,114,114,0.4)' : 'rgba(255,255,255,0.1)'}`,
-                color: keyStatus === 'ok' ? 'var(--green)' : keyStatus === 'error' ? 'var(--red)' : 'var(--text-muted)',
-                fontSize: 10, fontFamily: 'var(--font-mono)', padding: '4px 8px',
-                borderRadius: 4, cursor: 'pointer', whiteSpace: 'nowrap',
-              }}
+              className={`key-test-btn ${keyStatus || ''}`}
               title="Test your API key against the Claude API"
             >
               {testingKey ? '…' : keyStatus === 'ok' ? '✓ works' : keyStatus === 'error' ? '✗ failed' : 'Test'}
@@ -457,11 +538,12 @@ export default function ScanModal({ onClose, onScanComplete }) {
 
         {/* AI model + cost estimate */}
         <div style={{ marginTop: 12, display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-          <span style={{ fontSize: 10, fontFamily: 'var(--font-mono)', color: 'var(--text-faint)', letterSpacing: 1 }}>AI MODEL</span>
+          <label htmlFor="scan-ai-model" style={{ fontSize: 10, fontFamily: 'var(--font-mono)', color: 'var(--text-faint)', letterSpacing: 1 }}>AI MODEL</label>
           <select
+            id="scan-ai-model"
             value={aiModel}
             onChange={e => { setAiModel(e.target.value); localStorage.setItem('vault_ai_model', e.target.value); setEstimate(null); }}
-            style={{ background: 'var(--bg3)', border: '1px solid var(--border)', borderRadius: 4, color: 'var(--text)', padding: '5px 8px', fontSize: 11, fontFamily: 'var(--font-mono)', outline: 'none' }}
+            style={{ background: 'var(--bg3)', border: '1px solid var(--border)', borderRadius: 4, color: 'var(--text)', padding: '5px 8px', fontSize: 11, fontFamily: 'var(--font-mono)' }}
           >
             {aiModels.length === 0 && <option value="">(default)</option>}
             {aiModels.map(m => <option key={m.id} value={m.id}>{m.label}</option>)}
@@ -478,73 +560,67 @@ export default function ScanModal({ onClose, onScanComplete }) {
           )}
         </div>
 
+        {reconnecting && (
+          <div className="scan-reconnecting" role="status">
+            <span className="spinner" style={{ width: 12, height: 12 }} /> Reconnecting to the running scan…
+          </div>
+        )}
         <div style={{ marginTop: 14 }}>
           <TaskLog lines={lines} running={running} title="SCAN LOG" height={240} />
         </div>
 
         {done && summary && (
-          <div style={{
-            marginTop: 12, padding: '10px 14px',
-            background: summary.success ? 'rgba(76,175,125,0.08)' : 'rgba(207,114,114,0.08)',
-            border: `1px solid ${summary.success ? 'rgba(76,175,125,0.3)' : 'rgba(207,114,114,0.3)'}`,
-            borderRadius: 6, fontSize: 12,
-            color: summary.success ? 'var(--green)' : 'var(--red)',
-            fontFamily: 'var(--font-mono)',
-          }}>
+          <div className={`scan-summary ${summary.success ? 'ok' : 'fail'}`} role="status">
             {summary.success
               ? `✓ Complete — ${summary.modelsFound} found · ${summary.modelsAdded} added · ${summary.modelsUpdated} updated · ${summary.modelsSkipped ?? 0} skipped`
               : `✗ Error — ${summary.error}`}
           </div>
         )}
 
-        <div className="modal-actions" style={{ marginTop: 16, flexWrap: 'wrap' }}>
+        <div className="modal-actions" style={{ flexWrap: 'wrap' }}>
           <button className="btn-cancel" onClick={onClose} disabled={tagging || findingImages || visionTagging}
             title={running ? 'Hide this window — the scan keeps running in the background' : undefined}>
             {running ? '▸ Minimize (keep scanning)' : done ? 'Close' : 'Cancel'}
           </button>
           {running && (
-            <button className="btn-cancel" onClick={cancelScan}
-              style={{ borderColor: 'rgba(207,114,114,0.5)', color: '#cf7272' }}
+            <button onClick={cancelScan}
+              className="btn-cancel btn-stop"
               title="Stop the running scan">
               ■ Stop Scan
             </button>
           )}
           <button className="btn-primary" onClick={() => { setDone(false); startScan(); }} disabled={running || tagging || findingImages || visionTagging}>
-            {running ? 'Scanning…' : done ? 'Rescan' : 'Start Scan'}
+            {reconnecting ? 'Reconnecting…' : running ? 'Scanning…' : done ? 'Rescan' : 'Start Scan'}
           </button>
           <button
-            className="btn-primary"
             onClick={generateTags}
             disabled={running || tagging || findingImages || visionTagging || !apiKey}
-            style={{ background: tagging ? 'var(--bg-card)' : 'rgba(155,114,207,0.15)', color: '#9b72cf', border: '1px solid rgba(155,114,207,0.3)', opacity: !apiKey ? 0.5 : 1 }}
+            className="btn-primary btn-ai btn-ai-purple"
             title={apiKey ? 'Uses Claude API credits — auto-generate tags for all models from names, creators, and folder structure' : 'Add a Claude API key above to enable'}
           >
             {tagging ? 'Tagging…' : '$ Generate Tags'}
           </button>
           <button
-            className="btn-primary"
             onClick={() => visionTags(true)}
             disabled={running || tagging || findingImages || visionTagging || !apiKey}
-            style={{ background: visionTagging ? 'var(--bg-card)' : 'rgba(155,114,207,0.15)', color: '#9b72cf', border: '1px solid rgba(155,114,207,0.3)', opacity: !apiKey ? 0.5 : 1 }}
+            className="btn-primary btn-ai btn-ai-purple"
             title={apiKey ? 'Uses Claude API credits (vision — costs more) — analyses each render image to identify and tag the model' : 'Add a Claude API key above to enable'}
           >
             {visionTagging ? 'Looking…' : '$ 👁 Tags from Images (trial 10)'}
           </button>
           <button
-            className="btn-primary"
             onClick={() => findImages(true)}
             disabled={running || tagging || findingImages || visionTagging || !apiKey}
-            style={{ background: findingImages ? 'var(--bg-card)' : 'rgba(91,155,213,0.15)', color: '#5b9bd5', border: '1px solid rgba(91,155,213,0.3)', opacity: !apiKey ? 0.5 : 1 }}
+            className="btn-primary btn-ai btn-ai-blue"
             title={apiKey ? 'Uses Claude API credits — finds missing thumbnails online (trial: 10 best candidates first)' : 'Add a Claude API key above to enable'}
           >
             {findingImages ? 'Finding…' : '$ Find Images (trial 10)'}
           </button>
           {imgResult && imgResult.remaining > 0 && (
             <button
-              className="btn-primary"
               onClick={() => findImages(false)}
               disabled={running || tagging || findingImages || visionTagging || !apiKey}
-              style={{ background: 'rgba(91,155,213,0.25)', color: '#5b9bd5', border: '1px solid rgba(91,155,213,0.4)', opacity: !apiKey ? 0.5 : 1 }}
+              className="btn-primary btn-ai btn-ai-blue strong"
               title={apiKey ? `Uses Claude API credits — process all ${imgResult.remaining} remaining models` : 'Add a Claude API key above to enable'}
             >
               $ Continue All ({imgResult.remaining})
@@ -554,7 +630,6 @@ export default function ScanModal({ onClose, onScanComplete }) {
             <button className="btn-primary" onClick={onClose}>View Results</button>
           )}
         </div>
-      </div>
-    </div>
+    </Modal>
   );
 }

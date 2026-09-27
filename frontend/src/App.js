@@ -6,16 +6,53 @@ import Wishlist from './pages/Wishlist';
 import Sidebar from './components/Sidebar';
 import ScanModal from './components/ScanModal';
 import OrganizeModal from './components/OrganizeModal';
+import Modal, { useUniqueId } from './components/Modal';
+import { NoticeProvider, useNotify } from './components/Notices';
+import { EMPTY_FILTERS } from './filters';
 import './App.css';
 
 const API = '';
+const MOBILE_QUERY = '(max-width: 768px)';
+
+// Native desktop builds inject one of these; the Docker/browser build has neither.
+export function isNativeApp() {
+  return typeof window !== 'undefined' && !!(window.__TAURI__ || window.__VAULT_API__);
+}
+
+function useMediaQuery(query) {
+  const get = () => (typeof window !== 'undefined' && window.matchMedia ? window.matchMedia(query).matches : false);
+  const [matches, setMatches] = useState(get);
+  useEffect(() => {
+    if (!window.matchMedia) return undefined;
+    const mql = window.matchMedia(query);
+    const onChange = () => setMatches(mql.matches);
+    onChange();
+    if (mql.addEventListener) mql.addEventListener('change', onChange);
+    else if (mql.addListener) mql.addListener(onChange);
+    return () => {
+      if (mql.removeEventListener) mql.removeEventListener('change', onChange);
+      else if (mql.removeListener) mql.removeListener(onChange);
+    };
+  }, [query]);
+  return matches;
+}
 
 export default function App() {
+  return (
+    <NoticeProvider>
+      <VaultApp />
+    </NoticeProvider>
+  );
+}
+
+function VaultApp() {
+  const notify = useNotify();
+  const onboardingTitleId = useUniqueId('onboarding-title');
   const [view, setView] = useState('gallery');
   const [selectedModel, setSelectedModel] = useState(null);
   const [stats, setStats] = useState(null);
   const [creators, setCreators] = useState([]);
-  const [filters, setFilters] = useState({ search: '', creator: '', status: '', tags: '', franchise: '', collection: '', folder: '', has_thumbnail: false, recently_added: false, favorite: false })
+  const [filters, setFilters] = useState(() => ({ ...EMPTY_FILTERS }));
   const [tags, setTags] = useState([]);
   const [folderTree, setFolderTree] = useState(null);
   const [density, setDensity] = useState(() => {
@@ -40,8 +77,11 @@ export default function App() {
   const [showScan, setShowScan] = useState(false);
   const [showOrganize, setShowOrganize] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
+  const isMobile = useMediaQuery(MOBILE_QUERY);
+  const [drawerOpen, setDrawerOpen] = useState(false);
   const [showHidden, setShowHidden] = useState(false);
   const [appVersion, setAppVersion] = useState(null);
+  const [health, setHealth] = useState(null);
   const [refreshKey, setRefreshKey] = useState(0);
   const [queueCount, setQueueCount] = useState(0);
   const [wishlistCount, setWishlistCount] = useState(0);
@@ -50,7 +90,6 @@ export default function App() {
     try { return JSON.parse(localStorage.getItem('vault_recently_viewed') || '[]'); } catch { return []; }
   });
   const [scanStatus, setScanStatus] = useState({ inProgress: false, count: 0, last: '' });
-  const [scanToast, setScanToast] = useState(null);
   const scanWasRunning = useRef(false);
   const [onboarded, setOnboarded] = useState(() => {
     try { return localStorage.getItem('vault_onboarded') === '1'; } catch { return true; }
@@ -74,7 +113,10 @@ export default function App() {
 
   useEffect(() => {
     fetch(`${API}/api/health`).then(r => r.json())
-      .then(d => setAppVersion(d.version ? `${d.version}.${d.build}` : null))
+      .then(d => {
+        setHealth(d || null);
+        setAppVersion(d && d.version ? `${d.version}${d.build != null && d.build !== '' ? `.${d.build}` : ''}` : null);
+      })
       .catch(() => {});
   }, []);
 
@@ -101,10 +143,11 @@ export default function App() {
           fetchStats();
           setRefreshKey(k => k + 1);
           if (s.summary) {
-            setScanToast(s.summary.success
-              ? `✓ Scan complete — ${s.summary.modelsAdded ?? 0} added, ${s.summary.modelsFound ?? 0} found`
-              : `✗ Scan failed: ${s.summary.error || 'unknown error'}`);
-            setTimeout(() => setScanToast(null), 7000);
+            if (s.summary.success) {
+              notify(`✓ Scan complete — ${s.summary.modelsAdded ?? 0} added, ${s.summary.modelsFound ?? 0} found`, { type: 'success', duration: 7000 });
+            } else {
+              notify(`✗ Scan failed: ${s.summary.error || 'unknown error'}`, { type: 'error', duration: 10000 });
+            }
           }
         }
         scanWasRunning.current = s.inProgress;
@@ -113,7 +156,7 @@ export default function App() {
     poll();
     const id = setInterval(poll, 3500);
     return () => { active = false; clearInterval(id); };
-  }, [fetchStats]);
+  }, [fetchStats, notify]);
 
   // Auto-open scan modal if a scan is already in progress on page load
   useEffect(() => {
@@ -123,7 +166,10 @@ export default function App() {
       .catch(() => {});
   }, []);
 
+  const closeDrawer = () => setDrawerOpen(false);
+
   const openModel = (model) => {
+    closeDrawer();
     setSelectedModel(model);
     setView('detail');
     // Track recently viewed (store minimal info for sidebar display)
@@ -136,33 +182,53 @@ export default function App() {
     });
   };
   const closeModel = () => { setSelectedModel(null); setView('gallery'); };
-  const openQueue = () => { setSelectedModel(null); setView('queue'); };
-  const openWishlist = () => { setSelectedModel(null); setView('wishlist'); };
+  // Logo / "Gallery" click: back to the unfiltered gallery
+  const goHome = () => { closeDrawer(); setFilters({ ...EMPTY_FILTERS }); setShowHidden(false); closeModel(); };
+  const openQueue = () => { closeDrawer(); setSelectedModel(null); setView('queue'); };
+  const openWishlist = () => { closeDrawer(); setSelectedModel(null); setView('wishlist'); };
+  const openScan = () => { closeDrawer(); setShowScan(true); };
+  const openOrganize = () => { closeDrawer(); setShowOrganize(true); };
+
+  const sidebarExpanded = isMobile ? true : sidebarOpen;
+  const appClass = [
+    'app',
+    sidebarExpanded ? 'sidebar-open' : 'sidebar-closed',
+    `density-${density}`,
+    isMobile ? 'is-mobile' : '',
+    isMobile && drawerOpen ? 'drawer-open' : '',
+  ].filter(Boolean).join(' ');
 
   return (
-    <div className={`app ${sidebarOpen ? 'sidebar-open' : 'sidebar-closed'} density-${density}`}>
+    <div className={appClass}>
+      {isMobile && (
+        <button className="mobile-menu-btn" onClick={() => setDrawerOpen(true)} aria-label="Open menu"
+          aria-expanded={drawerOpen} aria-controls="app-sidebar">☰</button>
+      )}
+      {isMobile && drawerOpen && <div className="drawer-backdrop" onClick={closeDrawer} aria-hidden="true" />}
       <Sidebar
-        open={sidebarOpen}
-        onToggle={() => setSidebarOpen(o => !o)}
+        open={sidebarExpanded}
+        isMobile={isMobile}
+        onToggle={() => (isMobile ? closeDrawer() : setSidebarOpen(o => !o))}
         stats={stats}
         creators={creators}
         tags={tags}
         filters={filters}
         onFilterChange={setFilters}
-        onScanClick={() => setShowScan(true)}
-        onOrganizeClick={() => setShowOrganize(true)}
-        onHomeClick={closeModel}
+        onScanClick={openScan}
+        onOrganizeClick={openOrganize}
+        onHomeClick={goHome}
         showHidden={showHidden}
         onToggleHidden={() => setShowHidden(h => !h)}
         appVersion={appVersion}
-        onRescanCreator={() => setShowScan(true)}
+        gitSha={health?.gitSha}
+        onRescanCreator={openScan}
         franchises={stats?.franchises || []}
         collections={collections}
         queueCount={queueCount}
         onQueueClick={openQueue}
         onWishlistClick={openWishlist}
         wishlistCount={wishlistCount}
-        onCollectionClick={(id) => { setFilters(f => ({ ...f, collection: id })); setView('gallery'); }}
+        onCollectionClick={(id) => { closeDrawer(); setFilters(f => ({ ...f, collection: id })); setView('gallery'); }}
         onCollectionsChange={fetchCollections}
         recentlyViewed={recentlyViewed}
         onRecentClick={openModel}
@@ -177,13 +243,15 @@ export default function App() {
         scanCount={scanStatus.count}
         scanLast={scanStatus.last}
       />
-      <main className="main-content">
+      <main className="main-content" inert={isMobile && drawerOpen ? '' : undefined}>
         {view === 'gallery' && (
           <Gallery
             filters={filters}
             onFilterChange={setFilters}
             onModelClick={openModel}
             showHidden={showHidden}
+            onToggleHidden={() => setShowHidden(h => !h)}
+            onScanClick={openScan}
             onRefreshStats={fetchStats}
             refreshKey={refreshKey}
             collections={collections}
@@ -222,45 +290,31 @@ export default function App() {
       {showOrganize && (
         <OrganizeModal
           onClose={() => { setShowOrganize(false); fetchStats(); }}
+          libraryWritable={health ? health.libraryWritable : undefined}
+          libraryPath={health?.libraryPath}
         />
       )}
 
       {/* First-run onboarding (shown once, when the library is empty) */}
       {!onboarded && stats && (stats.total || 0) === 0 && !scanStatus.inProgress && (
-        <div className="modal-overlay" onClick={e => { if (e.target === e.currentTarget) dismissOnboarding(); }}>
-          <div className="modal" style={{ width: 460, textAlign: 'center' }}>
-            <div style={{ fontSize: 40, marginBottom: 6 }}>🗃️</div>
-            <div className="modal-title" style={{ textAlign: 'center' }}>WELCOME TO THE VAULT</div>
-            <div className="modal-subtitle" style={{ textAlign: 'center' }}>Your self-hosted 3D-print library. Three quick things:</div>
-            <div style={{ textAlign: 'left', margin: '14px auto', maxWidth: 380, display: 'flex', flexDirection: 'column', gap: 10, fontSize: 13, color: 'var(--text-muted)' }}>
-              <div><b style={{ color: 'var(--accent)' }}>1. Scan</b> &nbsp;Point it at your prints folder to index models and pull preview images.</div>
-              <div><b style={{ color: 'var(--accent)' }}>2. Organize</b> &nbsp;Browse by folder, creator, tags, favorites ⭐, and collections.</div>
-              <div><b style={{ color: 'var(--accent)' }}>3. AI (optional)</b> &nbsp;Add a Claude API key for auto-tagging and finding thumbnails.</div>
-            </div>
-            <div className="modal-actions" style={{ justifyContent: 'center', marginTop: 8 }}>
-              <button className="btn-cancel" onClick={dismissOnboarding}>Skip</button>
-              <button className="btn-primary" onClick={() => { dismissOnboarding(); setShowScan(true); }}>⟳ Scan your library</button>
-            </div>
+        <Modal onClose={dismissOnboarding} labelledBy={onboardingTitleId} className="modal onboarding-modal">
+          <div style={{ fontSize: 40, marginBottom: 6 }} aria-hidden="true">🗃️</div>
+          <div className="modal-title" id={onboardingTitleId} style={{ textAlign: 'center' }}>WELCOME TO THE VAULT</div>
+          <div className="modal-subtitle" style={{ textAlign: 'center' }}>Your self-hosted 3D-print library. Three quick things:</div>
+          <div className="onboarding-steps">
+            {isNativeApp() ? (
+              <div><b>1. Scan</b> &nbsp;Point it at your prints folder to index models and pull preview images.</div>
+            ) : (
+              <div><b>1. Scan</b> &nbsp;Your library folder (set in docker-compose / <code>.env</code>) is ready to scan — indexing pulls in models and preview images.</div>
+            )}
+            <div><b>2. Organize</b> &nbsp;Browse by folder, creator, tags, favorites ⭐, and collections.</div>
+            <div><b>3. AI (optional)</b> &nbsp;Add a Claude API key for auto-tagging and finding thumbnails.</div>
           </div>
-        </div>
-      )}
-
-      {/* Background-scan toast (completion) */}
-      {scanToast && (
-        <div
-          onClick={() => setScanToast(null)}
-          style={{
-            position: 'fixed', bottom: 20, right: 20, zIndex: 500,
-            background: 'var(--bg2)', border: '1px solid var(--border-bright)',
-            borderLeft: '3px solid var(--accent)', borderRadius: 8,
-            padding: '12px 16px', maxWidth: 320, cursor: 'pointer',
-            boxShadow: '0 8px 28px rgba(0,0,0,0.5)',
-            fontSize: 13, color: 'var(--text)', fontFamily: 'var(--font-body)',
-          }}
-          title="Dismiss"
-        >
-          {scanToast}
-        </div>
+          <div className="modal-actions" style={{ justifyContent: 'center', marginTop: 8 }}>
+            <button className="btn-cancel" onClick={dismissOnboarding}>Skip</button>
+            <button className="btn-primary" onClick={() => { dismissOnboarding(); setShowScan(true); }}>⟳ Scan your library</button>
+          </div>
+        </Modal>
       )}
     </div>
   );

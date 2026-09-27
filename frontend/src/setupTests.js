@@ -11,7 +11,6 @@ global.fetch = jest.fn(() =>
 
 // Mock IntersectionObserver (used by lazy-loading images)
 global.IntersectionObserver = class {
-  constructor() {}
   observe() {}
   unobserve() {}
   disconnect() {}
