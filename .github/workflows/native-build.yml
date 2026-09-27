@@ -1,32 +1,27 @@
 name: Native build (macOS + Windows)
 
-# Builds the Tauri desktop app for both OSes from one source and attaches the
-# (unsigned) installers to a draft GitHub Release. Tag with `native-vX.Y.Z`.
+# Builds the Tauri desktop app for both OSes from one source.
+#   native-vX.Y.Z tag  → app version X.Y.Z, installers attached to a DRAFT
+#                        GitHub Release for that tag (created once, re-runs
+#                        upload into the same release; nothing is deleted).
+#   workflow_dispatch  → version 0.0.0-dev+<sha>, installers kept as workflow
+#                        artifacts only (no release).
 on:
   push:
     tags: ["native-v*"]
   workflow_dispatch:
 
-jobs:
-  # Delete any existing release for this tag FIRST (keeping the tag), so the
-  # build always publishes fresh installers instead of leaving stale assets.
-  prepare-release:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
-      - name: Clear stale release for tag
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh release delete "${{ github.ref_name }}" --yes --cleanup-tag=false --repo "$GITHUB_REPOSITORY" || echo "no existing release"
+concurrency:
+  group: native-build-${{ github.ref }}
+  cancel-in-progress: true
 
+permissions:
+  contents: read
+
+jobs:
   build:
-    needs: prepare-release
     permissions:
-      contents: write
+      contents: write   # draft release upload (tag builds only)
     strategy:
       fail-fast: false
       matrix:
@@ -41,15 +36,49 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Build frontend
-        run: cd frontend && npm install --no-audit --no-fund && npm run build
-
-      - name: Stamp build version
+      - name: Work out the app version
+        id: ver
         shell: bash
         run: |
           SHA=$(git rev-parse --short HEAD)
-          printf '{"version":"0.1.0","build":"%s","builtAt":"%s"}\n' "$SHA" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > backend/version.json
+          if [[ "$GITHUB_REF" == refs/tags/native-v* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/native-v}"
+          else
+            VERSION="0.0.0-dev+${SHA}"
+          fi
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.+-]+)?$ ]]; then
+            echo "::error::'$VERSION' is not a semver version (tag must look like native-v1.2.3)"; exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "App version: $VERSION"
+
+      - name: Stamp versions (tauri.conf.json + backend/version.json)
+        shell: bash
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+          SHA: ${{ steps.ver.outputs.sha }}
+        run: |
+          node -e '
+            const fs = require("fs");
+            const t = "native/src-tauri/tauri.conf.json";
+            const conf = JSON.parse(fs.readFileSync(t, "utf8"));
+            conf.version = process.env.VERSION;
+            fs.writeFileSync(t, JSON.stringify(conf, null, 2) + "\n");
+            // Keep the backend version, record which commit this app was built from.
+            const v = "backend/version.json";
+            const ver = JSON.parse(fs.readFileSync(v, "utf8"));
+            ver.build = process.env.SHA;
+            ver.builtAt = new Date().toISOString();
+            fs.writeFileSync(v, JSON.stringify(ver) + "\n");
+          '
+          grep '"version"' native/src-tauri/tauri.conf.json
           cat backend/version.json
+
+      - name: Build frontend
+        shell: bash
+        working-directory: frontend
+        run: npm ci --no-audit --no-fund && npm run build
 
       - name: Stage backend resource
         shell: bash
@@ -57,40 +86,65 @@ jobs:
 
       - name: Generate app icons from committed logo
         shell: bash
+        working-directory: native
         run: |
-          cd native
-          npm install --no-audit --no-fund
-          npx --yes @tauri-apps/cli icon src-tauri/icon-source.png
+          if [ -f package-lock.json ]; then npm ci --no-audit --no-fund; else npm install --no-audit --no-fund; fi
+          npx tauri icon src-tauri/icon-source.png
 
-      - name: Bundle Node 22 runtime (M2)
+      - name: Bundle Node 22 runtime (verified against SHASUMS256.txt)
         shell: bash
         run: |
+          set -euo pipefail
           # Download the LATEST v22 from nodejs.org. This gets both things right:
           #  - it's Apple-notarized, so Gatekeeper runs it inside our unsigned app
           #    (copying the runner's node + ad-hoc re-signing STRIPS notarization →
           #    the app hangs forever when it spawns node);
-          #  - it's new enough that node:sqlite is unflagged (22.11 was too old).
-          # Do NOT re-sign the macOS binary — that would remove the notarization.
+          #  - it's new enough that node:sqlite is unflagged (needs >= 22.13).
+          # Do NOT re-sign the macOS binary - that would remove the notarization.
           NODE_VERSION=$(curl -fsSL https://nodejs.org/dist/index.json | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{console.log(JSON.parse(d).find(r=>r.version.startsWith('v22.')).version)})")
           echo "Using Node $NODE_VERSION"
-          mkdir -p native/src-tauri/resources/node
           case "${{ matrix.platform }}" in
             macos-latest)
               if [ "$(uname -m)" = "arm64" ]; then N=arm64; else N=x64; fi
-              curl -fsSL "https://nodejs.org/dist/$NODE_VERSION/node-$NODE_VERSION-darwin-$N.tar.gz" -o node.tgz
-              tar xzf node.tgz
+              FILE="node-$NODE_VERSION-darwin-$N.tar.gz" ;;
+            windows-latest)
+              FILE="node-$NODE_VERSION-win-x64.zip" ;;
+          esac
+          curl -fsSLO "https://nodejs.org/dist/$NODE_VERSION/$FILE"
+          curl -fsSLO "https://nodejs.org/dist/$NODE_VERSION/SHASUMS256.txt"
+          EXPECTED=$(awk -v f="$FILE" '$2 == f { print $1 }' SHASUMS256.txt)
+          if command -v sha256sum >/dev/null; then ACTUAL=$(sha256sum "$FILE" | awk '{print $1}'); else ACTUAL=$(shasum -a 256 "$FILE" | awk '{print $1}'); fi
+          echo "expected $EXPECTED"; echo "actual   $ACTUAL"
+          if [ -z "$EXPECTED" ] || [ "$EXPECTED" != "$ACTUAL" ]; then
+            echo "::error::Checksum mismatch for $FILE"; exit 1
+          fi
+          mkdir -p native/src-tauri/resources/node
+          case "${{ matrix.platform }}" in
+            macos-latest)
+              tar xzf "$FILE"
               cp "node-$NODE_VERSION-darwin-$N/bin/node" native/src-tauri/resources/node/node
               chmod +x native/src-tauri/resources/node/node
               ;;
             windows-latest)
-              curl -fsSL "https://nodejs.org/dist/$NODE_VERSION/node-$NODE_VERSION-win-x64.zip" -o node.zip
-              unzip -q node.zip
+              unzip -q "$FILE"
               cp "node-$NODE_VERSION-win-x64/node.exe" native/src-tauri/resources/node/node.exe
               ;;
           esac
           ls -la native/src-tauri/resources/node
 
-      - name: Build Tauri app
+      - name: Smoke test the bundled node + staged backend
+        shell: bash
+        run: |
+          case "${{ matrix.platform }}" in
+            windows-latest) NODE_BIN=native/src-tauri/resources/node/node.exe ;;
+            *)              NODE_BIN=native/src-tauri/resources/node/node ;;
+          esac
+          "$NODE_BIN" --version
+          SMOKE_NODE="$NODE_BIN" SMOKE_BACKEND_DIR=native/src-tauri/resources/backend \
+            node .github/scripts/smoke-scan.js
+
+      - name: Build Tauri app + attach to draft release (tag builds)
+        if: startsWith(github.ref, 'refs/tags/')
         uses: tauri-apps/tauri-action@v0
         with:
           projectPath: native
@@ -100,9 +154,25 @@ jobs:
           releaseBody: |
             Ad-hoc signed (not notarized) desktop build of The Vault.
 
-            **macOS:** open the .dmg, drag the app to Applications, then **right-click the app → Open → Open** the first time (don't double-click). If it says "damaged", you have an older artifact — download the latest, or see native/README.md.
+            **macOS:** open the .dmg, drag the app to Applications, then **right-click the app → Open → Open** the first time (don't double-click). If it says "damaged", you have an older artifact - download the latest, or see native/README.md.
             **Windows:** on first run click **More info → Run anyway**.
 
             First launch: open **Scan Library → 📁 Choose library folder…**, pick your 3D-print folder, then Start Scan.
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build Tauri app (no release)
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: tauri-apps/tauri-action@v0
+        with:
+          projectPath: native
+
+      - name: Upload installers as workflow artifacts
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: the-vault-${{ matrix.platform }}-${{ steps.ver.outputs.sha }}
+          path: |
+            native/src-tauri/target/release/bundle/dmg/*.dmg
+            native/src-tauri/target/release/bundle/nsis/*.exe
+          if-no-files-found: error

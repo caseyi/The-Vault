@@ -10,14 +10,23 @@
     "withGlobalTauri": true,
     "windows": [],
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' data: https://fonts.gstatic.com; img-src 'self' data: blob: http://127.0.0.1:*; connect-src 'self' ipc: http://ipc.localhost http://127.0.0.1:*"
     }
   },
   "bundle": {
     "active": true,
-    "targets": ["dmg", "nsis"],
-    "icon": ["icons/icon.png", "icons/icon.icns", "icons/icon.ico"],
-    "resources": ["resources/**/*"],
+    "targets": [
+      "dmg",
+      "nsis"
+    ],
+    "icon": [
+      "icons/icon.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "resources": [
+      "resources/**/*"
+    ],
     "macOS": {
       "signingIdentity": "-",
       "entitlements": "entitlements.plist"

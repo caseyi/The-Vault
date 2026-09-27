@@ -7,12 +7,12 @@ function formatBytes(bytes) {
 }
 
 const TYPE_STYLE = {
-  stl:    { bg: 'rgba(76,175,125,0.15)',  color: '#4caf7d', label: 'STL' },
-  slicer: { bg: 'rgba(91,155,213,0.15)',  color: '#5b9bd5', label: 'SLC' },
-  zip:    { bg: 'rgba(212,170,76,0.15)',  color: '#d4aa4c', label: 'ZIP' },
-  plate:  { bg: 'rgba(155,114,207,0.15)', color: '#9b72cf', label: 'PLT' },
-  image:  { bg: 'rgba(193,127,58,0.15)',  color: '#c17f3a', label: 'IMG' },
-  other:  { bg: 'rgba(100,100,120,0.15)', color: '#667',    label: 'OTH' },
+  stl:    { bg: 'rgba(76,175,125,0.15)',  color: 'var(--green-text)', label: 'STL' },
+  slicer: { bg: 'rgba(91,155,213,0.15)',  color: 'var(--blue-text)', label: 'SLC' },
+  zip:    { bg: 'rgba(212,170,76,0.15)',  color: 'var(--yellow-text)', label: 'ZIP' },
+  plate:  { bg: 'rgba(155,114,207,0.15)', color: 'var(--purple-text)', label: 'PLT' },
+  image:  { bg: 'rgba(193,127,58,0.15)',  color: 'var(--accent-text)', label: 'IMG' },
+  other:  { bg: 'rgba(100,100,120,0.15)', color: 'var(--text-faint)', label: 'OTH' },
 };
 
 // Role detection from filename — renders, supports, FDM, resin, etc.

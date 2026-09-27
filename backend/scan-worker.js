@@ -33,8 +33,13 @@ const creatorProgress = (p) => {
     } else {
       const { libPath, force } = workerData;
       if (force) {
-        // Clear folder hashes so nothing is skipped (done here, off the main thread)
         const db = require('./db');
+        // Safety net: snapshot the DB before a forced rescan rewrites every model.
+        // Done here (off the main thread) because VACUUM INTO can take a while.
+        const { snapshot } = require('./lib/backup');
+        const file = snapshot('pre-forcescan', { db, log: { log: (m) => logger('info', m), error: (m) => logger('warn', m) } });
+        if (file) logger('info', `Backup written before forced rescan: ${require('path').basename(file)}`);
+        // Clear folder hashes so nothing is skipped (done here, off the main thread)
         db.prepare('UPDATE models SET folder_hash = NULL').run();
       }
       result = await scanLibrary(libPath, fullProgress, logger);

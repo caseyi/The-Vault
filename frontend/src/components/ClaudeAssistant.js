@@ -349,7 +349,6 @@ export default function ClaudeAssistant({ model, apiKey, onApplyTag, onApplyAllT
         <div style={{ fontSize: 10, color: 'var(--text-faint)', marginTop: 4 }}>Enter to send · Shift+Enter for new line</div>
       </div>
 
-      <style>{`@keyframes pulse { 0%,100% { opacity:0.3; transform:scale(0.8); } 50% { opacity:1; transform:scale(1.1); } }`}</style>
     </div>
   );
 }

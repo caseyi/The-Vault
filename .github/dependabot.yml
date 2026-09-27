@@ -1,0 +1,55 @@
+# Monthly, grouped dependency updates: one PR per ecosystem/folder per month,
+# so updates arrive in reviewable batches. Every PR runs docker-publish.yml
+# (tests + container smoke test) before anything can reach main.
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /backend
+    schedule: { interval: monthly }
+    open-pull-requests-limit: 5
+    groups:
+      backend-deps:
+        patterns: ["*"]
+
+  - package-ecosystem: npm
+    directory: /frontend
+    schedule: { interval: monthly }
+    open-pull-requests-limit: 5
+    groups:
+      frontend-deps:
+        patterns: ["*"]
+
+  - package-ecosystem: npm
+    directory: /native
+    schedule: { interval: monthly }
+    groups:
+      native-npm-deps:
+        patterns: ["*"]
+
+  - package-ecosystem: cargo
+    directory: /native/src-tauri
+    schedule: { interval: monthly }
+    groups:
+      native-cargo-deps:
+        patterns: ["*"]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: { interval: monthly }
+    groups:
+      github-actions:
+        patterns: ["*"]
+
+  - package-ecosystem: docker
+    directory: /backend
+    schedule: { interval: monthly }
+    groups:
+      backend-base-image:
+        patterns: ["*"]
+
+  - package-ecosystem: docker
+    directory: /frontend
+    schedule: { interval: monthly }
+    groups:
+      frontend-base-images:
+        patterns: ["*"]

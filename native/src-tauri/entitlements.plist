@@ -10,6 +10,10 @@
   <true/>
   <key>com.apple.security.cs.allow-jit</key>
   <true/>
+  <!-- Probably unnecessary: the bundled Node is a separately signed, notarized
+       binary and we pass it no DYLD_* variables. Kept because removing it
+       can't be verified without a macOS build + Gatekeeper test; drop it in a
+       release where that test is done. -->
   <key>com.apple.security.cs.allow-dyld-environment-variables</key>
   <true/>
 </dict>

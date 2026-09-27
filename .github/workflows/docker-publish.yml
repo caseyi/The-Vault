@@ -1,49 +1,239 @@
 name: Build & Publish Docker Images
 
+# main      → test, build, boot + scan smoke test, then push :latest and :sha-<7>
+# v* tag    → same, plus :X.Y.Z and :X.Y
+# PR → main → test, build, boot + scan smoke test; nothing is pushed
+#
+# Image names are fixed (ghcr.io/caseyi/stlvault-backend / -frontend): the NAS
+# update path depends on them. Don't rename.
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
+    tags: ["v*"]
+  pull_request:
+    branches: ["main"]
   workflow_dispatch:
+
+concurrency:
+  group: docker-publish-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
 
 env:
   IMAGE_BASE: ghcr.io/${{ github.repository_owner }}/stlvault
 
 jobs:
-  build-and-push:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            backend/package-lock.json
+            frontend/package-lock.json
+
+      - name: Backend - install
+        working-directory: backend
+        run: npm ci --no-audit --no-fund
+
+      - name: Backend - unit tests
+        working-directory: backend
+        run: npx jest --ci
+
+      - name: Backend - scan smoke test
+        run: node .github/scripts/smoke-scan.js
+
+      - name: Frontend - install
+        working-directory: frontend
+        run: npm ci --no-audit --no-fund
+
+      - name: Frontend - unit tests
+        working-directory: frontend
+        env:
+          CI: "true"
+        run: npm test
+
+  images:
+    needs: test
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
-
+    env:
+      PUSH: ${{ github.event_name != 'pull_request' }}
     steps:
       - uses: actions/checkout@v4
 
+      - name: Build metadata
+        id: build
+        shell: bash
+        run: |
+          echo "git_sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          echo "build_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
       - uses: docker/login-action@v3
+        if: env.PUSH == 'true'
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: docker/setup-buildx-action@v3
+      - name: Tags & labels (backend)
+        id: meta_backend
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_BASE }}-backend
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,prefix=sha-,format=short
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=ref,event=pr
+          labels: |
+            org.opencontainers.image.title=stlvault-backend
+            org.opencontainers.image.source=https://github.com/caseyi/The-Vault
 
-      - name: Build & push backend
-        uses: docker/build-push-action@v5
+      - name: Tags & labels (frontend)
+        id: meta_frontend
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_BASE }}-frontend
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,prefix=sha-,format=short
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=ref,event=pr
+          labels: |
+            org.opencontainers.image.title=stlvault-frontend
+            org.opencontainers.image.source=https://github.com/caseyi/The-Vault
+
+      # ── Build both images into the local Docker engine (not pushed yet) ──
+      - name: Build backend (local)
+        uses: docker/build-push-action@v6
         with:
           context: ./backend
-          push: true
-          tags: |
-            ${{ env.IMAGE_BASE }}-backend:latest
-            ${{ env.IMAGE_BASE }}-backend:sha-${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # Multi-arch (e.g. a Raspberry Pi or an ARM Synology): uncomment and
+          # add docker/setup-qemu-action before buildx. Note `load: true` only
+          # supports a single platform, so the smoke test below would need to
+          # move to a per-platform step. amd64 covers Dagobah (x86_64).
+          # platforms: linux/amd64,linux/arm64
+          load: true
+          push: false
+          tags: stlvault-backend:ci
+          labels: ${{ steps.meta_backend.outputs.labels }}
+          build-args: |
+            GIT_SHA=${{ steps.build.outputs.git_sha }}
+            BUILD_DATE=${{ steps.build.outputs.build_date }}
+          cache-from: type=gha,scope=backend
+          cache-to: type=gha,scope=backend,mode=max
 
-      - name: Build & push frontend
-        uses: docker/build-push-action@v5
+      - name: Build frontend (local)
+        uses: docker/build-push-action@v6
         with:
           context: ./frontend
+          # platforms: linux/amd64,linux/arm64
+          load: true
+          push: false
+          tags: stlvault-frontend:ci
+          labels: ${{ steps.meta_frontend.outputs.labels }}
+          build-args: |
+            GIT_SHA=${{ steps.build.outputs.git_sha }}
+            BUILD_DATE=${{ steps.build.outputs.build_date }}
+          cache-from: type=gha,scope=frontend
+          cache-to: type=gha,scope=frontend,mode=max
+
+      # ── Boot the real images like docker-compose does and scan a fixture ──
+      - name: Container smoke test (boot, health, scan, proxy)
+        shell: bash
+        env:
+          GIT_SHA: ${{ steps.build.outputs.git_sha }}
+        run: |
+          set -euo pipefail
+          FIXTURE="$RUNNER_TEMP/fixture"
+          mkdir -p "$FIXTURE"
+          docker network create vault-smoke
+          docker run -d --name vault-backend --network vault-smoke --network-alias backend \
+            -p 127.0.0.1:8585:3001 \
+            -v "$FIXTURE:/library/Fixture:ro" \
+            -v vault-smoke-data:/data \
+            stlvault-backend:ci
+          docker run -d --name vault-frontend --network vault-smoke \
+            -p 127.0.0.1:8484:80 stlvault-frontend:ci
+
+          # Creates the fixture, waits for health, checks gitSha, scans, asserts models.
+          SMOKE_BASE_URL=http://127.0.0.1:8585 \
+          SMOKE_FIXTURE_DIR="$FIXTURE" \
+          SMOKE_SCAN_PATH=/library \
+          SMOKE_EXPECT_SHA="$GIT_SHA" \
+            node .github/scripts/smoke-scan.js
+
+          # The frontend must serve the app and proxy the API.
+          page=$(curl -fsS http://127.0.0.1:8484/)
+          grep -qi 'id="root"' <<<"$page" || { echo "frontend did not serve index.html"; exit 1; }
+          api=$(curl -fsS http://127.0.0.1:8484/api/health)
+          grep -q '"ok":true' <<<"$api" || { echo "frontend did not proxy /api: $api"; exit 1; }
+
+          # Image-level HEALTHCHECK must report healthy.
+          for _ in $(seq 1 30); do
+            s=$(docker inspect -f '{{.State.Health.Status}}' vault-backend)
+            [ "$s" = healthy ] && break
+            sleep 2
+          done
+          echo "backend health: $s"; [ "$s" = healthy ]
+
+          # Neither image may log an API key passed as ?key=
+          curl -fsS "http://127.0.0.1:8484/api/health?key=sk-ant-smoke-secret" >/dev/null
+          sleep 1
+          if docker logs vault-frontend 2>&1 | grep -c 'sk-ant-smoke-secret' >/dev/null; then
+            echo "API key leaked into nginx access log"; exit 1
+          fi
+          echo "CONTAINER SMOKE PASS"
+
+      - name: Container logs (on failure)
+        if: failure()
+        run: |
+          docker logs vault-backend || true
+          docker logs vault-frontend || true
+
+      # ── Push (same inputs → fully cached rebuild, then upload) ──
+      - name: Push backend
+        if: env.PUSH == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          # platforms: linux/amd64,linux/arm64
           push: true
-          tags: |
-            ${{ env.IMAGE_BASE }}-frontend:latest
-            ${{ env.IMAGE_BASE }}-frontend:sha-${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # Plain single-platform manifests: older Docker engines (Synology
+          # Container Manager ships 20.10/24.x) show attestation entries as
+          # "unknown/unknown" platforms.
+          provenance: false
+          tags: ${{ steps.meta_backend.outputs.tags }}
+          labels: ${{ steps.meta_backend.outputs.labels }}
+          build-args: |
+            GIT_SHA=${{ steps.build.outputs.git_sha }}
+            BUILD_DATE=${{ steps.build.outputs.build_date }}
+          cache-from: type=gha,scope=backend
+
+      - name: Push frontend
+        if: env.PUSH == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: ./frontend
+          # platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: false
+          tags: ${{ steps.meta_frontend.outputs.tags }}
+          labels: ${{ steps.meta_frontend.outputs.labels }}
+          build-args: |
+            GIT_SHA=${{ steps.build.outputs.git_sha }}
+            BUILD_DATE=${{ steps.build.outputs.build_date }}
+          cache-from: type=gha,scope=frontend

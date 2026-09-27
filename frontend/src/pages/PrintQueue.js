@@ -110,7 +110,7 @@ export default function PrintQueue({ onModelClick, onQueueChange }) {
   }
 
   return (
-    <div style={{ padding: '20px 24px', maxWidth: 760, margin: '0 auto' }}>
+    <div className="queue-page">
       <div style={{ display: 'flex', alignItems: 'baseline', gap: 12, marginBottom: 20 }}>
         <h2 style={{ margin: 0, fontFamily: 'var(--font-display)', fontSize: 20, color: 'var(--text)' }}>
           Print Queue
@@ -118,7 +118,7 @@ export default function PrintQueue({ onModelClick, onQueueChange }) {
         <span style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--text-faint)' }}>
           {queue.length} model{queue.length !== 1 ? 's' : ''}
         </span>
-        {saving && <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: '#c17f3a', marginLeft: 'auto' }}>Saving…</span>}
+        {saving && <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--accent-text)', marginLeft: 'auto' }}>Saving…</span>}
       </div>
 
       {queue.length === 0 ? (
@@ -148,7 +148,7 @@ export default function PrintQueue({ onModelClick, onQueueChange }) {
                 style={{ display: 'flex', alignItems: 'center', gap: 10, cursor: 'grab', userSelect: 'none' }}
               >
                 {/* Priority number */}
-                <div style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: '#c17f3a', minWidth: 24, textAlign: 'right' }}>
+                <div style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--accent-text)', minWidth: 24, textAlign: 'right' }}>
                   #{index + 1}
                 </div>
 
@@ -196,7 +196,7 @@ export default function PrintQueue({ onModelClick, onQueueChange }) {
                 {/* Mark printed + remove from queue */}
                 <button
                   onClick={() => markPrintedAndRemove(item.model_id)}
-                  style={{ background: 'rgba(76,175,125,0.12)', border: '1px solid rgba(76,175,125,0.4)', borderRadius: 4, color: '#4caf7d', cursor: 'pointer', fontSize: 11, padding: '3px 8px', fontFamily: 'var(--font-mono)', flexShrink: 0, whiteSpace: 'nowrap' }}
+                  style={{ background: 'rgba(76,175,125,0.12)', border: '1px solid rgba(76,175,125,0.4)', borderRadius: 4, color: 'var(--green-text)', cursor: 'pointer', fontSize: 11, padding: '3px 8px', fontFamily: 'var(--font-mono)', flexShrink: 0, whiteSpace: 'nowrap' }}
                   title="Mark printed and remove from queue"
                 >
                   ✓ Done
@@ -221,7 +221,7 @@ export default function PrintQueue({ onModelClick, onQueueChange }) {
                 style={{
                   width: '100%', marginTop: 8, background: 'var(--bg3)', border: '1px solid var(--border)',
                   borderRadius: 4, color: 'var(--text)', padding: '5px 8px', fontSize: 11,
-                  outline: 'none', fontFamily: 'var(--font-body)', boxSizing: 'border-box',
+                  fontFamily: 'var(--font-body)', boxSizing: 'border-box',
                 }}
               />
             </div>
