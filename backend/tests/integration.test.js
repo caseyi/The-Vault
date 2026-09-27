@@ -447,11 +447,17 @@ describe('B15 scan status ring buffer + cancel (worker thread)', () => {
   };
 
   test('/api/scan/status returns at most 500 lines and flags truncation', async () => {
-    for (let i = 0; i < 320; i++) mk(`Bulk/Model ${String(i).padStart(3, '0')}/m.stl`);
+    for (let i = 0; i < 700; i++) mk(`Bulk/Model ${String(i).padStart(3, "0")}/m.stl`); // >=1 log line per model, so >500 lines
     const res = await request(app).post('/api/scan').send({ path: LIB });
     expect(res.status).toBe(200);
-    await waitIdle();
-    const st = (await request(app).get('/api/scan/status')).body;
+    // The worker may not have flagged inProgress yet, so wait for the summary.
+    let st;
+    for (let i = 0; i < 250; i++) {
+      await waitIdle();
+      st = (await request(app).get('/api/scan/status')).body;
+      if (st.summary) break;
+      await new Promise(r => setTimeout(r, 100));
+    }
     expect(st.log.length).toBeLessThanOrEqual(500);
     expect(st.truncated).toBe(true);
     expect(st.summary.success).toBe(true);
