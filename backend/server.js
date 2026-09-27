@@ -1,5 +1,4 @@
 const express = require('express');
-const cors = require('cors');
 const path = require('path');
 const fs = require('fs');
 
@@ -15,19 +14,41 @@ try {
 } catch {}
 
 const db = require('./db');
-const { scanLibrary, scanSingleCreator, LIBRARY_PATH, matchesHint, pickRenderArchives, analyzeFolder, inferReleaseName } = require('./scanner');
+const { LIBRARY_PATH, pickRenderArchives, analyzeFolder, extractImagesFromArchive } = require('./scanner');
 const { scrapeImagesFromUrl, detectUrlFromFolderName } = require('./scraper');
 const organizeRouter = require('./organize');
+const { wrapAsyncRoutes, originPolicy, errorHandler } = require('./lib/middleware');
+const { confinePath, tryConfine, sendPathError, imageUrlToFile, isSafeImageUrl } = require('./lib/paths');
+const { openSSE } = require('./lib/sse');
+const { acquireOr409 } = require('./lib/jobs');
+const { callClaudeAPI } = require('./lib/claude');
 
-const app = express();
+const app = wrapAsyncRoutes(express());
 const PORT = process.env.PORT || 3001;
+const HOST = process.env.HOST || '0.0.0.0';
 const IMAGES_DIR = process.env.IMAGES_DIR || '/data/images';
+
+/** Escape LIKE wildcards so user text matches literally (use with ESCAPE '\\'). */
+const likeEscape = (s) => String(s).replace(/[\\%_]/g, '\\$&');
+/** Archives above ARCHIVE_MAX_MB (default 500) are never opened (they're read fully into memory). */
+function archiveTooBig(p) {
+  const mb = parseFloat(process.env.ARCHIVE_MAX_MB);
+  const max = (Number.isFinite(mb) && mb > 0 ? mb : 500) * 1024 * 1024;
+  try { return fs.statSync(p).size > max; } catch { return false; }
+}
+/** Parse a positive integer query param, clamped to [min, max]. */
+function clampInt(v, def, min, max) {
+  const n = parseInt(v, 10);
+  if (!Number.isFinite(n)) return def;
+  return Math.min(max, Math.max(min, n));
+}
 
 // Version info — auto-incremented by pre-commit hook
 let APP_VERSION = { version: '0.0.0', build: 0 };
 try { APP_VERSION = JSON.parse(fs.readFileSync(path.join(__dirname, 'version.json'), 'utf8')); } catch {}
 
-app.use(cors());
+app.disable('x-powered-by');
+app.use(originPolicy());
 app.use(express.json({ limit: '10mb' }));
 app.use('/images', express.static(IMAGES_DIR));
 app.use('/api/organize', organizeRouter);
@@ -35,13 +56,32 @@ app.use('/api/organize', organizeRouter);
 // ── Scan ──────────────────────────────────────────────────────────────────────
 
 let scanInProgress = false;
-let scanLog = [];       // running log lines
+let scanLog = [];       // running log lines — ring buffer of the last SCAN_LOG_MAX
+let scanLogDropped = 0; // lines shifted out of the ring (absolute index = dropped + i)
 let scanSummary = null; // final result
+const SCAN_LOG_MAX = 2000;
+const SCAN_STATUS_LINES = 500;
 
 function pushLog(level, msg) {
   const line = { ts: new Date().toISOString(), level, msg };
   scanLog.push(line);
+  if (scanLog.length > SCAN_LOG_MAX) {
+    const drop = scanLog.length - SCAN_LOG_MAX;
+    scanLog.splice(0, drop);
+    scanLogDropped += drop;
+  }
   return line;
+}
+
+// A scan that never reported back (cancelled / crashed worker) must not leave
+// its scan_log row stuck at 'running'.
+function markRunningScans(status, error) {
+  try {
+    db.prepare(`UPDATE scan_log SET status = ?, error = COALESCE(error, ?), finished_at = datetime('now') WHERE status = 'running'`)
+      .run(status, error || null);
+  } catch (e) {
+    console.error('[scan] could not update scan_log:', e.message);
+  }
 }
 
 // Scans run in a worker thread so heavy/synchronous filesystem work never blocks
@@ -53,6 +93,7 @@ let scanProgress = { count: 0, last: '' }; // lightweight live progress for the 
 function startScanWorker(workerData, startLogLines) {
   scanInProgress = true;
   scanLog = [];
+  scanLogDropped = 0;
   scanSummary = null;
   scanProgress = { count: 0, last: '' };
   for (const [level, msg] of startLogLines) pushLog(level, msg);
@@ -80,6 +121,7 @@ function startScanWorker(workerData, startLogLines) {
   scanWorker.on('error', (err) => {
     pushLog('error', `✗ Worker error: ${err.message}`);
     scanSummary = { type: 'done', success: false, error: err.message };
+    markRunningScans('error', err.message);
     scanInProgress = false;
     scanWorker = null;
   });
@@ -89,6 +131,7 @@ function startScanWorker(workerData, startLogLines) {
     if (scanInProgress && !scanSummary) {
       scanSummary = { type: 'done', success: false, error: 'Scan ended unexpectedly' };
       pushLog('error', scanSummary.error);
+      markRunningScans('error', scanSummary.error);
     }
     scanInProgress = false;
     scanWorker = null;
@@ -97,36 +140,34 @@ function startScanWorker(workerData, startLogLines) {
 
 // SSE stream — client connects and receives log lines in real time
 app.get('/api/scan/stream', (req, res) => {
-  res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('Connection', 'keep-alive');
-  res.flushHeaders();
-
-  const send = (data) => res.write(`data: ${JSON.stringify(data)}\n\n`);
+  const sse = openSSE(req, res);
+  const send = (data) => sse.send(data);
 
   // Replay existing log lines for late-joiners
   scanLog.forEach(line => send(line));
-  if (scanSummary) { send({ type: 'done', ...scanSummary }); res.end(); return; }
-  if (!scanInProgress) { send({ type: 'idle' }); res.end(); return; }
+  if (scanSummary) { sse.end({ type: 'done', ...scanSummary }); return; }
+  if (!scanInProgress) { sse.end({ type: 'idle' }); return; }
 
-  // Subscribe to new log lines via polling the array length
-  let lastIdx = scanLog.length;
+  // Subscribe to new log lines by polling the ring buffer's absolute position
+  let lastAbs = scanLogDropped + scanLog.length;
   const interval = setInterval(() => {
-    while (lastIdx < scanLog.length) send(scanLog[lastIdx++]);
+    const endAbs = scanLogDropped + scanLog.length;
+    if (lastAbs < scanLogDropped) lastAbs = scanLogDropped; // fell behind the ring; skip dropped lines
+    while (lastAbs < endAbs) send(scanLog[lastAbs++ - scanLogDropped]);
     if (!scanInProgress) {
-      if (scanSummary) send({ type: 'done', ...scanSummary });
       clearInterval(interval);
-      res.end();
+      sse.end(scanSummary ? { type: 'done', ...scanSummary } : undefined);
     }
   }, 150);
 
-  req.on('close', () => clearInterval(interval));
+  sse.onAbort(() => clearInterval(interval));
 });
 
 app.post('/api/scan', (req, res) => {
   if (scanInProgress) return res.status(409).json({ error: 'Scan already in progress' });
-  const libPath = req.body.path || LIBRARY_PATH;
-  const force = req.body.force === true;
+  let libPath;
+  try { libPath = confinePath(req.body?.path || LIBRARY_PATH); } catch (e) { if (sendPathError(res, e)) return; throw e; }
+  const force = req.body?.force === true;
   if (!fs.existsSync(libPath)) return res.status(400).json({ error: `Path not found: ${libPath}` });
 
   res.json({ message: 'Scan started', path: libPath, force });
@@ -139,7 +180,10 @@ app.post('/api/scan', (req, res) => {
 
 // Legacy status endpoint (still used by anything polling)
 app.get('/api/scan/status', (req, res) => {
-  res.json({ inProgress: scanInProgress, log: scanLog, summary: scanSummary });
+  const log = scanLog.length > SCAN_STATUS_LINES ? scanLog.slice(-SCAN_STATUS_LINES) : scanLog;
+  const body = { inProgress: scanInProgress, log, summary: scanSummary };
+  if (scanLogDropped > 0 || scanLog.length > SCAN_STATUS_LINES) body.truncated = true;
+  res.json(body);
 });
 
 // Lightweight progress — for the app-wide background scan indicator (no full log)
@@ -158,8 +202,9 @@ app.get('/api/scan/progress', (req, res) => {
 app.post('/api/scan/cancel', async (req, res) => {
   if (!scanInProgress || !scanWorker) return res.json({ cancelled: false, message: 'No scan running' });
   pushLog('warn', 'Scan cancelled by user');
-  try { await scanWorker.terminate(); } catch {}
   scanSummary = { type: 'done', success: false, error: 'Scan cancelled' };
+  try { await scanWorker.terminate(); } catch {}
+  markRunningScans('cancelled', 'Scan cancelled by user');
   scanInProgress = false;
   scanWorker = null;
   res.json({ cancelled: true });
@@ -171,6 +216,7 @@ app.post('/api/scan/creator/:id', async (req, res) => {
   const creator = db.prepare('SELECT * FROM creators WHERE id = ?').get(req.params.id);
   if (!creator) return res.status(404).json({ error: 'Creator not found' });
   if (!creator.folder_path) return res.status(400).json({ error: 'Creator has no folder path' });
+  try { confinePath(creator.folder_path); } catch (e) { if (sendPathError(res, e)) return; throw e; }
   if (!fs.existsSync(creator.folder_path)) return res.status(400).json({ error: `Folder not found: ${creator.folder_path}` });
 
   res.json({ message: 'Creator scan started', creator: creator.name, path: creator.folder_path });
@@ -195,8 +241,10 @@ const SORT_MAP = {
 };
 
 app.get('/api/models', (req, res) => {
-  const { search, creator, status, tags, franchise, collection, folder, favorite, page = 1, limit = 48, show_hidden, has_thumbnail, recently_added, sort } = req.query;
-  const offset = (parseInt(page) - 1) * parseInt(limit);
+  const { search, creator, status, tags, franchise, collection, folder, favorite, show_hidden, has_thumbnail, recently_added, sort } = req.query;
+  const page = clampInt(req.query.page, 1, 1, 1e6);
+  const limit = clampInt(req.query.limit, 48, 1, 500);
+  const offset = (page - 1) * limit;
 
   let where = ['1=1'];
   const params = [];
@@ -241,20 +289,20 @@ app.get('/api/models', (req, res) => {
   // `folder` is an absolute container path (e.g. /library/STL Archive/SomeCreator)
   // as supplied by /api/library/tree.
   if (folder) {
-    where.push('(m.folder_path = ? OR m.folder_path LIKE ?)');
-    params.push(folder, folder.replace(/\/+$/, '') + '/%');
+    where.push("(m.folder_path = ? OR m.folder_path LIKE ? ESCAPE '\\')");
+    params.push(folder, likeEscape(String(folder).replace(/\/+$/, '')) + '/%');
   }
 
   if (search) {
-    where.push('(m.name LIKE ? OR c.name LIKE ? OR m.tags LIKE ? OR m.notes LIKE ?)');
-    const s = `%${search}%`;
+    where.push("(m.name LIKE ? ESCAPE '\\' OR c.name LIKE ? ESCAPE '\\' OR m.tags LIKE ? ESCAPE '\\' OR m.notes LIKE ? ESCAPE '\\')");
+    const s = `%${likeEscape(search)}%`;
     params.push(s, s, s, s);
   }
   if (creator) { where.push('c.name = ?'); params.push(creator); }
   if (status) { where.push('m.print_status = ?'); params.push(status); }
   if (tags) {
-    const tagList = tags.split(',');
-    tagList.forEach(t => { where.push("m.tags LIKE ?"); params.push(`%"${t.trim()}"%`); });
+    const tagList = String(tags).split(',');
+    tagList.forEach(t => { where.push("m.tags LIKE ? ESCAPE '\\'"); params.push(`%"${likeEscape(t.trim())}"%`); });
   }
 
   const whereStr = where.join(' AND ');
@@ -269,7 +317,7 @@ app.get('/api/models', (req, res) => {
     WHERE ${whereStr}
     ORDER BY ${orderBy}
     LIMIT ? OFFSET ?
-  `).all(...params, parseInt(limit), offset);
+  `).all(...params, limit, offset);
 
   res.json({
     models: models.map(m => ({
@@ -278,68 +326,9 @@ app.get('/api/models', (req, res) => {
       images: JSON.parse(m.images || '[]')
     })),
     total,
-    page: parseInt(page),
-    pages: Math.ceil(total / parseInt(limit))
+    page,
+    pages: Math.ceil(total / limit)
   });
-});
-
-app.get('/api/models/:id', (req, res) => {
-  const model = db.prepare(`
-    SELECT m.*, c.name as creator_name
-    FROM models m LEFT JOIN creators c ON m.creator_id = c.id
-    WHERE m.id = ?
-  `).get(req.params.id);
-  if (!model) return res.status(404).json({ error: 'Not found' });
-
-  const files = db.prepare('SELECT * FROM model_files WHERE model_id = ? ORDER BY release_name NULLS LAST, filetype, filename').all(model.id);
-  res.json({
-    ...model,
-    tags: JSON.parse(model.tags || '[]'),
-    images: JSON.parse(model.images || '[]'),
-    files
-  });
-});
-
-app.patch('/api/models/:id', (req, res) => {
-  const { print_status, tags, notes, source_url, name, thumbnail_path, hidden, franchise, team, is_favorite } = req.body;
-  const model = db.prepare('SELECT id, print_status FROM models WHERE id = ?').get(req.params.id);
-  if (!model) return res.status(404).json({ error: 'Not found' });
-
-  const updates = [];
-  const params = [];
-  if (print_status !== undefined) {
-    // Log the status transition if it actually changed
-    if (print_status !== model.print_status) {
-      db.prepare(`INSERT INTO status_log (model_id, from_status, to_status) VALUES (?, ?, ?)`).run(
-        req.params.id, model.print_status, print_status
-      );
-    }
-    updates.push('print_status = ?'); params.push(print_status);
-  }
-  if (tags !== undefined) { updates.push('tags = ?'); params.push(JSON.stringify(tags)); }
-  if (notes !== undefined) { updates.push('notes = ?'); params.push(notes); }
-  if (source_url !== undefined) { updates.push('source_url = ?'); params.push(source_url); }
-  if (name !== undefined) { updates.push('name = ?'); params.push(name); }
-  if (thumbnail_path !== undefined) { updates.push('thumbnail_path = ?'); params.push(thumbnail_path); }
-  if (hidden !== undefined) { updates.push('hidden = ?'); params.push(hidden ? 1 : 0); }
-  if (franchise !== undefined) { updates.push('franchise = ?'); params.push(franchise || null); }
-  if (team !== undefined) { updates.push('team = ?'); params.push(team || null); }
-  if (is_favorite !== undefined) { updates.push('is_favorite = ?'); params.push(is_favorite ? 1 : 0); }
-
-  if (updates.length === 0) return res.status(400).json({ error: 'Nothing to update' });
-  updates.push("updated_at = datetime('now')");
-  params.push(req.params.id);
-
-  db.prepare(`UPDATE models SET ${updates.join(', ')} WHERE id = ?`).run(...params);
-  res.json({ success: true });
-});
-
-// Status history for a model
-app.get('/api/models/:id/status-log', (req, res) => {
-  const log = db.prepare(
-    `SELECT id, from_status, to_status, note, changed_at FROM status_log WHERE model_id = ? ORDER BY id DESC`
-  ).all(req.params.id);
-  res.json(log);
 });
 
 // Common tags across a set of models (for bulk tag editor)
@@ -357,6 +346,74 @@ app.get('/api/models/common-tags', (req, res) => {
   const allTags = [...new Set(tagSets.flatMap(s => [...s]))].sort();
   const commonTags = allTags.filter(t => tagSets.every(s => s.has(t)));
   res.json({ allTags, commonTags });
+});
+
+app.get('/api/models/:id(\\d+)', (req, res) => {
+  const model = db.prepare(`
+    SELECT m.*, c.name as creator_name
+    FROM models m LEFT JOIN creators c ON m.creator_id = c.id
+    WHERE m.id = ?
+  `).get(req.params.id);
+  if (!model) return res.status(404).json({ error: 'Not found' });
+
+  const files = db.prepare('SELECT * FROM model_files WHERE model_id = ? ORDER BY release_name NULLS LAST, filetype, filename').all(model.id);
+  res.json({
+    ...model,
+    tags: JSON.parse(model.tags || '[]'),
+    images: JSON.parse(model.images || '[]'),
+    files
+  });
+});
+
+app.patch('/api/models/:id(\\d+)', (req, res) => {
+  const { print_status, tags, notes, source_url, name, thumbnail_path, hidden, franchise, team, is_favorite, name_locked } = req.body || {};
+  // thumbnail_path must point at an extracted image under /images/ (or be cleared)
+  if (thumbnail_path !== undefined && thumbnail_path !== null && thumbnail_path !== '' && !isSafeImageUrl(thumbnail_path)) {
+    return res.status(400).json({ error: 'thumbnail_path must be an /images/... path' });
+  }
+  const model = db.prepare('SELECT id, print_status FROM models WHERE id = ?').get(req.params.id);
+  if (!model) return res.status(404).json({ error: 'Not found' });
+
+  const updates = [];
+  const params = [];
+  if (print_status !== undefined) {
+    // Log the status transition if it actually changed
+    if (print_status !== model.print_status) {
+      db.prepare(`INSERT INTO status_log (model_id, from_status, to_status) VALUES (?, ?, ?)`).run(
+        req.params.id, model.print_status, print_status
+      );
+    }
+    updates.push('print_status = ?'); params.push(print_status);
+  }
+  if (tags !== undefined) { updates.push('tags = ?'); params.push(JSON.stringify(tags)); }
+  if (notes !== undefined) { updates.push('notes = ?'); params.push(notes); }
+  if (source_url !== undefined) { updates.push('source_url = ?'); params.push(source_url); }
+  if (name !== undefined) {
+    // A user rename is sticky: rescans must not overwrite it (name_locked)
+    updates.push('name = ?'); params.push(name);
+    if (name_locked === undefined) updates.push('name_locked = 1');
+  }
+  if (name_locked !== undefined) { updates.push('name_locked = ?'); params.push(name_locked ? 1 : 0); }
+  if (thumbnail_path !== undefined) { updates.push('thumbnail_path = ?'); params.push(thumbnail_path || null); }
+  if (hidden !== undefined) { updates.push('hidden = ?'); params.push(hidden ? 1 : 0); }
+  if (franchise !== undefined) { updates.push('franchise = ?'); params.push(franchise || null); }
+  if (team !== undefined) { updates.push('team = ?'); params.push(team || null); }
+  if (is_favorite !== undefined) { updates.push('is_favorite = ?'); params.push(is_favorite ? 1 : 0); }
+
+  if (updates.length === 0) return res.status(400).json({ error: 'Nothing to update' });
+  updates.push("updated_at = datetime('now')");
+  params.push(req.params.id);
+
+  db.prepare(`UPDATE models SET ${updates.join(', ')} WHERE id = ?`).run(...params);
+  res.json({ success: true });
+});
+
+// Status history for a model
+app.get('/api/models/:id(\\d+)/status-log', (req, res) => {
+  const log = db.prepare(
+    `SELECT id, from_status, to_status, note, changed_at FROM status_log WHERE model_id = ? ORDER BY id DESC`
+  ).all(req.params.id);
+  res.json(log);
 });
 
 // Toggle a single file as printed/unprinted
@@ -417,20 +474,15 @@ app.post('/api/creators/:id/merge', (req, res) => {
   res.json({ moved, sourceCreator: source.name, targetCreator: target.name });
 });
 
-// Re-extract renders for all models belonging to a creator, using the current hint
-app.post('/api/creators/:id/reextract', async (req, res) => {
+// Re-extract renders for all models belonging to a creator, using the current hint.
+// Served for GET (the UI uses EventSource) and POST (older clients).
+async function reextractCreator(req, res) {
   const creator = db.prepare('SELECT * FROM creators WHERE id = ?').get(req.params.id);
   if (!creator) return res.status(404).json({ error: 'Not found' });
 
-  res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('Connection', 'keep-alive');
-  res.flushHeaders();
+  const sse = openSSE(req, res);
+  const send = (level, msg) => sse.send({ level, msg, ts: new Date().toISOString() });
 
-  const send = (level, msg) => res.write(`data: ${JSON.stringify({ level, msg, ts: new Date().toISOString() })}\n\n`);
-  const done = (data) => { res.write(`data: ${JSON.stringify({ type: 'done', ...data })}\n\n`); res.end(); };
-
-  const AdmZip = require('adm-zip');
   const hint = creator.render_zip_hint || null;
   send('info', `Creator: ${creator.name}`);
   send('info', `Render ZIP hint: ${hint || '(auto-detect by keyword)'}`);
@@ -440,43 +492,39 @@ app.post('/api/creators/:id/reextract', async (req, res) => {
 
   let updated = 0, skipped = 0;
   for (const model of models) {
+    if (sse.aborted) return;
+    // Yield between models so a big creator doesn't monopolise the event loop
+    await new Promise(r => setImmediate(r));
+    if (!tryConfine(model.folder_path)) {
+      send('warn', `  ⚠ ${model.name}: folder is outside the library, skipped`);
+      skipped++;
+      continue;
+    }
     // Model-level hint overrides creator hint
     const effectiveHint = model.render_zip_hint || hint;
-    const analysis = analyzeFolder(model.folder_path);
-    const renderZips = pickRenderZips(analysis, effectiveHint);
+    const analysis = analyzeFolder(model.folder_path, creator.name);
+    const renderArchives = pickRenderArchives(analysis, effectiveHint);
 
-    if (renderZips.length === 0) {
+    if (renderArchives.length === 0) {
       send('warn', `  ⚠ ${model.name}: no matching ZIP found`);
       skipped++;
       continue;
     }
 
-    send('zip', `  📦 ${model.name}: extracting from ${renderZips.map(z => path.basename(z)).join(', ')}`);
-
-    const IMAGE_EXTS = new Set(['.jpg', '.jpeg', '.png', '.webp', '.gif']);
-    const modelImgDir = path.join(IMAGES_DIR, model.uuid);
-    if (!fs.existsSync(modelImgDir)) fs.mkdirSync(modelImgDir, { recursive: true });
+    send('zip', `  📦 ${model.name}: extracting from ${renderArchives.map(z => path.basename(z)).join(', ')}`);
 
     const freshImages = [];
-    for (const zipPath of renderZips) {
+    for (const archivePath of renderArchives) {
       try {
-        const zip = new AdmZip(zipPath);
-        for (const entry of zip.getEntries()) {
-          if (entry.isDirectory) continue;
-          const ext = path.extname(entry.entryName).toLowerCase();
-          if (!IMAGE_EXTS.has(ext)) continue;
-          const safeName = path.basename(entry.entryName).replace(/[^a-zA-Z0-9._-]/g, '_');
-          const outPath = path.join(modelImgDir, safeName);
-          zip.extractEntryTo(entry, modelImgDir, false, true, false, safeName);
-          freshImages.push(`/images/${model.uuid}/${safeName}`);
-        }
+        freshImages.push(...await extractImagesFromArchive(archivePath, model.uuid));
       } catch (e) {
         send('error', `    ✗ Failed: ${e.message}`);
       }
     }
 
     if (freshImages.length > 0) {
-      const existing = JSON.parse(model.images || '[]');
+      let existing = [];
+      try { existing = JSON.parse(model.images || '[]'); } catch {}
       const merged = [...new Set([...freshImages, ...existing])];
       db.prepare(`UPDATE models SET images=?, thumbnail_path=?, folder_hash=NULL, updated_at=datetime('now') WHERE id=?`)
         .run(JSON.stringify(merged), merged[0], model.id);
@@ -488,11 +536,13 @@ app.post('/api/creators/:id/reextract', async (req, res) => {
     }
   }
 
-  done({ success: true, updated, skipped });
-});
+  sse.end({ type: 'done', success: true, updated, skipped });
+}
+app.get('/api/creators/:id(\\d+)/reextract', reextractCreator);
+app.post('/api/creators/:id(\\d+)/reextract', reextractCreator);
 
 // Per-model render ZIP hint override
-app.patch('/api/models/:id/render-hint', (req, res) => {
+app.patch('/api/models/:id(\\d+)/render-hint', (req, res) => {
   const { render_zip_hint } = req.body;
   db.prepare('UPDATE models SET render_zip_hint = ?, folder_hash = NULL WHERE id = ?').run(render_zip_hint || null, req.params.id);
   res.json({ success: true });
@@ -681,14 +731,14 @@ app.get('/api/export', (req, res) => {
     params.push(collection);
   }
   if (search) {
-    where.push('(m.name LIKE ? OR c.name LIKE ? OR m.tags LIKE ? OR m.notes LIKE ?)');
-    const s = `%${search}%`;
+    where.push("(m.name LIKE ? ESCAPE '\\' OR c.name LIKE ? ESCAPE '\\' OR m.tags LIKE ? ESCAPE '\\' OR m.notes LIKE ? ESCAPE '\\')");
+    const s = `%${likeEscape(search)}%`;
     params.push(s, s, s, s);
   }
   if (creator) { where.push('c.name = ?'); params.push(creator); }
   if (status) { where.push('m.print_status = ?'); params.push(status); }
   if (tags) {
-    tags.split(',').forEach(t => { where.push('m.tags LIKE ?'); params.push(`%"${t.trim()}"%`); });
+    String(tags).split(',').forEach(t => { where.push("m.tags LIKE ? ESCAPE '\\'"); params.push(`%"${likeEscape(t.trim())}"%`); });
   }
 
   const rows = db.prepare(`
@@ -730,17 +780,13 @@ app.get('/api/export', (req, res) => {
 });
 
 // SSE stream version of scrape (GET so EventSource can use it)
-app.get('/api/models/:id/scrape-stream', async (req, res) => {
+app.get('/api/models/:id(\\d+)/scrape-stream', async (req, res) => {
   const model = db.prepare('SELECT * FROM models WHERE id = ?').get(req.params.id);
   if (!model) return res.status(404).end();
 
-  res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('Connection', 'keep-alive');
-  res.flushHeaders();
-
-  const send = (level, msg) => res.write(`data: ${JSON.stringify({ level, msg, ts: new Date().toISOString() })}\n\n`);
-  const done = (data) => { res.write(`data: ${JSON.stringify({ type: 'done', ...data })}\n\n`); res.end(); };
+  const sse = openSSE(req, res);
+  const send = (level, msg) => sse.send({ level, msg, ts: new Date().toISOString() });
+  const done = (data) => sse.end({ type: 'done', ...data });
 
   let sourceUrl = req.query.url || model.source_url;
   if (!sourceUrl) {
@@ -754,7 +800,8 @@ app.get('/api/models/:id/scrape-stream', async (req, res) => {
   send('info', `Fetching: ${sourceUrl}`);
 
   try {
-    const { savedPaths, sourceSite, sourceUrl: finalUrl } = await scrapeImagesFromUrl(sourceUrl, model.uuid, send);
+    const { savedPaths, sourceSite, sourceUrl: finalUrl } = await scrapeImagesFromUrl(sourceUrl, model.uuid, send, { signal: sse.signal });
+    if (sse.aborted) return;
     if (savedPaths.length === 0) return done({ success: false, error: 'No images could be downloaded.' });
 
     send('success', `✓ Downloaded ${savedPaths.length} image(s)`);
@@ -772,32 +819,27 @@ app.get('/api/models/:id/scrape-stream', async (req, res) => {
   }
 });
 
-app.post('/api/models/:id/scrape', async (req, res) => {
+app.post('/api/models/:id(\\d+)/scrape', async (req, res) => {
   const model = db.prepare('SELECT * FROM models WHERE id = ?').get(req.params.id);
   if (!model) return res.status(404).json({ error: 'Not found' });
 
   // SSE mode if client requests it
   const useStream = req.headers.accept === 'text/event-stream';
-  if (useStream) {
-    res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('Connection', 'keep-alive');
-    res.flushHeaders();
-  }
+  const sse = useStream ? openSSE(req, res) : null;
 
   const sendLog = (level, msg) => {
-    if (useStream) res.write(`data: ${JSON.stringify({ level, msg, ts: new Date().toISOString() })}\n\n`);
+    if (sse) sse.send({ level, msg, ts: new Date().toISOString() });
   };
   const sendDone = (data) => {
-    if (useStream) { res.write(`data: ${JSON.stringify({ type: 'done', ...data })}\n\n`); res.end(); }
+    if (sse) sse.end({ type: 'done', ...data });
     else res.json(data);
   };
   const sendError = (msg) => {
-    if (useStream) { res.write(`data: ${JSON.stringify({ type: 'done', success: false, error: msg })}\n\n`); res.end(); }
+    if (sse) sse.end({ type: 'done', success: false, error: msg });
     else res.status(500).json({ error: msg });
   };
 
-  let sourceUrl = req.body.url || model.source_url;
+  let sourceUrl = req.body?.url || model.source_url;
   if (!sourceUrl) {
     const folderName = path.basename(model.folder_path);
     const detected = detectUrlFromFolderName(folderName);
@@ -809,7 +851,8 @@ app.post('/api/models/:id/scrape', async (req, res) => {
   sendLog('info', `Fetching page: ${sourceUrl}`);
 
   try {
-    const { savedPaths, sourceSite, sourceUrl: finalUrl } = await scrapeImagesFromUrl(sourceUrl, model.uuid, sendLog);
+    const { savedPaths, sourceSite, sourceUrl: finalUrl } = await scrapeImagesFromUrl(sourceUrl, model.uuid, sendLog, { signal: sse?.signal });
+    if (sse?.aborted) return;
 
     if (savedPaths.length === 0) return sendError('Found the page but could not download any images.');
 
@@ -832,7 +875,7 @@ app.post('/api/models/:id/scrape', async (req, res) => {
 });
 
 // Auto-detect source URL from folder name
-app.get('/api/models/:id/detect-url', (req, res) => {
+app.get('/api/models/:id(\\d+)/detect-url', (req, res) => {
   const model = db.prepare('SELECT folder_path, source_url FROM models WHERE id = ?').get(req.params.id);
   if (!model) return res.status(404).json({ error: 'Not found' });
 
@@ -848,7 +891,7 @@ app.get('/api/models/:id/detect-url', (req, res) => {
 // ── ZIP Image Picker ──────────────────────────────────────────────────────────
 
 // List all ZIP files for a model
-app.get('/api/models/:id/zips', (req, res) => {
+app.get('/api/models/:id(\\d+)/zips', (req, res) => {
   const model = db.prepare('SELECT * FROM models WHERE id = ?').get(req.params.id);
   if (!model) return res.status(404).json({ error: 'Not found' });
 
@@ -863,7 +906,9 @@ app.get('/api/models/:id/zips', (req, res) => {
 app.get('/api/files/:fileId/zip-contents', (req, res) => {
   const file = db.prepare('SELECT * FROM model_files WHERE id = ?').get(req.params.fileId);
   if (!file) return res.status(404).json({ error: 'File not found' });
+  try { confinePath(file.filepath); } catch (e) { if (sendPathError(res, e)) return; throw e; }
   if (!fs.existsSync(file.filepath)) return res.status(404).json({ error: 'File not found on disk' });
+  if (archiveTooBig(file.filepath)) return res.status(413).json({ error: 'Archive is larger than ARCHIVE_MAX_MB' });
 
   const IMAGE_EXTS = new Set(['.jpg', '.jpeg', '.png', '.webp', '.gif']);
   try {
@@ -900,7 +945,10 @@ app.post('/api/files/:fileId/extract-images', (req, res) => {
   const model = db.prepare('SELECT * FROM models WHERE id = ?').get(file.model_id);
   if (!model) return res.status(404).json({ error: 'Model not found' });
 
-  const { selectedFiles } = req.body; // optional: array of entry names to extract, or extract all images
+  const { selectedFiles } = req.body || {}; // optional: array of entry names to extract, or extract all images
+  try { confinePath(file.filepath); } catch (e) { if (sendPathError(res, e)) return; throw e; }
+  if (!fs.existsSync(file.filepath)) return res.status(404).json({ error: 'File not found on disk' });
+  if (archiveTooBig(file.filepath)) return res.status(413).json({ error: 'Archive is larger than ARCHIVE_MAX_MB' });
 
   const IMAGE_EXTS = new Set(['.jpg', '.jpeg', '.png', '.webp', '.gif']);
   try {
@@ -909,10 +957,11 @@ app.post('/api/files/:fileId/extract-images', (req, res) => {
     const entries = zip.getEntries().filter(e => {
       if (e.isDirectory) return false;
       const ext = path.extname(e.entryName).toLowerCase();
-      if (selectedFiles && selectedFiles.length > 0) {
+      if (!IMAGE_EXTS.has(ext)) return false; // only ever extract images
+      if (Array.isArray(selectedFiles) && selectedFiles.length > 0) {
         return selectedFiles.includes(e.entryName);
       }
-      return IMAGE_EXTS.has(ext);
+      return true;
     });
 
     if (entries.length === 0) {
@@ -1131,77 +1180,7 @@ Search for this model and provide download/purchase links.`;
   }
 });
 
-// ── Claude API Helper ─────────────────────────────────────────────────────────
-
-function callClaudeAPI(apiKey, body, { timeoutMs = 120000 } = {}) {
-  const https = require('https');
-  return new Promise((resolve, reject) => {
-    const payload = JSON.stringify(body);
-    const options = {
-      hostname: 'api.anthropic.com',
-      path: '/v1/messages',
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': apiKey,
-        'anthropic-version': '2023-06-01',
-        'Content-Length': Buffer.byteLength(payload)
-      }
-    };
-
-    const apiReq = https.request(options, (apiRes) => {
-      let data = '';
-      apiRes.on('data', chunk => data += chunk);
-      apiRes.on('end', () => {
-        // Check HTTP status BEFORE trying to parse JSON
-        if (apiRes.statusCode !== 200) {
-          // Try to extract a useful error message
-          let errMsg = `Claude API returned HTTP ${apiRes.statusCode}`;
-          if (apiRes.statusCode === 401) errMsg = 'Invalid API key — check your key at console.anthropic.com';
-          else if (apiRes.statusCode === 403) errMsg = 'API key lacks permission — check your key permissions';
-          else if (apiRes.statusCode === 429) errMsg = 'Rate limited — too many requests, wait a moment and retry';
-          else if (apiRes.statusCode === 500) errMsg = 'Claude API internal error — try again later';
-          else if (apiRes.statusCode === 529) errMsg = 'Claude API overloaded — try again in a few minutes';
-
-          // Try to get more detail from response body
-          try {
-            const parsed = JSON.parse(data);
-            if (parsed.error?.message) errMsg += `: ${parsed.error.message}`;
-          } catch {
-            // Response was HTML or other non-JSON (e.g. Cloudflare error page)
-            const titleMatch = data.match(/<title>(.*?)<\/title>/i);
-            if (titleMatch) errMsg += ` (${titleMatch[1]})`;
-            else if (data.length < 200) errMsg += ` — ${data.substring(0, 100)}`;
-          }
-          return reject(new Error(errMsg));
-        }
-
-        try {
-          const parsed = JSON.parse(data);
-          if (parsed.error) return reject(new Error(`Claude API error: ${parsed.error.message}`));
-          resolve(parsed);
-        } catch (e) {
-          reject(new Error(`Failed to parse Claude response as JSON (got ${data.substring(0, 80)}…)`));
-        }
-      });
-    });
-
-    // Timeout
-    apiReq.setTimeout(timeoutMs, () => {
-      apiReq.destroy();
-      reject(new Error(`Claude API timed out after ${Math.round(timeoutMs / 1000)}s — the request may have been too large`));
-    });
-
-    apiReq.on('error', (e) => {
-      if (e.code === 'ECONNRESET') reject(new Error('Connection to Claude API was reset — check your network'));
-      else if (e.code === 'ENOTFOUND') reject(new Error('Cannot reach api.anthropic.com — check DNS/network'));
-      else reject(new Error(`Network error calling Claude API: ${e.message}`));
-    });
-
-    apiReq.write(payload);
-    apiReq.end();
-  });
-}
+// ── Claude API Helper ─ lives in lib/claude.js (shared with organize.js) ─────
 
 // ── AI Key Test ──────────────────────────────────────────────────────────────
 
@@ -1281,13 +1260,14 @@ app.get('/api/ai/vision-tags', async (req, res) => {
   const trial = req.query.trial !== '0';
   const TRIAL_LIMIT = 10;
 
-  res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('Connection', 'keep-alive');
-  res.flushHeaders();
-  const send = (data) => res.write(`data: ${JSON.stringify(data)}\n\n`);
+  const release = acquireOr409(res, 'vision-tags');
+  if (!release) return;
+  const sse = openSSE(req, res);
+  sse.onAbort(release);
+  const send = (data) => sse.send(data);
   const log = (level, msg) => send({ level, msg, ts: new Date().toISOString() });
-  const finish = (data) => { send({ type: 'done', ...data }); res.end(); };
+  const finish = (data) => { release(); sse.end({ type: 'done', ...data }); };
+  try {
 
   const all = db.prepare(`
     SELECT m.id, m.name, m.tags, m.thumbnail_path, m.folder_path, c.name AS creator_name
@@ -1306,14 +1286,15 @@ app.get('/api/ai/vision-tags', async (req, res) => {
 
   let tagged = 0, errors = 0;
   for (let i = 0; i < batch.length; i++) {
+    if (sse.aborted) { log('warn', 'Client disconnected — stopping'); return release(); }
     const m = batch[i];
-    const rel = (m.thumbnail_path || '').replace(/^\/images\//, '');
-    const file = path.join(IMAGES_DIR, rel);
-    const ext = path.extname(file).toLowerCase();
+    // Only ever read images from IMAGES_DIR (thumbnail_path is user-editable)
+    const file = imageUrlToFile(m.thumbnail_path || '');
+    const ext = file ? path.extname(file).toLowerCase() : '';
     const media = VISION_MEDIA[ext];
     const label = `[${i + 1}/${batch.length}] ${m.creator_name || '?'} / ${m.name}`;
 
-    if (!media || !fs.existsSync(file)) { log('warn', `${label} — image missing/unsupported, skipping`); continue; }
+    if (!file || !media || !fs.existsSync(file)) { log('warn', `${label} — image missing/unsupported, skipping`); continue; }
     let b64;
     try {
       const buf = fs.readFileSync(file);
@@ -1329,7 +1310,7 @@ app.get('/api/ai/vision-tags', async (req, res) => {
           { type: 'image', source: { type: 'base64', media_type: media, data: b64 } },
           { type: 'text', text: `${meta}\n\nTag this model.` },
         ] }],
-      }, { timeoutMs: 60000 });
+      }, { timeoutMs: 60000, signal: sse.signal });
 
       const text = (parsed.content || []).filter(b => b.type === 'text').map(b => b.text).join('\n');
       const jsonMatch = text.match(/\{[\s\S]*\}/);
@@ -1349,12 +1330,13 @@ app.get('/api/ai/vision-tags', async (req, res) => {
       if (e.message.includes('Invalid API key') || e.message.includes('lacks permission')) {
         return finish({ success: false, error: e.message, tagged, total: batch.length });
       }
-      if (e.message.includes('Rate limited')) { log('warn', 'Waiting 30s…'); await new Promise(r => setTimeout(r, 30000)); i--; continue; }
+      if (e.message.includes('Rate limited')) { log('warn', 'Waiting 30s…'); await sse.sleep(30000); i--; continue; }
     }
   }
 
   log(errors ? 'warn' : 'success', `Vision tagging done — ${tagged} tagged, ${errors} error(s)`);
   finish({ success: true, tagged, total: batch.length, remaining, errors });
+  } finally { release(); }
 });
 
 // ── AI Auto-Tagging (SSE) ────────────────────────────────────────────────────
@@ -1364,15 +1346,14 @@ app.get('/api/ai/generate-tags', async (req, res) => {
   if (!apiKey) { res.status(401).json({ error: 'API key required' }); return; }
   const model = resolveTagModel(req.query.model);
 
-  // SSE setup
-  res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('Connection', 'keep-alive');
-  res.flushHeaders();
-
-  const send = (data) => res.write(`data: ${JSON.stringify(data)}\n\n`);
+  const release = acquireOr409(res, 'generate-tags');
+  if (!release) return;
+  const sse = openSSE(req, res);
+  sse.onAbort(release);
+  const send = (data) => sse.send(data);
   const log = (level, msg) => send({ level, msg, ts: new Date().toISOString() });
-  const finish = (data) => { send({ type: 'done', ...data }); res.end(); };
+  const finish = (data) => { release(); sse.end({ type: 'done', ...data }); };
+  try {
 
   // Gather all models with creator names and slicer info
   const models = db.prepare(`
@@ -1421,6 +1402,7 @@ Respond with ONLY a JSON array. Each element: {"id": <model_id>, "tags": ["tag1"
 No other text or explanation — just the JSON array.`;
 
   for (let b = 0; b < batches.length; b++) {
+    if (sse.aborted) { log('warn', 'Client disconnected — stopping'); return release(); }
     const batch = batches[b];
     const batchLabel = `Batch ${b + 1}/${batches.length}`;
     const firstCreator = batch[0]?.creator_name || 'unknown';
@@ -1446,7 +1428,7 @@ No other text or explanation — just the JSON array.`;
         max_tokens: 4096,
         system: systemPrompt,
         messages: [{ role: 'user', content: userContent }]
-      }, { timeoutMs: 180000 }); // 3 min per batch
+      }, { timeoutMs: 180000, signal: sse.signal }); // 3 min per batch
 
       const textBlocks = (parsed.content || []).filter(b => b.type === 'text');
       const fullText = textBlocks.map(b => b.text).join('\n');
@@ -1522,7 +1504,7 @@ No other text or explanation — just the JSON array.`;
       // If rate limited, wait and retry
       if (e.message.includes('Rate limited')) {
         log('warn', 'Waiting 30s before retrying…');
-        await new Promise(r => setTimeout(r, 30000));
+        await sse.sleep(30000);
         b--; // retry this batch
         continue;
       }
@@ -1534,6 +1516,7 @@ No other text or explanation — just the JSON array.`;
     : `✓ All done — tagged ${totalTagged} of ${models.length} models`;
   log(totalErrors > 0 ? 'warn' : 'success', msg);
   finish({ success: true, tagged: totalTagged, total: models.length, errors: totalErrors });
+  } finally { release(); }
 });
 
 // ── AI Image Finder (SSE) ────────────────────────────────────────────────────
@@ -1573,14 +1556,14 @@ app.get('/api/ai/find-images', async (req, res) => {
 
   if (!apiKey) { res.status(401).json({ error: 'API key required' }); return; }
 
-  res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('Connection', 'keep-alive');
-  res.flushHeaders();
-
-  const send = (data) => res.write(`data: ${JSON.stringify(data)}\n\n`);
+  const release = acquireOr409(res, 'find-images');
+  if (!release) return;
+  const sse = openSSE(req, res);
+  sse.onAbort(release);
+  const send = (data) => sse.send(data);
   const log = (level, msg) => send({ level, msg, ts: new Date().toISOString() });
-  const done = (data) => { send({ type: 'done', ...data }); res.end(); };
+  const done = (data) => { release(); sse.end({ type: 'done', ...data }); };
+  try {
 
   // Get models without thumbnails
   const allModels = db.prepare(`
@@ -1634,6 +1617,7 @@ app.get('/api/ai/find-images', async (req, res) => {
   let scraped = 0, failed = 0, apiCalls = 0;
 
   for (let i = 0; i < batch.length; i++) {
+    if (sse.aborted) { log('warn', 'Client disconnected — stopping'); return release(); }
     const model = batch[i];
     const label = `[${i + 1}/${batch.length}] ${model.creator_name || '?'} / ${model.name}`;
     const confidence = model.score >= 40 ? '●' : model.score >= 20 ? '◐' : '○';
@@ -1668,7 +1652,7 @@ Return ONLY the most likely URL. No explanation, just the URL. If you cannot fin
           max_tokens: 256,
           tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: 2 }],
           messages: [{ role: 'user', content: searchPrompt }]
-        }, { timeoutMs: 60000 });
+        }, { timeoutMs: 60000, signal: sse.signal });
 
         const textBlocks = (parsed.content || []).filter(b => b.type === 'text');
         const text = textBlocks.map(b => b.text).join('\n').trim();
@@ -1692,7 +1676,7 @@ Return ONLY the most likely URL. No explanation, just the URL. If you cannot fin
         }
         if (e.message.includes('Rate limited')) {
           log('warn', 'Rate limited — waiting 30s before retrying…');
-          await new Promise(r => setTimeout(r, 30000));
+          await sse.sleep(30000);
           i--; // retry
           continue;
         }
@@ -1706,7 +1690,7 @@ Return ONLY the most likely URL. No explanation, just the URL. If you cannot fin
       log('img', `${confidence} ${label} — scraping ${sourceUrl}`);
       const { savedPaths, sourceSite } = await scrapeImagesFromUrl(sourceUrl, model.uuid, (level, msg) => {
         log(level, `  ${msg}`);
-      });
+      }, { signal: sse.signal });
 
       if (savedPaths.length > 0) {
         const existingImages = JSON.parse(model.images || '[]');
@@ -1738,6 +1722,7 @@ Return ONLY the most likely URL. No explanation, just the URL. If you cannot fin
     log('info', `${poor.length} model(s) skipped (too little info to search)`);
   }
   done({ success: true, found: batch.length, scraped, failed, apiCalls, remaining, skippedPoor: poor.length, hitRate });
+  } finally { release(); }
 });
 
 // ── STL File Serving ──────────────────────────────────────────────────────────
@@ -1746,12 +1731,17 @@ Return ONLY the most likely URL. No explanation, just the URL. If you cannot fin
 app.get('/api/files/:fileId/stl', (req, res) => {
   const file = db.prepare('SELECT * FROM model_files WHERE id = ? AND filetype = ?').get(req.params.fileId, 'stl');
   if (!file) return res.status(404).json({ error: 'STL file not found' });
+  try { confinePath(file.filepath); } catch (e) { if (sendPathError(res, e)) return; throw e; }
   if (!fs.existsSync(file.filepath)) return res.status(404).json({ error: 'File not found on disk' });
 
   res.setHeader('Content-Type', 'model/stl');
-  res.setHeader('Content-Disposition', `inline; filename="${file.filename}"`);
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  fs.createReadStream(file.filepath).pipe(res);
+  res.setHeader('Content-Disposition', `inline; filename*=UTF-8''${encodeURIComponent(file.filename)}`);
+  const stream = fs.createReadStream(file.filepath);
+  stream.on('error', (err) => {
+    if (!res.headersSent) res.status(500).json({ error: `Could not read file: ${err.code || err.message}` });
+    else res.destroy(err);
+  });
+  stream.pipe(res);
 });
 
 // ── Print Queue ───────────────────────────────────────────────────────────────
@@ -1811,7 +1801,7 @@ app.put('/api/queue/reorder', (req, res) => {
 
 // ── Tag suggestions ───────────────────────────────────────────────────────────
 
-app.get('/api/models/:id/tag-suggestions', (req, res) => {
+app.get('/api/models/:id(\\d+)/tag-suggestions', (req, res) => {
   const model = db.prepare('SELECT id, tags, franchise, creator_id FROM models WHERE id = ?').get(req.params.id);
   if (!model) return res.status(404).json({ error: 'Not found' });
 
@@ -1891,8 +1881,9 @@ app.delete('/api/collections/:id', (req, res) => {
 });
 
 app.get('/api/collections/:id/models', (req, res) => {
-  const { page = 1, limit = 48 } = req.query;
-  const offset = (parseInt(page) - 1) * parseInt(limit);
+  const page = clampInt(req.query.page, 1, 1, 1e6);
+  const limit = clampInt(req.query.limit, 48, 1, 500);
+  const offset = (page - 1) * limit;
   const total = db.prepare('SELECT COUNT(*) as n FROM collection_models WHERE collection_id = ?').get(req.params.id).n;
   const models = db.prepare(`
     SELECT m.id, m.name, m.thumbnail_path, m.print_status, m.tags, m.franchise,
@@ -1904,8 +1895,8 @@ app.get('/api/collections/:id/models', (req, res) => {
     WHERE cm.collection_id = ?
     ORDER BY cm.sort_order ASC, cm.added_at ASC
     LIMIT ? OFFSET ?
-  `).all(req.params.id, parseInt(limit), offset);
-  res.json({ models, total, pages: Math.ceil(total / parseInt(limit)) });
+  `).all(req.params.id, limit, offset);
+  res.json({ models, total, pages: Math.ceil(total / limit) });
 });
 
 app.post('/api/collections/:id/models', (req, res) => {
@@ -1921,7 +1912,7 @@ app.delete('/api/collections/:id/models/:modelId', (req, res) => {
   res.json({ success: true });
 });
 
-app.get('/api/models/:id/collections', (req, res) => {
+app.get('/api/models/:id(\\d+)/collections', (req, res) => {
   const cols = db.prepare(`
     SELECT c.id, c.name, c.color FROM collections c
     JOIN collection_models cm ON cm.collection_id = c.id
@@ -1932,7 +1923,17 @@ app.get('/api/models/:id/collections', (req, res) => {
 
 // ── Health ────────────────────────────────────────────────────────────────────
 
-app.get('/api/health', (req, res) => res.json({ ok: true, libraryPath: LIBRARY_PATH, ...APP_VERSION }));
+function libraryWritable() {
+  try { fs.accessSync(LIBRARY_PATH, fs.constants.W_OK); return true; } catch { return false; }
+}
+app.get('/api/health', (req, res) => res.json({
+  ok: true,
+  libraryPath: LIBRARY_PATH,
+  ...APP_VERSION,
+  gitSha: process.env.GIT_SHA || 'dev',
+  buildDate: process.env.BUILD_DATE || '',
+  libraryWritable: libraryWritable(),
+}));
 
 // ── Library roots ───────────────────────────────────────────────────────────
 // Lists the top-level folders mounted under LIBRARY_PATH (one per docker-compose
@@ -1953,8 +1954,8 @@ app.get('/api/library/roots', (req, res) => {
     let accessible = false;
     try { fs.accessSync(fullPath, fs.constants.R_OK); accessible = true; } catch {}
     const count = db.prepare(
-      'SELECT COUNT(*) AS n FROM models WHERE folder_path = ? OR folder_path LIKE ?'
-    ).get(fullPath, fullPath + '/%').n;
+      "SELECT COUNT(*) AS n FROM models WHERE folder_path = ? OR folder_path LIKE ? ESCAPE '\\'"
+    ).get(fullPath, likeEscape(fullPath) + '/%').n;
     return { name, path: fullPath, accessible, modelCount: count };
   }).sort((a, b) => a.name.localeCompare(b.name));
 
@@ -2054,9 +2055,60 @@ app.delete('/api/wishlist/:id', (req, res) => {
   res.json({ success: true });
 });
 
-// Only start the server if run directly (not when imported for testing)
-if (require.main === module) {
-  app.listen(PORT, () => console.log(`The Vault v${APP_VERSION.version} (build ${APP_VERSION.build}) running on port ${PORT}`));
+// JSON error handler (must be registered after every route)
+app.use(errorHandler);
+
+// ── Process lifecycle ────────────────────────────────────────────────────────
+
+function startServer() {
+  // A crashed async handler must never take the whole server down.
+  process.on('unhandledRejection', (reason) => {
+    console.error('[unhandledRejection]', reason && reason.stack ? reason.stack : reason);
+  });
+  let shuttingDown = false;
+  process.on('uncaughtException', (err) => {
+    console.error('[uncaughtException]', err && err.stack ? err.stack : err);
+    // State may be inconsistent after a synchronous throw — shut down cleanly
+    // (Docker's restart policy brings us back).
+    shutdown('uncaughtException', 1);
+  });
+
+  // Anything left 'running' from a previous process was interrupted.
+  markRunningScans('interrupted', 'Server restarted during scan');
+
+  // Daily DB snapshot (startup if none today, then re-checked hourly)
+  try { require('./lib/backup').startDailyBackups({ db }); } catch (e) { console.error('[backup]', e.message); }
+
+  const server = app.listen(PORT, HOST, () => console.log(`The Vault v${APP_VERSION.version} (build ${APP_VERSION.build}) running on ${HOST}:${PORT}`));
+
+  function shutdown(signal, code = 0) {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`[shutdown] ${signal} received — closing`);
+    const hardExit = setTimeout(() => { console.error('[shutdown] timed out, forcing exit'); process.exit(code || 1); }, 5000);
+    hardExit.unref();
+    try { require('./lib/backup').stopDailyBackups(); } catch {}
+    server.close();
+    try { server.closeIdleConnections?.(); } catch {}
+    // SSE streams never go idle — give in-flight requests a moment, then cut them.
+    setTimeout(() => { try { server.closeAllConnections?.(); } catch {} }, 1500).unref();
+    (async () => {
+      if (scanWorker) {
+        markRunningScans('interrupted', `Server shutdown (${signal})`);
+        try { await scanWorker.terminate(); } catch {}
+      }
+      try { db.exec('PRAGMA wal_checkpoint(TRUNCATE)'); } catch (e) { console.error('[shutdown] checkpoint failed:', e.message); }
+      try { db.close(); } catch {}
+      console.log('[shutdown] database closed');
+      process.exit(code);
+    })();
+  }
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
+  return server;
 }
+
+// Only start the server if run directly (not when imported for testing)
+if (require.main === module) startServer();
 
 module.exports = app;
