@@ -1,0 +1,17 @@
+# Keep the image small and free of local state/secrets.
+node_modules
+npm-debug.log*
+tests
+coverage
+jest.config.js
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+data
+backups
+.env
+.env.*
+.DS_Store
+Dockerfile
+.dockerignore

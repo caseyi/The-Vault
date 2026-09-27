@@ -1,0 +1,10 @@
+# The image builds the app itself; never ship a local build or node_modules.
+node_modules
+build
+coverage
+npm-debug.log*
+.env
+.env.*
+.DS_Store
+Dockerfile
+.dockerignore
