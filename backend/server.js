@@ -98,7 +98,8 @@ function startScanWorker(workerData, startLogLines) {
   scanProgress = { count: 0, last: '' };
   for (const [level, msg] of startLogLines) pushLog(level, msg);
 
-  scanWorker = new Worker(path.join(__dirname, 'scan-worker.js'), { workerData });
+  // env passed explicitly: jest sandboxes process.env, and a worker would otherwise see the real one
+  scanWorker = new Worker(path.join(__dirname, 'scan-worker.js'), { workerData, env: { ...process.env } });
 
   scanWorker.on('message', (m) => {
     if (m.type === 'log') {
