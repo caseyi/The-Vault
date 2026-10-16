@@ -42,6 +42,8 @@ services:
 
       # ── A second LOCAL folder (optional) ─────────────────────────────────────
       # Uncomment and set LIBRARY2_* in .env to add another local folder.
+      # Endor: mount its 3dPrint share with DSM "Mount Remote Folder", then set
+      # LIBRARY2_HOST_PATH to that mount point and LIBRARY2_NAME=3dPrint.
       # - ${LIBRARY2_HOST_PATH}:/library/${LIBRARY2_NAME:-More Prints}:ro
 
       # ── A folder on a REMOTE NAS over SMB / CIFS (optional) ──────────────────
@@ -78,8 +80,17 @@ services:
       - CLAUDE_API_KEY=${CLAUDE_API_KEY:-}
       # Optional: Claude model for AI features (empty = built-in default)
       - CLAUDE_MODEL=${CLAUDE_MODEL:-}
-      # Archives larger than this (MB) are never opened for render extraction
+      # RAR archives larger than this (MB) are never opened (they are read into memory)
       - ARCHIVE_MAX_MB=${ARCHIVE_MAX_MB:-500}
+      # ZIPs are streamed, so any size works; 0 = no limit
+      - ZIP_MAX_MB=${ZIP_MAX_MB:-0}
+      # Image files / zip entries bigger than this (MB) are not used as thumbnails
+      - IMAGE_MAX_MB=${IMAGE_MAX_MB:-50}
+      # Display names for the libraries under /library (folder=Label, comma list)
+      - LIBRARY_LABELS=${LIBRARY_LABELS:-STL Archive=Dagobah,3dPrint=Endor}
+      # layout = group files into works and attribute them from <library>/_Meta;
+      # legacy = the old one-card-per-folder scanner
+      - LAYOUT_MODE=${LAYOUT_MODE:-layout}
       # 1 = let the web scraper fetch LAN/private addresses (off by default)
       - SCRAPER_ALLOW_PRIVATE=${SCRAPER_ALLOW_PRIVATE:-0}
       # Optional: extra browser origins allowed to call the API cross-origin

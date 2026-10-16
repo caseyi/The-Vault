@@ -14,7 +14,11 @@ try {
 } catch {}
 
 const db = require('./db');
-const { LIBRARY_PATH, pickRenderArchives, analyzeFolder, extractImagesFromArchive } = require('./scanner');
+const { LIBRARY_PATH, pickRenderArchives, analyzeFolder, extractImagesFromArchive, analysisFromFiles, realFolder } = require('./scanner');
+const metaSummaryLib = require('./lib/meta-summary');
+const metaLib = require('./lib/meta');
+const librariesLib = require('./lib/libraries');
+const zipLib = require('./lib/zip');
 const { scrapeImagesFromUrl, detectUrlFromFolderName } = require('./scraper');
 const organizeRouter = require('./organize');
 const { wrapAsyncRoutes, originPolicy, errorHandler } = require('./lib/middleware');
@@ -30,12 +34,6 @@ const IMAGES_DIR = process.env.IMAGES_DIR || '/data/images';
 
 /** Escape LIKE wildcards so user text matches literally (use with ESCAPE '\\'). */
 const likeEscape = (s) => String(s).replace(/[\\%_]/g, '\\$&');
-/** Archives above ARCHIVE_MAX_MB (default 500) are never opened (they're read fully into memory). */
-function archiveTooBig(p) {
-  const mb = parseFloat(process.env.ARCHIVE_MAX_MB);
-  const max = (Number.isFinite(mb) && mb > 0 ? mb : 500) * 1024 * 1024;
-  try { return fs.statSync(p).size > max; } catch { return false; }
-}
 /** Parse a positive integer query param, clamped to [min, max]. */
 function clampInt(v, def, min, max) {
   const n = parseInt(v, 10);
@@ -52,6 +50,35 @@ app.use(originPolicy());
 app.use(express.json({ limit: '10mb' }));
 app.use('/images', express.static(IMAGES_DIR));
 app.use('/api/organize', organizeRouter);
+
+// ── Library metadata (_Meta) cache ────────────────────────────────────────────
+// /api/meta/* and /api/attribution/* use a plain summary of _Meta (lib/meta-summary.js).
+// Every scan sends a fresh one; otherwise meta-worker.js builds it off the main thread.
+const META_LOAD_TIMEOUT_MS = 60000;
+let metaSummary = null;
+let metaLoading = null;
+function loadMetaSummary() {
+  if (metaLoading) return metaLoading;
+  metaLoading = new Promise((resolve) => {
+    let settled = false;
+    const done = (v) => { if (!settled) { settled = true; clearTimeout(timer); resolve(v); } };
+    let w;
+    try {
+      w = new Worker(path.join(__dirname, 'meta-worker.js'), { workerData: { root: LIBRARY_PATH }, env: { ...process.env } });
+    } catch (e) { done(metaSummaryLib.failed(`_Meta could not be loaded: ${e.message}`)); return; }
+    const timer = setTimeout(() => { done(metaSummaryLib.failed(`_Meta took longer than ${META_LOAD_TIMEOUT_MS / 1000}s to load`)); w.terminate(); }, META_LOAD_TIMEOUT_MS);
+    if (timer.unref) timer.unref();
+    w.once('message', done);
+    w.once('error', (e) => done(metaSummaryLib.failed(`_Meta could not be loaded: ${e.message}`)));
+    w.once('exit', (code) => done(metaSummaryLib.failed(`_Meta loader exited (${code})`)));
+  }).then((sum) => { metaSummary = sum; metaLoading = null; return sum; });
+  return metaLoading;
+}
+async function getMetaSummary({ reload = false } = {}) {
+  if (metaSummary && !reload) return metaSummary;
+  return loadMetaSummary();
+}
+const parseJSON = (s, d) => { try { const v = JSON.parse(s); return v == null ? d : v; } catch { return d; } };
 
 // ── Scan ──────────────────────────────────────────────────────────────────────
 
@@ -108,9 +135,12 @@ function startScanWorker(workerData, startLogLines) {
       if (m.msg) scanProgress.last = String(m.msg).trim();
     } else if (m.type === 'done') {
       if (m.success) {
-        const r = m.result || {};
+        const { metaSummary: freshMeta, ...r } = m.result || {};
         pushLog('success', `✓ Scan complete — ${r.modelsFound ?? 0} found · ${r.modelsAdded ?? 0} added · ${r.modelsUpdated ?? 0} updated · ${r.modelsSkipped ?? 0} skipped`);
         scanSummary = { type: 'done', success: true, ...r };
+        metaSummary = freshMeta || null; // the scan's own _Meta; null → reloaded off-thread on demand
+        gapsCache = null;
+        refreshHealthCache();
       } else {
         pushLog('error', `✗ Error: ${m.error}`);
         scanSummary = { type: 'done', success: false, error: m.error };
@@ -241,6 +271,51 @@ const SORT_MAP = {
   status:     'm.print_status ASC, m.name ASC',
 };
 
+/**
+ * Filters shared by /api/models and /api/export for the library-metadata fields:
+ * library, studio, genre (= franchise), term, kind, attributed, source, confidence.
+ * Tools (kind = 'tool') are hidden unless kind=tool or includeTools=1.
+ */
+function addLayoutFilters(q, where, params) {
+  const kinds = q.kind ? String(q.kind).split(',').map(k => k.trim()).filter(Boolean) : [];
+  if (kinds.length) {
+    where.push(`COALESCE(m.kind, 'model') IN (${kinds.map(() => '?').join(',')})`);
+    params.push(...kinds);
+  } else if (q.includeTools !== '1' && q.includeTools !== 'true' && q.favorite !== '1') {
+    // a favorite tool stays reachable: the favorites filter lists it
+    where.push(`COALESCE(m.kind, 'model') != 'tool'`);
+  }
+  if (q.library) {
+    where.push(`(m.library = ? OR m.libraries LIKE ? ESCAPE '\\')`);
+    params.push(String(q.library), `%"${likeEscape(q.library)}"%`);
+  }
+  if (q.studio) { where.push('m.studio = ?'); params.push(String(q.studio)); }
+  if (q.genre) { where.push('m.franchise = ?'); params.push(String(q.genre)); }
+  if (q.term) {
+    const t = String(q.term);
+    if (/^\d{4}$/.test(t)) { where.push('m.release_term LIKE ?'); params.push(`${t}-%`); }
+    else { where.push('m.release_term = ?'); params.push(t); }
+  }
+  if (q.source) { where.push('m.source = ?'); params.push(String(q.source)); }
+  if (q.confidence) { where.push(`COALESCE(m.confidence, 'none') = ?`); params.push(String(q.confidence)); }
+  if (q.attributed === 'yes') where.push(`m.confidence IN ('sidecar','exact','name')`);
+  else if (q.attributed === 'no') where.push(`(m.confidence IS NULL OR m.confidence IN ('none','path'))`);
+}
+
+/** List item: existing fields + parsed layout fields; heavy JSON (products) only on the detail route. */
+function shapeModel(m) {
+  const { products, attribution, ...rest } = m;
+  return {
+    ...rest,
+    tags: parseJSON(m.tags || '[]', []),
+    images: parseJSON(m.images || '[]', []),
+    kind: m.kind || 'model',
+    libraries: parseJSON(m.libraries, m.library ? [m.library] : []),
+    editions: parseJSON(m.editions, []),
+    confidence: m.confidence || null,
+  };
+}
+
 app.get('/api/models', (req, res) => {
   const { search, creator, status, tags, franchise, collection, folder, favorite, show_hidden, has_thumbnail, recently_added, sort } = req.query;
   const page = clampInt(req.query.page, 1, 1, 1e6);
@@ -250,17 +325,19 @@ app.get('/api/models', (req, res) => {
   let where = ['1=1'];
   const params = [];
 
-  // Hide hidden models by default; show_hidden=1 to include them
+  // Hide hidden models by default; show_hidden=1 to include them. Rows folded into a work by the
+  // regroup are never listed (show_folded=1 for diagnostics): their files and data live on the work.
   if (!show_hidden || show_hidden === '0') {
     where.push('(m.hidden IS NULL OR m.hidden = 0)');
   }
+  if (req.query.show_folded !== '1') where.push('m.folded_into IS NULL');
 
   // Thumbnail filter
   if (has_thumbnail === '1') {
     where.push('m.thumbnail_path IS NOT NULL');
   }
 
-  // Favorites filter
+  // Favorites filter (favorite tools are listed too: see addLayoutFilters)
   if (favorite === '1') {
     where.push('m.is_favorite = 1');
   }
@@ -290,14 +367,17 @@ app.get('/api/models', (req, res) => {
   // `folder` is an absolute container path (e.g. /library/STL Archive/SomeCreator)
   // as supplied by /api/library/tree.
   if (folder) {
-    where.push("(m.folder_path = ? OR m.folder_path LIKE ? ESCAPE '\\')");
-    params.push(folder, likeEscape(String(folder).replace(/\/+$/, '')) + '/%');
+    // works sharing a folder carry a virtual "<folder>#<slug>" path
+    where.push("(m.folder_path = ? OR m.folder_path LIKE ? ESCAPE '\\' OR m.folder_path LIKE ? ESCAPE '\\')");
+    const f = likeEscape(String(folder).replace(/\/+$/, ''));
+    params.push(folder, f + '/%', f + '#%');
   }
+  addLayoutFilters(req.query, where, params);
 
   if (search) {
-    where.push("(m.name LIKE ? ESCAPE '\\' OR c.name LIKE ? ESCAPE '\\' OR m.tags LIKE ? ESCAPE '\\' OR m.notes LIKE ? ESCAPE '\\')");
+    where.push("(m.name LIKE ? ESCAPE '\\' OR c.name LIKE ? ESCAPE '\\' OR m.tags LIKE ? ESCAPE '\\' OR m.notes LIKE ? ESCAPE '\\' OR m.character LIKE ? ESCAPE '\\' OR m.group_name LIKE ? ESCAPE '\\')");
     const s = `%${likeEscape(search)}%`;
-    params.push(s, s, s, s);
+    params.push(s, s, s, s, s, s);
   }
   if (creator) { where.push('c.name = ?'); params.push(creator); }
   if (status) { where.push('m.print_status = ?'); params.push(status); }
@@ -321,11 +401,7 @@ app.get('/api/models', (req, res) => {
   `).all(...params, limit, offset);
 
   res.json({
-    models: models.map(m => ({
-      ...m,
-      tags: JSON.parse(m.tags || '[]'),
-      images: JSON.parse(m.images || '[]')
-    })),
+    models: models.map(shapeModel),
     total,
     page,
     pages: Math.ceil(total / limit)
@@ -358,10 +434,12 @@ app.get('/api/models/:id(\\d+)', (req, res) => {
   if (!model) return res.status(404).json({ error: 'Not found' });
 
   const files = db.prepare('SELECT * FROM model_files WHERE model_id = ? ORDER BY release_name NULLS LAST, filetype, filename').all(model.id);
+  const attribution = parseJSON(model.attribution, null);
+  if (attribution) { delete attribution.sig; delete attribution.autoFranchise; delete attribution.sourceUrl; delete attribution.foldedInto; }
   res.json({
-    ...model,
-    tags: JSON.parse(model.tags || '[]'),
-    images: JSON.parse(model.images || '[]'),
+    ...shapeModel(model),
+    products: parseJSON(model.products, []).map(({ matchedBy, genre, creator, ...p }) => p),
+    attribution: attribution || { confidence: model.confidence || 'none', fields: {}, matchedFiles: 0, totalFiles: files.length },
     files
   });
 });
@@ -372,8 +450,14 @@ app.patch('/api/models/:id(\\d+)', (req, res) => {
   if (thumbnail_path !== undefined && thumbnail_path !== null && thumbnail_path !== '' && !isSafeImageUrl(thumbnail_path)) {
     return res.status(400).json({ error: 'thumbnail_path must be an /images/... path' });
   }
-  const model = db.prepare('SELECT id, print_status FROM models WHERE id = ?').get(req.params.id);
+  const model = db.prepare('SELECT id, print_status, folded_into FROM models WHERE id = ?').get(req.params.id);
   if (!model) return res.status(404).json({ error: 'Not found' });
+  if (hidden !== undefined && !hidden && model.folded_into != null) {
+    return res.status(409).json({
+      error: `This card was folded into card #${model.folded_into} when the library was regrouped into works; its files and your tags, notes and collections are on that card now. Open it instead of unhiding this one.`,
+      folded_into: model.folded_into,
+    });
+  }
 
   const updates = [];
   const params = [];
@@ -496,14 +580,17 @@ async function reextractCreator(req, res) {
     if (sse.aborted) return;
     // Yield between models so a big creator doesn't monopolise the event loop
     await new Promise(r => setImmediate(r));
-    if (!tryConfine(model.folder_path)) {
+    const folder = realFolder(model.folder_path);
+    if (!tryConfine(folder)) {
       send('warn', `  ⚠ ${model.name}: folder is outside the library, skipped`);
       skipped++;
       continue;
     }
     // Model-level hint overrides creator hint
     const effectiveHint = model.render_zip_hint || hint;
-    const analysis = analyzeFolder(model.folder_path, creator.name);
+    // Works (layout scanner) own a file list — they may share a folder or span libraries
+    const dbFiles = model.work_key ? db.prepare('SELECT filename, filepath, filesize, variant FROM model_files WHERE model_id = ?').all(model.id).filter(f => tryConfine(f.filepath)) : [];
+    const analysis = dbFiles.length ? analysisFromFiles(dbFiles) : analyzeFolder(folder, creator.name);
     const renderArchives = pickRenderArchives(analysis, effectiveHint);
 
     if (renderArchives.length === 0) {
@@ -552,26 +639,29 @@ app.patch('/api/models/:id(\\d+)/render-hint', (req, res) => {
 // ── Stats ─────────────────────────────────────────────────────────────────────
 
 app.get('/api/stats', (req, res) => {
-  const total = db.prepare('SELECT COUNT(*) as n FROM models WHERE hidden IS NULL OR hidden = 0').get().n;
-  const totalHidden = db.prepare('SELECT COUNT(*) as n FROM models WHERE hidden = 1').get().n;
+  // Tools (_Tools: slicer projects, printer files…) are not models: left out of the stats
+  const VIS = `(hidden IS NULL OR hidden = 0) AND COALESCE(kind, 'model') != 'tool'`;
+  const total = db.prepare(`SELECT COUNT(*) as n FROM models WHERE ${VIS}`).get().n;
+  // hidden by the user; rows folded into works by the regroup are not "hidden models"
+  const totalHidden = db.prepare('SELECT COUNT(*) as n FROM models WHERE hidden = 1 AND folded_into IS NULL').get().n;
   const byStatus = db.prepare(`
-    SELECT print_status, COUNT(*) as n FROM models WHERE hidden IS NULL OR hidden = 0 GROUP BY print_status
+    SELECT print_status, COUNT(*) as n FROM models WHERE ${VIS} GROUP BY print_status
   `).all();
-  const creators = db.prepare('SELECT COUNT(*) as n FROM creators').get().n;
-  const withImages = db.prepare("SELECT COUNT(*) as n FROM models WHERE thumbnail_path IS NOT NULL AND (hidden IS NULL OR hidden = 0)").get().n;
-  const favorites = db.prepare("SELECT COUNT(*) as n FROM models WHERE is_favorite = 1 AND (hidden IS NULL OR hidden = 0)").get().n;
+  const creators = db.prepare(`SELECT COUNT(*) as n FROM creators WHERE name != '_Tools'`).get().n;
+  const withImages = db.prepare(`SELECT COUNT(*) as n FROM models WHERE thumbnail_path IS NOT NULL AND ${VIS}`).get().n;
+  const favorites = db.prepare(`SELECT COUNT(*) as n FROM models WHERE is_favorite = 1 AND ${VIS}`).get().n;
   const lastScan = db.prepare('SELECT * FROM scan_log ORDER BY id DESC LIMIT 1').get();
 
   // Count models added since the last scan started
   let recentlyAdded = 0;
   if (lastScan?.started_at) {
-    recentlyAdded = db.prepare('SELECT COUNT(*) as n FROM models WHERE (hidden IS NULL OR hidden = 0) AND created_at >= ?').get(lastScan.started_at).n;
+    recentlyAdded = db.prepare(`SELECT COUNT(*) as n FROM models WHERE ${VIS} AND created_at >= ?`).get(lastScan.started_at).n;
   }
 
   // Franchise list with counts
   const franchises = db.prepare(`
     SELECT franchise, COUNT(*) as count FROM models
-    WHERE franchise IS NOT NULL AND franchise != '' AND (hidden IS NULL OR hidden = 0)
+    WHERE franchise IS NOT NULL AND franchise != '' AND ${VIS}
     GROUP BY franchise ORDER BY count DESC, franchise
   `).all();
 
@@ -679,11 +769,14 @@ app.post('/api/models/bulk', (req, res) => {
     updated = result.changes;
   }
 
+  let skippedFolded = 0;
   if (hidden !== undefined) {
+    // rows folded into a work stay hidden (PATCH answers 409 for them)
     const result = db.prepare(
-      `UPDATE models SET hidden = ?, updated_at = datetime('now') WHERE id IN (${placeholders})`
+      `UPDATE models SET hidden = ?, updated_at = datetime('now') WHERE id IN (${placeholders}) AND folded_into IS NULL`
     ).run(hidden ? 1 : 0, ...ids);
     updated = result.changes;
+    if (!hidden) skippedFolded = ids.length - result.changes;
   }
 
   if (tags_add && tags_add.length > 0) {
@@ -708,7 +801,7 @@ app.post('/api/models/bulk', (req, res) => {
     updated = models.length;
   }
 
-  res.json({ success: true, updated });
+  res.json({ success: true, updated, ...(skippedFolded > 0 ? { skippedFolded } : {}) });
 });
 
 // ── Export ────────────────────────────────────────────────────────────────────
@@ -723,10 +816,12 @@ app.get('/api/export', (req, res) => {
   if (!show_hidden || show_hidden === '0') {
     where.push('(m.hidden IS NULL OR m.hidden = 0)');
   }
+  where.push('m.folded_into IS NULL');
   if (has_thumbnail === '1') {
     where.push('m.thumbnail_path IS NOT NULL');
   }
   if (franchise) { where.push('m.franchise = ?'); params.push(franchise); }
+  addLayoutFilters(req.query, where, params);
   if (collection) {
     where.push('m.id IN (SELECT model_id FROM collection_models WHERE collection_id = ?)');
     params.push(collection);
@@ -791,7 +886,7 @@ app.get('/api/models/:id(\\d+)/scrape-stream', async (req, res) => {
 
   let sourceUrl = req.query.url || model.source_url;
   if (!sourceUrl) {
-    const folderName = path.basename(model.folder_path);
+    const folderName = path.basename(realFolder(model.folder_path));
     const detected = detectUrlFromFolderName(folderName);
     if (detected) { sourceUrl = detected.url; send('info', `Auto-detected URL: ${sourceUrl}`); }
   }
@@ -842,7 +937,7 @@ app.post('/api/models/:id(\\d+)/scrape', async (req, res) => {
 
   let sourceUrl = req.body?.url || model.source_url;
   if (!sourceUrl) {
-    const folderName = path.basename(model.folder_path);
+    const folderName = path.basename(realFolder(model.folder_path));
     const detected = detectUrlFromFolderName(folderName);
     if (detected) { sourceUrl = detected.url; sendLog('info', `Auto-detected URL from folder name: ${sourceUrl}`); }
   }
@@ -882,7 +977,7 @@ app.get('/api/models/:id(\\d+)/detect-url', (req, res) => {
 
   if (model.source_url) return res.json({ url: model.source_url, source: 'saved' });
 
-  const folderName = path.basename(model.folder_path);
+  const folderName = path.basename(realFolder(model.folder_path));
   const detected = detectUrlFromFolderName(folderName);
   if (detected) return res.json({ url: detected.url, site: detected.site, source: 'folder_name' });
 
@@ -904,28 +999,20 @@ app.get('/api/models/:id(\\d+)/zips', (req, res) => {
 });
 
 // Preview images inside a ZIP without extracting
-app.get('/api/files/:fileId/zip-contents', (req, res) => {
+app.get('/api/files/:fileId/zip-contents', async (req, res) => {
   const file = db.prepare('SELECT * FROM model_files WHERE id = ?').get(req.params.fileId);
   if (!file) return res.status(404).json({ error: 'File not found' });
   try { confinePath(file.filepath); } catch (e) { if (sendPathError(res, e)) return; throw e; }
   if (!fs.existsSync(file.filepath)) return res.status(404).json({ error: 'File not found on disk' });
-  if (archiveTooBig(file.filepath)) return res.status(413).json({ error: 'Archive is larger than ARCHIVE_MAX_MB' });
+  if (zipLib.zipTooBig(file.filepath)) return res.status(413).json({ error: 'Archive is larger than ZIP_MAX_MB/ARCHIVE_MAX_MB' });
 
-  const IMAGE_EXTS = new Set(['.jpg', '.jpeg', '.png', '.webp', '.gif']);
   try {
-    const AdmZip = require('adm-zip');
-    const zip = new AdmZip(file.filepath);
-    const entries = zip.getEntries()
+    // yauzl reads the central directory only — fine for multi-GB archives
+    const entries = (await zipLib.listZip(file.filepath))
       .filter(e => !e.isDirectory)
       .map(e => {
-        const ext = path.extname(e.entryName).toLowerCase();
-        return {
-          name: e.entryName,
-          basename: path.basename(e.entryName),
-          size: e.header.size,
-          isImage: IMAGE_EXTS.has(ext),
-          ext
-        };
+        const ext = path.extname(e.name).toLowerCase();
+        return { name: e.name, basename: path.basename(e.name), size: e.size, isImage: zipLib.IMAGE_EXTS.has(ext), ext };
       });
     res.json({
       filename: file.filename,
@@ -939,7 +1026,7 @@ app.get('/api/files/:fileId/zip-contents', (req, res) => {
 });
 
 // Extract images from a specific ZIP and save them
-app.post('/api/files/:fileId/extract-images', (req, res) => {
+app.post('/api/files/:fileId/extract-images', async (req, res) => {
   const file = db.prepare('SELECT * FROM model_files WHERE id = ?').get(req.params.fileId);
   if (!file) return res.status(404).json({ error: 'File not found' });
 
@@ -949,38 +1036,15 @@ app.post('/api/files/:fileId/extract-images', (req, res) => {
   const { selectedFiles } = req.body || {}; // optional: array of entry names to extract, or extract all images
   try { confinePath(file.filepath); } catch (e) { if (sendPathError(res, e)) return; throw e; }
   if (!fs.existsSync(file.filepath)) return res.status(404).json({ error: 'File not found on disk' });
-  if (archiveTooBig(file.filepath)) return res.status(413).json({ error: 'Archive is larger than ARCHIVE_MAX_MB' });
+  if (zipLib.zipTooBig(file.filepath)) return res.status(413).json({ error: 'Archive is larger than ZIP_MAX_MB/ARCHIVE_MAX_MB' });
 
-  const IMAGE_EXTS = new Set(['.jpg', '.jpeg', '.png', '.webp', '.gif']);
   try {
-    const AdmZip = require('adm-zip');
-    const zip = new AdmZip(file.filepath);
-    const entries = zip.getEntries().filter(e => {
-      if (e.isDirectory) return false;
-      const ext = path.extname(e.entryName).toLowerCase();
-      if (!IMAGE_EXTS.has(ext)) return false; // only ever extract images
-      if (Array.isArray(selectedFiles) && selectedFiles.length > 0) {
-        return selectedFiles.includes(e.entryName);
-      }
-      return true;
-    });
-
-    if (entries.length === 0) {
-      return res.status(422).json({ error: 'No image files found in this ZIP' });
-    }
-
     const modelImgDir = path.join(IMAGES_DIR, model.uuid);
-    if (!fs.existsSync(modelImgDir)) fs.mkdirSync(modelImgDir, { recursive: true });
-
-    const savedPaths = [];
-    for (const entry of entries) {
-      const safeName = path.basename(entry.entryName).replace(/[^a-zA-Z0-9._-]/g, '_');
-      const destPath = path.join(modelImgDir, safeName);
-      zip.extractEntryTo(entry, modelImgDir, false, true, false, safeName);
-      if (fs.existsSync(destPath)) {
-        savedPaths.push(`/images/${model.uuid}/${safeName}`);
-      }
-    }
+    const names = await zipLib.extractZipImages(file.filepath, modelImgDir, {
+      select: Array.isArray(selectedFiles) && selectedFiles.length ? selectedFiles : null,
+    });
+    if (!names.length) return res.status(422).json({ error: 'No image files found in this ZIP' });
+    const savedPaths = [...new Set(names)].map(n => `/images/${model.uuid}/${n}`);
 
     // Merge with existing images
     const existingImages = JSON.parse(model.images || '[]');
@@ -1303,7 +1367,7 @@ app.get('/api/ai/vision-tags', async (req, res) => {
       b64 = buf.toString('base64');
     } catch { log('warn', `${label} — could not read image`); continue; }
 
-    const meta = `File metadata:\n- name: ${m.name}\n- creator: ${m.creator_name || 'unknown'}\n- folder: ${m.folder_path.replace(/^\/library\/?/, '')}`;
+    const meta = `File metadata:\n- name: ${m.name}\n- creator: ${m.creator_name || 'unknown'}\n- folder: ${realFolder(m.folder_path).replace(/^\/library\/?/, '')}`;
     try {
       const parsed = await callClaudeAPI(apiKey, {
         model, max_tokens: 400, system: systemPrompt,
@@ -1417,7 +1481,7 @@ No other text or explanation — just the JSON array.`;
       id: m.id,
       name: m.name,
       creator: m.creator_name,
-      path: m.folder_path.replace(/^\/library\/?/, ''),
+      path: realFolder(m.folder_path).replace(/^\/library\/?/, ''),
       slicer: (m.has_chitubox || m.has_lychee) ? 'resin' : 'fdm'
     }));
 
@@ -1532,7 +1596,7 @@ function scoreMatchability(model) {
   if (model.source_url) { score += 50; reasons.push('has source URL'); }
 
   // Folder name matches a known site pattern (thingiverse ID, printables slug, etc.)
-  const folderName = path.basename(model.folder_path);
+  const folderName = path.basename(realFolder(model.folder_path));
   if (detectUrlFromFolderName(folderName)) { score += 40; reasons.push('folder has site ID'); }
 
   // Has a real creator name (not just a generic folder name)
@@ -1628,7 +1692,7 @@ app.get('/api/ai/find-images', async (req, res) => {
 
     // Try folder name detection first (free, no API call)
     if (!sourceUrl) {
-      const folderName = path.basename(model.folder_path);
+      const folderName = path.basename(realFolder(model.folder_path));
       const detected = detectUrlFromFolderName(folderName);
       if (detected) {
         sourceUrl = detected.url;
@@ -1843,14 +1907,15 @@ app.get('/api/models/:id(\\d+)/tag-suggestions', (req, res) => {
 
 app.get('/api/collections', (req, res) => {
   const cols = db.prepare(`
-    SELECT c.id, c.name, c.color, c.created_at, c.pinned,
-           COUNT(cm.id) AS model_count,
+    SELECT c.id, c.name, c.color, c.created_at, c.pinned, c.description,
+           COUNT(mm.id) AS model_count,
            (SELECT m.thumbnail_path FROM collection_models cm2
               JOIN models m ON m.id = cm2.model_id
-              WHERE cm2.collection_id = c.id AND m.thumbnail_path IS NOT NULL
+              WHERE cm2.collection_id = c.id AND m.thumbnail_path IS NOT NULL AND m.folded_into IS NULL
               ORDER BY cm2.sort_order, cm2.id LIMIT 1) AS cover
     FROM collections c
     LEFT JOIN collection_models cm ON cm.collection_id = c.id
+    LEFT JOIN models mm ON mm.id = cm.model_id AND mm.folded_into IS NULL
     GROUP BY c.id ORDER BY c.pinned DESC, c.name ASC
   `).all();
   res.json(cols);
@@ -1885,7 +1950,7 @@ app.get('/api/collections/:id/models', (req, res) => {
   const page = clampInt(req.query.page, 1, 1, 1e6);
   const limit = clampInt(req.query.limit, 48, 1, 500);
   const offset = (page - 1) * limit;
-  const total = db.prepare('SELECT COUNT(*) as n FROM collection_models WHERE collection_id = ?').get(req.params.id).n;
+  const total = db.prepare('SELECT COUNT(*) as n FROM collection_models cm JOIN models m ON m.id = cm.model_id WHERE cm.collection_id = ? AND m.folded_into IS NULL').get(req.params.id).n;
   const models = db.prepare(`
     SELECT m.id, m.name, m.thumbnail_path, m.print_status, m.tags, m.franchise,
            m.has_stl, m.has_chitubox, m.has_lychee, m.file_count,
@@ -1893,7 +1958,7 @@ app.get('/api/collections/:id/models', (req, res) => {
     FROM collection_models cm
     JOIN models m ON m.id = cm.model_id
     LEFT JOIN creators c ON c.id = m.creator_id
-    WHERE cm.collection_id = ?
+    WHERE cm.collection_id = ? AND m.folded_into IS NULL
     ORDER BY cm.sort_order ASC, cm.added_at ASC
     LIMIT ? OFFSET ?
   `).all(req.params.id, limit, offset);
@@ -1924,16 +1989,164 @@ app.get('/api/models/:id(\\d+)/collections', (req, res) => {
 
 // ── Health ────────────────────────────────────────────────────────────────────
 
-function libraryWritable() {
-  try { fs.accessSync(LIBRARY_PATH, fs.constants.W_OK); return true; } catch { return false; }
+// Libraries and writability are cached (startup, after scans, then at most once a minute in the
+// background): /api/health is polled and must never block on a slow or stalled library mount.
+const HEALTH_TTL_MS = 60000;
+const HEALTH_FS_TIMEOUT_MS = 3000;
+const healthCache = { libraries: null, libraryWritable: null, at: 0, error: null, pending: null };
+function refreshHealthCache() {
+  if (healthCache.pending) return healthCache.pending;
+  healthCache.pending = librariesLib.listLibrariesAsync(LIBRARY_PATH, metaSummary?.libraryLabels, { timeoutMs: HEALTH_FS_TIMEOUT_MS })
+    .then(({ libraries, rootWritable }) => {
+      healthCache.libraries = libraries.map(l => ({ name: l.name, path: l.path, writable: !!l.writable }));
+      healthCache.libraryWritable = rootWritable;
+      healthCache.error = null;
+    })
+    .catch((e) => { healthCache.error = e.message; })
+    .finally(() => { healthCache.at = Date.now(); healthCache.pending = null; });
+  return healthCache.pending;
 }
-app.get('/api/health', (req, res) => res.json({
-  ok: true,
-  libraryPath: LIBRARY_PATH,
-  ...APP_VERSION,
-  gitSha: process.env.GIT_SHA || 'dev',
-  buildDate: process.env.BUILD_DATE || '',
-  libraryWritable: libraryWritable(),
+refreshHealthCache();
+
+app.get('/api/health', async (req, res) => {
+  if (!healthCache.at && healthCache.pending) await healthCache.pending; // first call: bounded by HEALTH_FS_TIMEOUT_MS
+  else if (Date.now() - healthCache.at > HEALTH_TTL_MS) refreshHealthCache(); // answer from cache, refresh behind
+  res.json({
+    ok: true,
+    libraryPath: LIBRARY_PATH,
+    ...APP_VERSION,
+    gitSha: process.env.GIT_SHA || 'dev',
+    buildDate: process.env.BUILD_DATE || '',
+    libraryWritable: healthCache.libraryWritable,
+    layoutMode: (process.env.LAYOUT_MODE || 'layout').toLowerCase() === 'legacy' ? 'legacy' : 'layout',
+    libraries: healthCache.libraries || [],
+    ...(healthCache.error ? { libraryError: healthCache.error } : {}),
+    librariesCheckedAt: healthCache.at ? new Date(healthCache.at).toISOString() : null,
+  });
+});
+
+// ── Facets, _Meta and attribution (docs/library-metadata.md §7) ──────────────
+
+const ATTRIBUTED = new Set(['sidecar', 'exact', 'name']);
+const countList = (m) => [...m.entries()].map(([name, count]) => ({ name, count })).sort((a, b) => b.count - a.count || String(a.name).localeCompare(String(b.name)));
+
+app.get('/api/facets', (req, res) => {
+  const rows = db.prepare(`
+    SELECT m.library, m.libraries, m.studio, m.franchise, m.release_term, COALESCE(m.kind, 'model') AS kind, m.source, m.confidence, c.name AS creator
+    FROM models m LEFT JOIN creators c ON c.id = m.creator_id
+    WHERE (m.hidden IS NULL OR m.hidden = 0)
+  `).all();
+  const f = { libraries: new Map(), studios: new Map(), creators: new Map(), genres: new Map(), terms: new Map(), kinds: new Map(), sources: new Map(), confidence: new Map() };
+  const inc = (m, k) => { if (k) m.set(k, (m.get(k) || 0) + 1); };
+  for (const r of rows) {
+    inc(f.kinds, r.kind);
+    if (r.kind === 'tool') continue;
+    const libs = parseJSON(r.libraries, r.library ? [r.library] : []);
+    for (const l of libs) inc(f.libraries, l);
+    inc(f.studios, r.studio); inc(f.creators, r.creator); inc(f.genres, r.franchise); inc(f.terms, r.release_term);
+    inc(f.sources, r.source); inc(f.confidence, r.confidence || 'none');
+  }
+  const out = Object.fromEntries(Object.entries(f).map(([k, m]) => [k, countList(m)]));
+  out.terms.sort((a, b) => String(b.name).localeCompare(String(a.name)));
+  res.json(out);
+});
+
+/**
+ * _Meta status. model.json sidecars are read by the scanner (it walks the library, the server
+ * does not): their count and the unreadable ones come from the last full scan.
+ */
+function metaStatusBody(sum) {
+  const st = JSON.parse(JSON.stringify(sum.status));
+  const sc = parseInt(db.getSetting ? db.getSetting('meta_sidecars') : '', 10);
+  if (Number.isFinite(sc)) st.counts.sidecars = sc;
+  const bad = parseJSON(db.getSetting ? db.getSetting('meta_sidecar_errors') : null, []);
+  if (Array.isArray(bad) && bad.length) {
+    st.errors = [...st.errors, ...bad.slice(0, 50)];
+    st.counts.sidecarErrors = bad.length;
+  }
+  return st;
+}
+// Express 4 does not catch rejected promises: async routes go through this
+const asyncRoute = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+app.get('/api/meta/status', asyncRoute(async (req, res) => res.json(metaStatusBody(await getMetaSummary()))));
+app.post('/api/meta/reload', asyncRoute(async (req, res) => { gapsCache = null; res.json(metaStatusBody(await getMetaSummary({ reload: true }))); }));
+
+/**
+ * Owned manifest products with no file in any library. A product is present when any of its
+ * files (name key + size) is in model_files on any card, or a card/file was attributed to it.
+ * Listed once per creator + name (a product bought twice has two download URLs).
+ */
+let gapsCache = null; // { sum, fp, owned }
+function ownedKeys(sum) {
+  const fp = db.prepare('SELECT COUNT(*) AS n, MAX(id) AS mx FROM model_files').get();
+  const fpKey = `${fp.n}|${fp.mx}`;
+  if (gapsCache && gapsCache.sum === sum && gapsCache.fp === fpKey) return gapsCache;
+  const wanted = new Set();
+  for (const p of sum.products) for (const k of p.keys) wanted.add(k);
+  const sizes = new Set([...wanted].map(k => k.slice(k.lastIndexOf('|') + 1)));
+  const files = new Set();
+  for (const r of db.prepare('SELECT filename, filesize FROM model_files WHERE filesize IS NOT NULL').iterate()) {
+    if (!sizes.has(String(r.filesize))) continue; // fileKey() only for candidate sizes
+    const k = `${metaLib.fileKey(r.filename)}|${r.filesize}`;
+    if (wanted.has(k)) files.add(k);
+  }
+  const products = new Set();
+  for (const r of db.prepare(`SELECT products FROM models WHERE products IS NOT NULL AND products != '[]'`).all()) {
+    for (const p of parseJSON(r.products, [])) products.add(p.libraryUrl || p.name);
+  }
+  for (const r of db.prepare('SELECT DISTINCT product FROM model_files WHERE product IS NOT NULL').all()) products.add(r.product);
+  gapsCache = { sum, fp: fpKey, files, products };
+  return gapsCache;
+}
+async function attributionGaps(creatorFilter) {
+  const sum = await getMetaSummary();
+  const { files, products } = ownedKeys(sum);
+  const want = creatorFilter ? String(creatorFilter).toLowerCase() : null;
+  const missing = new Map();
+  for (const p of sum.products) {
+    if (products.has(p.libraryUrl || p.name) || products.has(p.name) || p.keys.some(k => files.has(k))) continue;
+    if (want && ![p.creator, p.rawCreator, p.studio].some(x => x && String(x).toLowerCase() === want)) continue;
+    const id = `${String(p.creator || '').toLowerCase()}|${String(p.name).toLowerCase()}`;
+    const prev = missing.get(id);
+    if (prev && prev.files >= p.files) continue;
+    missing.set(id, {
+      creator: p.creator, name: p.name, term: p.term || null, libraryUrl: p.libraryUrl, productUrl: p.productUrl || null,
+      files: p.files, sizeGB: Math.round(p.bytes / 1e7) / 100,
+    });
+  }
+  // a product (creator + name) present under another download URL is not missing
+  for (const p of sum.products) {
+    if (products.has(p.libraryUrl || p.name) || p.keys.some(k => files.has(k))) missing.delete(`${String(p.creator || '').toLowerCase()}|${String(p.name).toLowerCase()}`);
+  }
+  return [...missing.values()]
+    .sort((a, b) => String(a.creator).localeCompare(String(b.creator)) || String(b.term || '').localeCompare(String(a.term || '')) || a.name.localeCompare(b.name));
+}
+
+app.get('/api/attribution/summary', asyncRoute(async (req, res) => {
+  const rows = db.prepare(`
+    SELECT m.libraries, m.library, m.studio, m.confidence FROM models m
+    WHERE (m.hidden IS NULL OR m.hidden = 0) AND COALESCE(m.kind, 'model') != 'tool'
+  `).all();
+  const byConfidence = {};
+  const lib = new Map(), studio = new Map();
+  const add = (m, k, a) => { if (!k) return; const v = m.get(k) || { name: k, total: 0, attributed: 0 }; v.total++; if (a) v.attributed++; m.set(k, v); };
+  for (const r of rows) {
+    const c = r.confidence || 'none';
+    byConfidence[c] = (byConfidence[c] || 0) + 1;
+    const a = ATTRIBUTED.has(c);
+    for (const l of parseJSON(r.libraries, r.library ? [r.library] : [])) add(lib, l, a);
+    add(studio, r.studio || 'Other', a);
+  }
+  res.json({
+    total: rows.length, byConfidence,
+    byLibrary: [...lib.values()].sort((a, b) => b.total - a.total),
+    byStudio: [...studio.values()].sort((a, b) => b.total - a.total),
+    gaps: (await attributionGaps()).length,
+  });
+}));
+
+app.get('/api/attribution/gaps', asyncRoute(async (req, res) => {
+  res.json({ products: await attributionGaps(req.query.creator) });
 }));
 
 // ── Library roots ───────────────────────────────────────────────────────────
@@ -1973,7 +2186,8 @@ app.get('/api/library/tree', (req, res) => {
   const root = { name: 'Library', path: LIBRARY_PATH, children: {}, count: 0 };
   const base = LIBRARY_PATH.replace(/\/+$/, '');
 
-  for (const { folder_path } of rows) {
+  for (const row of rows) {
+    const folder_path = realFolder(row.folder_path); // virtual "<folder>#<slug>" counts toward its folder
     if (!folder_path || !folder_path.startsWith(base)) continue;
     const rel = folder_path.slice(base.length).replace(/^\/+/, '');
     const parts = rel.split('/').filter(Boolean);

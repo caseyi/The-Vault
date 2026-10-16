@@ -12,7 +12,6 @@ on:
       - '.github/scripts/smoke-scan.js'
       - '.github/workflows/backend-smoke.yml'
   pull_request:
-    branches: [main]
     paths:
       - 'backend/**'
       - 'native/scripts/**'

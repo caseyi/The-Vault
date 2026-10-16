@@ -1,7 +1,8 @@
 import React, { useState, useEffect, useCallback, useRef, useMemo, memo } from 'react';
 import { apiGet, apiSend, errorMessage, isAbortError } from '../api';
 import { useNotify } from '../components/Notices';
-import { activeFilterChips, EMPTY_FILTERS } from '../filters';
+import { activeFilterChips, EMPTY_FILTERS, filterParams } from '../filters';
+import { cardEditions, multiLibraryLabel, formatTerm, isAttributed } from '../library';
 
 const STATUS_ICONS = {
   unprinted: '○', sliced: '◑', printing: '◕', printed: '●', painted: '★', failed: '✗'
@@ -12,7 +13,23 @@ const STATUS_OPTIONS = ['unprinted', 'sliced', 'printing', 'printed', 'painted',
 export const SEARCH_DEBOUNCE_MS = 250;
 const PAGE_SIZE = 48;
 
-const ModelCard = memo(function ModelCard({ model, onClick, bulkMode, selected, onToggle, onHide, onFavorite }) {
+/** Edition chips, a multi-library badge and (when asked) an unattributed marker. */
+export function CardMeta({ model, showAttribution }) {
+  const editions = cardEditions(model);
+  const libs = multiLibraryLabel(model);
+  const unattributed = showAttribution && !!model.confidence && !isAttributed(model.confidence);
+  if (!editions.length && !libs && !unattributed && model.kind !== 'release-item') return null;
+  return (
+    <div className="card-meta">
+      {editions.map(e => <span key={e} className={`edition-chip ed-${e.toLowerCase()}`}>{e}</span>)}
+      {model.kind === 'release-item' && !editions.length && <span className="edition-chip ed-release">Release item</span>}
+      {libs && <span className="library-badge" title={`Files in ${libs}`}><span aria-hidden="true">⇄ </span>{libs}</span>}
+      {unattributed && <span className="unattributed-mark" title="No purchase record matched this work">◌ unattributed</span>}
+    </div>
+  );
+}
+
+const ModelCard = memo(function ModelCard({ model, onClick, bulkMode, selected, onToggle, onHide, onFavorite, showAttribution }) {
   const imgs = model.images || [];
   const [imgIdx, setImgIdx] = useState(0);
   const [imgLoaded, setImgLoaded] = useState(false);
@@ -90,7 +107,11 @@ const ModelCard = memo(function ModelCard({ model, onClick, bulkMode, selected, 
       )}
       <div className="model-card-body">
         <div className="model-card-name" title={model.name}>{model.name}</div>
-        <div className="model-card-creator">{model.creator_name || 'Unknown'}</div>
+        <div className="model-card-sub">
+          <span className="model-card-creator">{model.creator_name || 'Unknown'}</span>
+          {model.release_term && <span className="model-card-term" title={`Release term ${formatTerm(model.release_term)}`}>{formatTerm(model.release_term)}</span>}
+        </div>
+        <CardMeta model={model} showAttribution={showAttribution} />
         <div className="model-card-footer">
           <span className={`status-badge status-${model.print_status}`}>
             {STATUS_ICONS[model.print_status]} {model.print_status}
@@ -276,6 +297,20 @@ function FilterChips({ chips, onRemove, onClearAll }) {
   );
 }
 
+/** Name + description of the collection being browsed (e.g. "Was: DC" from the regroup). */
+export function CollectionBanner({ collection }) {
+  if (!collection || !collection.description) return null;
+  return (
+    <div className="collection-banner" role="note" aria-label={`About collection ${collection.name}`}>
+      <span className="collection-banner-dot" style={{ background: collection.color }} aria-hidden="true" />
+      <div className="collection-banner-body">
+        <div className="collection-banner-name">{collection.name}</div>
+        <div className="collection-banner-desc">{collection.description}</div>
+      </div>
+    </div>
+  );
+}
+
 const SORT_OPTIONS = [
   { value: 'creator', label: 'Creator / Name' },
   { value: 'name', label: 'Name A–Z' },
@@ -285,22 +320,6 @@ const SORT_OPTIONS = [
 ];
 
 const CARD_MIN = { small: 150, medium: 200, large: 290 };
-
-function buildParams(filters, showHidden) {
-  return {
-    ...(filters.search && { search: filters.search }),
-    ...(filters.creator && { creator: filters.creator }),
-    ...(filters.status && { status: filters.status }),
-    ...(filters.tags && { tags: filters.tags }),
-    ...(filters.has_thumbnail && { has_thumbnail: '1' }),
-    ...(filters.recently_added && { recently_added: '1' }),
-    ...(filters.franchise && { franchise: filters.franchise }),
-    ...(filters.collection && { collection: filters.collection }),
-    ...(filters.folder && { folder: filters.folder }),
-    ...(filters.favorite && { favorite: '1' }),
-    ...(showHidden && { show_hidden: '1' }),
-  };
-}
 
 export default function Gallery({ filters, onFilterChange, onModelClick, showHidden, onToggleHidden, onRefreshStats, refreshKey, collections, onRefreshCollections, onScanClick }) {
   const notify = useNotify();
@@ -349,7 +368,7 @@ export default function Gallery({ filters, onFilterChange, onModelClick, showHid
     }, SEARCH_DEBOUNCE_MS);
   };
 
-  const params = useMemo(() => buildParams(filters, showHidden), [filters, showHidden]);
+  const params = useMemo(() => filterParams(filters, { showHidden }), [filters, showHidden]);
 
   const buildExportUrl = () => `/api/export?${new URLSearchParams(params)}`;
 
@@ -434,7 +453,12 @@ export default function Gallery({ filters, onFilterChange, onModelClick, showHid
   };
 
   const handleBulkHide = async (hide) => {
-    await apiSend('/api/models/bulk', 'POST', { ids: selectedList, hidden: hide });
+    const r = await apiSend('/api/models/bulk', 'POST', { ids: selectedList, hidden: hide });
+    const skipped = (r && r.skippedFolded) || 0;
+    if (!hide && skipped > 0) {
+      notify(`${skipped} card${skipped !== 1 ? 's were' : ' was'} folded into a work when the library was regrouped and stay${skipped !== 1 ? '' : 's'} hidden. Open the work instead; its tags, notes and collections are there.`,
+        { type: 'info', duration: 10000 });
+    }
     clearSelection();
     reload();
     if (onRefreshStats) onRefreshStats();
@@ -445,7 +469,12 @@ export default function Gallery({ filters, onFilterChange, onModelClick, showHid
       await apiSend(`/api/models/${id}`, 'PATCH', { hidden: hide });
       reload();
       if (onRefreshStats) onRefreshStats();
-    } catch (e) { notify(`Couldn't ${hide ? 'hide' : 'unhide'} model: ${errorMessage(e)}`); }
+    } catch (e) {
+      // 409: the row was folded into a work by the regroup; the server explains where its data went
+      if (e && e.status === 409) notify(errorMessage(e), { duration: 12000 });
+      else notify(`Couldn't ${hide ? 'hide' : 'unhide'} model: ${errorMessage(e)}`);
+      reload(); // re-sync the card with the server either way
+    }
   }, [fetchModels, onRefreshStats, notify]); // eslint-disable-line
 
   const handleFavorite = useCallback(async (id, fav) => {
@@ -510,6 +539,9 @@ export default function Gallery({ filters, onFilterChange, onModelClick, showHid
       </div>
 
       <FilterChips chips={chips} onRemove={removeChip} onClearAll={clearAll} />
+      {filters.collection && Array.isArray(collections) && (
+        <CollectionBanner collection={collections.find(c => String(c.id) === String(filters.collection))} />
+      )}
 
       <div className="gallery-scroll">
         {models.length === 0 && !loading && loadedOnce && (
@@ -535,7 +567,8 @@ export default function Gallery({ filters, onFilterChange, onModelClick, showHid
             {models.map(m => (
               <ModelCard key={m.id} model={m} onClick={onModelClick}
                 bulkMode={bulkMode} selected={selectedIds.has(m.id)}
-                onToggle={toggleSelect} onHide={handleHideModel} onFavorite={handleFavorite} />
+                onToggle={toggleSelect} onHide={handleHideModel} onFavorite={handleFavorite}
+                showAttribution={!!filters.attributed} />
             ))}
           </div>
         )}

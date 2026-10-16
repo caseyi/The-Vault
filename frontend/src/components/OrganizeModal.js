@@ -4,6 +4,8 @@ import Modal, { useUniqueId } from './Modal';
 import { useConfirm } from './ConfirmDialog';
 import { useNotify } from './Notices';
 import { apiGet, apiSend, errorMessage } from '../api';
+// Only the Health → Attribution section needs it; keep it out of the main bundle.
+const AttributionHealth = React.lazy(() => import('./AttributionHealth'));
 
 const READ_ONLY_TIP = 'Library is mounted read-only';
 
@@ -490,15 +492,31 @@ function ModelRow({ m, extra, onHide }) {
   );
 }
 
-function DupGroup({ groupKey, models, label, busy, onResolve, libraryPath }) {
+/** Libraries named on a duplicate group / pair, when the backend says it spans libraries. */
+function backupLibraries(group, models) {
+  const marked = group && (group.crossLibrary || group.cross_library || group.backup);
+  const libs = [...new Set(models.map(m => m.library).filter(Boolean))];
+  if (marked) return libs.length ? libs : (Array.isArray(group.libraries) ? group.libraries : []);
+  return null;
+}
+
+function DupGroup({ groupKey, models, label, busy, onResolve, libraryPath, backupOf }) {
   const best = [...models].sort((a, b) =>
     (Number(!!b.thumbnail_path) - Number(!!a.thumbnail_path)) || ((b.file_count || 0) - (a.file_count || 0))
   )[0];
   const [keepId, setKeepId] = useState(best?.id);
   const others = models.length - 1;
   return (
-    <div className="org-dupe-pair">
-      <div className="org-dupe-score">{label}</div>
+    <div className={`org-dupe-pair ${backupOf ? 'is-backup' : ''}`}>
+      <div className="org-dupe-score">
+        {backupOf && <span className="backup-badge">BACKUP</span>}
+        {label}
+      </div>
+      {backupOf && (
+        <div className="org-hint-inline backup-hint">
+          Same files in {backupOf.length > 1 ? backupOf.join(' and ') : 'two libraries'}: this is a backup copy, not a duplicate. Nothing needs fixing.
+        </div>
+      )}
       <div role="radiogroup" aria-label={`Choose which copy to keep: ${label}`}
         style={{ display: 'flex', flexWrap: 'wrap', gap: 8, padding: '8px' }}>
         {models.map(m => {
@@ -514,7 +532,7 @@ function DupGroup({ groupKey, models, label, busy, onResolve, libraryPath }) {
                 : <div className="org-dupe-thumb org-dupe-thumb-ph" aria-hidden="true">🧩</div>}
               <div style={{ minWidth: 0, flex: 1 }}>
                 <div className="org-dupe-name">{sel && <span className="org-dupe-keep-badge">KEEP</span>}{m.name}</div>
-                <div className="org-dupe-meta">{m.creator_name || '?'} · {m.file_count || 0} files · {tagCount} tags{m.thumbnail_path ? ' · 🖼' : ''}</div>
+                <div className="org-dupe-meta">{m.library ? `${m.library} · ` : ''}{m.creator_name || '?'} · {m.file_count || 0} files · {tagCount} tags{m.thumbnail_path ? ' · 🖼' : ''}</div>
                 {rel && <div className="org-dupe-path" title={m.folder_path}>📁 {rel}</div>}
               </div>
             </label>
@@ -532,6 +550,46 @@ function DupGroup({ groupKey, models, label, busy, onResolve, libraryPath }) {
   );
 }
 
+function fmtSize(b) {
+  if (!b) return '';
+  if (b >= 1024 ** 3) return `${(b / 1024 ** 3).toFixed(2)} GB`;
+  if (b >= 1024 ** 2) return `${(b / 1024 ** 2).toFixed(1)} MB`;
+  return `${Math.round(b / 1024)} KB`;
+}
+
+/** Files in two libraries (Dagobah + Endor) are backups, not duplicates. */
+function BackupNote({ count }) {
+  if (!count) return null;
+  return (
+    <div className="org-hint-inline backup-note">
+      <span className="backup-badge">BACKUP</span>
+      {Number(count).toLocaleString()} file{count !== 1 ? 's are' : ' is'} stored in more than one library. Those are backup copies, not duplicates, and are not listed here.
+    </div>
+  );
+}
+
+/** Same file name + size more than once inside ONE library. Read-only. */
+function FileDupRow({ d, libraryPath }) {
+  const copies = Array.isArray(d.copies) ? d.copies : [];
+  return (
+    <div className="org-dupe-pair">
+      <div className="org-dupe-score">
+        {d.library && <span className="backup-badge dup-lib">{d.library}</span>}
+        {copies.length} copies · {fmtSize(d.filesize)}
+      </div>
+      <div className="file-dup-name" title={d.filename}>{d.filename}</div>
+      <ul className="file-dup-copies">
+        {copies.map((c, i) => (
+          <li key={`${c.filepath}-${i}`} title={c.filepath}>
+            {c.model_name && <span className="org-health-creator">{c.model_name}</span>}{' '}
+            <span className="org-dupe-path">📁 {relativeFolder(c.filepath, libraryPath)}</span>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
 function HealthTab({ onAnnotateThese, libraryPath }) {
   const notify = useNotify();
   const [confirmUi, askConfirm] = useConfirm();
@@ -545,6 +603,14 @@ function HealthTab({ onAnnotateThese, libraryPath }) {
   const [integrityLoading, setIntegrityLoading] = useState(false);
   const [resolvedKeys, setResolvedKeys] = useState(new Set()); // dup groups already handled this session
   const [resolvingKey, setResolvingKey] = useState(null);
+  const [attrSummary, setAttrSummary] = useState(undefined); // undefined = loading, null = not supported
+
+  const loadAttrSummary = useCallback(() => {
+    apiGet('/api/attribution/summary')
+      .then(d => setAttrSummary(d && typeof d === 'object' && 'total' in d ? d : null))
+      .catch(() => setAttrSummary(null));
+  }, []);
+  useEffect(() => { loadAttrSummary(); }, [loadAttrSummary]);
 
   const resolveDup = useCallback(async (groupKey, keepId, models) => {
     const drop = models.filter(m => m.id !== keepId);
@@ -619,8 +685,11 @@ function HealthTab({ onAnnotateThese, libraryPath }) {
   };
 
   const sections = [
+    ...(attrSummary ? [{ id: 'attribution', label: 'Attribution', icon: '🔖', count: attrSummary.gaps }] : []),
     { id: 'crossCreator', label: 'X-Creator Dupes', icon: '🔀', count: data?.summary?.crossCreatorDupes },
     { id: 'duplicates',   label: 'Similar Names',   icon: '⧉', count: data?.summary?.duplicatePairs },
+    ...(data?.summary?.fileDuplicates !== undefined ? [{ id: 'fileDuplicates', label: 'Duplicate Files', icon: '⧉', count: data.summary.fileDuplicates }] : []),
+    ...(data?.summary?.conflictFolders !== undefined ? [{ id: 'conflicts', label: 'Conflict Copies', icon: '⚠', count: data.summary.conflictFolders }] : []),
     { id: 'integrity',    label: 'Integrity',        icon: '🔍', count: integrityData?.summary?.missingFolders },
     { id: 'emptyFolders', label: 'Empty Folders',   icon: '📂', count: data?.summary?.emptyFolders },
     { id: 'noThumbnail',  label: 'No Thumbnail',    icon: '🖼', count: data?.summary?.noThumbnail },
@@ -682,25 +751,66 @@ function HealthTab({ onAnnotateThese, libraryPath }) {
   function renderSection() {
     if (!data) return null;
     switch (activeSection) {
+      case 'attribution':
+        return attrSummary
+          ? (
+            <React.Suspense fallback={<div className="org-hint-inline">Loading…</div>}>
+              <AttributionHealth summary={attrSummary} onSummaryChange={loadAttrSummary} />
+            </React.Suspense>
+          )
+          : <div className="org-empty">Attribution needs a newer backend.</div>;
       case 'crossCreator': {
         const groups = (data.crossCreatorDupes || []).filter(g => !resolvedKeys.has(`xc-${g.key}`));
         return groups.length === 0
           ? <div className="org-empty">No cross-creator duplicates to resolve 🎉</div>
           : groups.map(g => (
             <DupGroup key={`xc-${g.key}`} groupKey={`xc-${g.key}`} models={g.models} libraryPath={libraryPath}
+              backupOf={backupLibraries(g, g.models)}
               busy={resolvingKey === `xc-${g.key}`} onResolve={resolveDup}
               label={`"${g.key}" — ${g.models.length} copies across ${new Set(g.models.map(m => m.creator_name)).size} creators`} />
           ));
       }
       case 'duplicates': {
         const pairs = (data.duplicates || []).filter(p => !resolvedKeys.has(`dup-${p.a.id}-${p.b.id}`));
+        if (pairs.length && data.summary.backupCopies) {
+          return (<>
+            <BackupNote count={data.summary.backupCopies} />
+            {pairs.map(p => (
+              <DupGroup key={`dup-${p.a.id}-${p.b.id}`} groupKey={`dup-${p.a.id}-${p.b.id}`} models={[p.a, p.b]} libraryPath={libraryPath}
+                backupOf={backupLibraries(p, [p.a, p.b])}
+                busy={resolvingKey === `dup-${p.a.id}-${p.b.id}`} onResolve={resolveDup}
+                label={`${Math.round(p.score * 100)}% similar`} />
+            ))}
+          </>);
+        }
         return pairs.length === 0
           ? <div className="org-empty">No similar-name pairs to resolve 🎉</div>
           : pairs.map(p => (
             <DupGroup key={`dup-${p.a.id}-${p.b.id}`} groupKey={`dup-${p.a.id}-${p.b.id}`} models={[p.a, p.b]} libraryPath={libraryPath}
+              backupOf={backupLibraries(p, [p.a, p.b])}
               busy={resolvingKey === `dup-${p.a.id}-${p.b.id}`} onResolve={resolveDup}
               label={`${Math.round(p.score * 100)}% similar`} />
           ));
+      }
+      case 'fileDuplicates': {
+        const list = data.fileDuplicates || [];
+        return (<>
+          <BackupNote count={data.summary.backupCopies} />
+          {list.length === 0
+            ? <div className="org-empty">No duplicate files inside a library 🎉</div>
+            : list.map((d, i) => <FileDupRow key={`${d.filename}-${d.filesize}-${i}`} d={d} libraryPath={libraryPath} />)}
+        </>);
+      }
+      case 'conflicts': {
+        const list = data.conflictFolders || [];
+        return list.length === 0
+          ? <div className="org-empty">No Synology Drive conflict copies 🎉</div>
+          : (<>
+            <div className="org-hint-inline" style={{ margin: 8 }}>
+              Folders ending in <code>_Conflict</code> are Synology Drive conflict copies. Compare them with the original and delete the extra on the NAS.
+            </div>
+            {list.map(m => <ModelRow key={m.id} m={m} extra={folderExtra(m)} onHide={hideOne} />)}
+          </>);
       }
       case 'integrity':
         if (!integrityData) return (

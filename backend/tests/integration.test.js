@@ -123,7 +123,10 @@ describe('U1 variant folder grouping', () => {
     const parent = byPath('StudioC/Old Model');
     const kid = byPath('StudioC/Old Model/Supported');
     expect(parent).toBeTruthy();
-    expect(kid.hidden).toBe(1);
+    // the old row held all of the work's files, so it IS the work now (same row); otherwise it is folded and hidden
+    if (parent.uuid !== 'stale-uuid') expect(kid.hidden).toBe(1);
+    else expect(kid).toBeFalsy();
+    expect(parent.hidden).toBe(0);
     expect(JSON.parse(parent.tags)).toContain('legacy');
     expect(parent.print_status).toBe('printed');
     expect(parent.is_favorite).toBe(1);

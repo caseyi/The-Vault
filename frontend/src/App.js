@@ -54,6 +54,7 @@ function VaultApp() {
   const [creators, setCreators] = useState([]);
   const [filters, setFilters] = useState(() => ({ ...EMPTY_FILTERS }));
   const [tags, setTags] = useState([]);
+  const [facets, setFacets] = useState(null); // null = older backend without /api/facets
   const [folderTree, setFolderTree] = useState(null);
   const [density, setDensity] = useState(() => {
     try { return localStorage.getItem('vault_density') || 'comfortable'; } catch { return 'comfortable'; }
@@ -125,6 +126,10 @@ function VaultApp() {
     fetch(`${API}/api/creators`).then(r => r.json()).then(setCreators).catch(() => {});
     fetch(`${API}/api/tags`).then(r => r.json()).then(setTags).catch(() => {});
     fetch(`${API}/api/library/tree`).then(r => r.json()).then(setFolderTree).catch(() => {});
+    fetch(`${API}/api/facets`)
+      .then(r => (r && r.ok === false ? null : r.json()))
+      .then(d => setFacets(d && typeof d === 'object' && !Array.isArray(d) && !d.error ? d : null))
+      .catch(() => setFacets(null));
   }, []);
 
   useEffect(() => { fetchStats(); fetchQueueCount(); fetchCollections(); fetchWishlistCount(); }, [fetchStats, fetchQueueCount, fetchCollections, fetchWishlistCount]);
@@ -223,6 +228,7 @@ function VaultApp() {
         gitSha={health?.gitSha}
         onRescanCreator={openScan}
         franchises={stats?.franchises || []}
+        facets={facets}
         collections={collections}
         queueCount={queueCount}
         onQueueClick={openQueue}
