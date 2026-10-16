@@ -5,7 +5,7 @@
 # Node 22 for the built-in node:sqlite. node:sqlite is unflagged from 22.13, so
 # we follow the 22 line (security patches included) and assert it at build time
 # below instead of pinning a minor version.
-FROM node:22-alpine
+FROM node:25-alpine
 
 WORKDIR /app
 
