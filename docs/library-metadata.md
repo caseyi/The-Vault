@@ -4,8 +4,9 @@ Status: implemented on `feature/library-metadata` (stacked on `review/2026-09-ha
 
 Result on the Oct 12 2026 rebuild: 5,584 cards -> 4,464 (1,050 works, 163 dioramas, 1,306 release
 items, 1,924 folder models, 21 tools); cards with generic names 972 -> 5; Wicked-family cards
-attributed to a purchase 0 -> 788 of 1,112 (ZEZ 95 of 101); 55 owned products have no files on
-either NAS. Full scan 6.6 s, unchanged rescan 4.5 s, `_Meta` load about 1 s.
+attributed to a purchase 0 -> 778 of 1,112 (ZEZ 92 of 101, about 95% precision on a 40-card
+spot check); 47 owned products have no files on either NAS. Full scan 6.1 s (7.7 s when migrating
+a legacy DB), unchanged rescan about 4.5 s, `_Meta` load about 1 s off the main thread.
 
 This describes how The Vault reads Casey's real library (Dagobah `STL Archive`, Endor `3dPrint`),
 groups files into gallery cards ("works"), and attributes them to the Gumroad / Google Drive
@@ -129,7 +130,13 @@ The Vault never writes to the library; `_Meta` is read on scan start and on `POS
 - Old folder-based models whose files now belong to a work are folded in (tags, status, favorite,
   notes, collections, queue, per-file `printed_at`) and hidden, never deleted. One locked custom name
   carries over; several are kept in notes.
-- `LAYOUT_MODE=legacy` restores the folder-based behaviour.
+- Legacy rows become a work's base only when they share at least half their files both ways;
+  rows spread over more than 2 works fold into all of them, and if they carried user data a
+  "Was: <name>" collection keeps it. Folded rows get `folded_into`, never show in hidden lists,
+  collections or stats, and can't be unhidden.
+- The snapshot is required: if it can't be written, the scan fails without changing anything.
+- Going back = restore the `pre-regroup` snapshot, then `LAYOUT_MODE=legacy` or the previous
+  image. `LAYOUT_MODE=legacy` on a regrouped DB alone gives a hybrid.
 
 ## 9. Performance
 

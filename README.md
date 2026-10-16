@@ -325,10 +325,14 @@ The Vault reads the folder tree as metadata (full design: `docs/library-metadata
   is indexed but hidden unless you pick the Tools filter; `_Unsorted`, `_Dioramas`,
   `_Undated`, `_Bundles` are transparent.
 - The same file (name + size) in two libraries is a backup copy, not a duplicate.
-- `LAYOUT_MODE=legacy` brings back the old one-card-per-folder behaviour. The first
-  layout-aware scan snapshots the DB (`backups/vault-pre-regroup-*.db`) and folds old cards
-  (tags, status, favorites, collections, queue, printed files) into the new ones; nothing is
-  deleted.
+- The first layout-aware scan snapshots the DB (`backups/vault-pre-regroup-*.db`; the scan
+  refuses to regroup if the snapshot can't be written) and folds old cards (tags, status,
+  favorites, collections, queue, printed files) into the new ones; nothing is deleted. A
+  category card whose files now belong to many works (e.g. an old "DC" card) keeps its tags
+  and notes in a collection named "Was: DC" holding all of those works.
+- **Going back:** restore `backups/vault-pre-regroup-*.db` (see "Backups and restore") and
+  either set `LAYOUT_MODE=legacy` or run the previous image (`sudo sh update.sh sha-<old>`).
+  `LAYOUT_MODE=legacy` alone, on an already regrouped DB, does not undo the regrouping.
 
 ### Attribution files (`_Meta`)
 

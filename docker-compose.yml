@@ -84,6 +84,8 @@ services:
       - ARCHIVE_MAX_MB=${ARCHIVE_MAX_MB:-500}
       # ZIPs are streamed, so any size works; 0 = no limit
       - ZIP_MAX_MB=${ZIP_MAX_MB:-0}
+      # Image files / zip entries bigger than this (MB) are not used as thumbnails
+      - IMAGE_MAX_MB=${IMAGE_MAX_MB:-50}
       # Display names for the libraries under /library (folder=Label, comma list)
       - LIBRARY_LABELS=${LIBRARY_LABELS:-STL Archive=Dagobah,3dPrint=Endor}
       # layout = group files into works and attribute them from <library>/_Meta;
