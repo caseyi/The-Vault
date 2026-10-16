@@ -5,7 +5,7 @@
 
 # The build output is plain static files, so build on the runner's native
 # platform even when producing images for other architectures.
-FROM --platform=$BUILDPLATFORM node:22-alpine AS builder
+FROM --platform=$BUILDPLATFORM node:25-alpine AS builder
 
 WORKDIR /app
 COPY package.json package-lock.json ./
@@ -16,7 +16,7 @@ ENV REACT_APP_GIT_SHA=${GIT_SHA} \
     GENERATE_SOURCEMAP=false
 RUN npm run build
 
-FROM nginx:1.28-alpine
+FROM nginx:1.29-alpine
 
 ARG GIT_SHA=dev
 ARG BUILD_DATE=
