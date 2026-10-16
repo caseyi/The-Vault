@@ -88,6 +88,38 @@ function originPolicy() {
   };
 }
 
+/**
+ * Guard for GET routes that spend API credits (/api/ai/enrich, generate-tags, vision-tags,
+ * find-images). A GET can be triggered by any page (an <img> or a link), so:
+ *  - Sec-Fetch-Site: cross-site, or a Referer from another site → 403 (unless the Origin is allowed)
+ *  - no key in the request (key param / x-claude-key) → only same-origin requests may use the
+ *    server's CLAUDE_API_KEY (browsers send Sec-Fetch-Site: same-origin for the app's own pages)
+ */
+function spendGuard() {
+  const raw = process.env.ALLOWED_ORIGINS !== undefined ? process.env.ALLOWED_ORIGINS : DEFAULT_ORIGINS;
+  const list = raw.split(',').map(s => s.trim().replace(/\/+$/, '').toLowerCase()).filter(Boolean);
+  const allowed = new Set(list);
+  return function spendGuardMiddleware(req, res, next) {
+    const hosts = [hostnameOf(req.headers.host), hostnameOf(req.headers['x-forwarded-host'])].filter(Boolean);
+    const hostOf = (u) => { try { return new URL(u).hostname.toLowerCase(); } catch { return null; } };
+    const origin = req.headers.origin ? String(req.headers.origin).replace(/\/+$/, '').toLowerCase() : null;
+    const originOk = !!origin && (list.includes('*') || allowed.has(origin) || hosts.includes(hostOf(origin)));
+    const site = String(req.headers['sec-fetch-site'] || '').toLowerCase();
+    const deny = (why) => res.status(403).json({ error: why });
+    if (site === 'cross-site' && !originOk) return deny('This request spends API credits and came from another site; it was refused.');
+    const ref = req.headers.referer || req.headers.referrer;
+    if (ref && !originOk) {
+      const rh = hostOf(ref);
+      if (rh && !hosts.includes(rh) && !allowed.has(String(ref).replace(/^(\w+:\/\/[^/]+).*$/, '$1').toLowerCase())) return deny('This request spends API credits and came from another site; it was refused.');
+    }
+    const hasKey = !!(req.query.key || req.headers['x-claude-key']);
+    if (!hasKey && site !== 'same-origin' && !originOk) {
+      return deny('Requests that spend the server\'s API key must come from the app itself; send your key (key parameter or x-claude-key header) to call this directly.');
+    }
+    next();
+  };
+}
+
 // eslint-disable-next-line no-unused-vars
 function errorHandler(err, req, res, next) {
   const status = err.status || err.statusCode || (err instanceof PathError ? err.status : 500);
@@ -106,4 +138,4 @@ function errorHandler(err, req, res, next) {
   res.status(status).json(body);
 }
 
-module.exports = { asyncHandler, wrapAsyncRoutes, originPolicy, errorHandler, DEFAULT_ORIGINS };
+module.exports = { asyncHandler, wrapAsyncRoutes, originPolicy, spendGuard, errorHandler, DEFAULT_ORIGINS };

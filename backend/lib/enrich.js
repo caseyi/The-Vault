@@ -36,8 +36,11 @@ const COLUMNS = { character: 'character', franchise: 'franchise', group_name: 'g
 const PROTECTED = new Set(['sidecar', 'path', 'manifest', 'rules', 'drive', 'user', 'ai-reviewed']);
 /** …and these are not even proposed again: explicit metadata, or a value the user set or accepted. */
 const NO_SUGGEST = new Set(['sidecar', 'user', 'ai-reviewed']);
-const CHARS_PER_TOKEN = 3.5;        // compact JSON with names; measured ≈3.3-3.8 on real evidence
-const OUT_TOKENS_PER_ITEM = 70;     // answer item: the fake model's compact JSON is ~44 tokens on real cards; real answers add reasons and spacing
+// Approximations, on the safe side: JSON is token-dense (quotes, braces, ids)
+const CHARS_PER_TOKEN = 3.0;        // input evidence (compact JSON with names)
+const OUT_CHARS_PER_TOKEN = 2.7;    // model output JSON
+const OUT_CHARS_PER_ITEM = 220;     // one answer item with a reason; the fake model's are ~150 chars
+const OUT_TOKENS_PER_ITEM = Math.ceil(OUT_CHARS_PER_ITEM / OUT_CHARS_PER_TOKEN);
 const IMAGE_TOKENS = 1600;          // one render, Claude caps images near 1.15 MP ≈ 1,600 tokens
 const VISION_OUT_TOKENS = 110;
 
@@ -52,9 +55,15 @@ const empty = (v) => v == null || v === '' || (Array.isArray(v) && !v.length);
 const norm = (s) => String(s == null ? '' : s).toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
 const round2 = (n) => Math.round(n * 100) / 100;
 
+let warnedThresholds = false;
 function thresholds() {
   const num = (v, d) => { const n = parseFloat(v); return Number.isFinite(n) && n >= 0 && n <= 1 ? n : d; };
-  return { auto: num(process.env.ENRICH_AUTO_MIN, 0.8), suggest: num(process.env.ENRICH_SUGGEST_MIN, 0.5) };
+  const t = { auto: num(process.env.ENRICH_AUTO_MIN, 0.8), suggest: num(process.env.ENRICH_SUGGEST_MIN, 0.5) };
+  if (t.auto < t.suggest) {
+    if (!warnedThresholds) { warnedThresholds = true; console.warn(`[enrich] ENRICH_AUTO_MIN (${t.auto}) is below ENRICH_SUGGEST_MIN (${t.suggest}); using ${t.suggest} for both`); }
+    t.auto = t.suggest;
+  }
+  return t;
 }
 
 function fakeEnabled() { return process.env.ENRICH_FAKE === '1'; }
@@ -63,8 +72,14 @@ function fakeEnabled() { return process.env.ENRICH_FAKE === '1'; }
 function getClient(log = () => {}) {
   if (fakeEnabled()) {
     log('warn', '⚠ ENRICH_FAKE=1: answers come from the dev fake model (tests/fixtures/enrich-fake.js), NOT from Claude. Never use this in production.');
+    let fake;
     // eslint-disable-next-line global-require
-    return require('../tests/fixtures/enrich-fake').callClaudeAPI;
+    try { fake = require('../tests/fixtures/enrich-fake'); } catch (e) {
+      const err = new Error('ENRICH_FAKE=1 needs the dev fake model (tests/fixtures/enrich-fake.js), which is not part of this build. Unset ENRICH_FAKE to use Claude.');
+      err.fatal = true;
+      throw err;
+    }
+    return fake.callClaudeAPI;
   }
   // resolved per call so tests can jest.mock('../lib/claude')
   // eslint-disable-next-line global-require
@@ -155,6 +170,7 @@ function nearDuplicates(cards) {
         // two releases of one character are not duplicates (Daredevil 2025 vs Daredevil Netflix)
         const rx = releaseOf(x.c.work_key), re = releaseOf(e.c.work_key);
         if ((rx.release || re.release) && rx.release !== re.release) continue;
+        if ((x.c.kind || 'model') !== (e.c.kind || 'model')) continue; // a work is not merged into a diorama
         let score = 0;
         if (x.compact === e.compact) score = 1;
         else {
@@ -374,7 +390,38 @@ function extractJSON(text) {
   throw new Error('response is not valid JSON');
 }
 
-const cleanStr = (v, max = 80) => (typeof v === 'string' && v.trim() && v.trim().length <= max ? v.trim().replace(/\s+/g, ' ') : null);
+/** Spreadsheet formula / injection prefixes are refused (values end up in CSV exports). */
+const FORMULA_START = /^[=+\-@\t\r]/;
+/**
+ * The complete top-level objects of a JSON array cut off mid-way (an answer that hit max_tokens).
+ * String-aware brace matching; anything after the last complete object is dropped.
+ */
+function salvageObjects(text) {
+  const t = String(text || '');
+  const start = t.indexOf('[');
+  if (start === -1) return [];
+  const out = [];
+  let depth = 0, inStr = false, esc = false, objStart = -1;
+  for (let i = start + 1; i < t.length; i++) {
+    const ch = t[i];
+    if (inStr) { if (esc) esc = false; else if (ch === '\\') esc = true; else if (ch === '"') inStr = false; continue; }
+    if (ch === '"') { inStr = true; continue; }
+    if (ch === '{') { if (depth === 0) objStart = i; depth++; }
+    else if (ch === '}') {
+      depth--;
+      if (depth === 0 && objStart !== -1) { try { out.push(JSON.parse(t.slice(objStart, i + 1))); } catch { /* skip */ } objStart = -1; }
+      if (depth < 0) break;
+    } else if (ch === ']' && depth === 0) break;
+  }
+  return out;
+}
+
+const cleanStr = (v, max = 80) => {
+  if (typeof v !== 'string') return null;
+  const t = v.trim().replace(/\s+/g, ' ');
+  if (!t || t.length > max || FORMULA_START.test(v.replace(/^ +/, '')) || /[<>]/.test(t)) return null;
+  return t;
+};
 
 /**
  * Validate a batch answer. Never throws for item-level problems; they are reported in `errors`.
@@ -386,7 +433,13 @@ function validateResponse(text, batch) {
   const errors = [];
   const items = new Map();
   let data;
-  try { data = extractJSON(text); } catch (e) { return { items, errors: [`malformed JSON: ${e.message}`], fatal: true }; }
+  let truncated = false;
+  try { data = extractJSON(text); } catch (e) {
+    data = salvageObjects(text);
+    if (!data.length) return { items, errors: [`malformed JSON: ${e.message}`], fatal: true };
+    truncated = true;
+    errors.push(`truncated JSON: kept ${data.length} complete item(s)`);
+  }
   if (!Array.isArray(data)) data = data && Array.isArray(data.items) ? data.items : (data && typeof data === 'object' && data.id != null ? [data] : null);
   if (!data) return { items, errors: ['expected a JSON array of items'], fatal: true };
   const ids = batch instanceof Map ? batch : new Map([...batch].map(id => [id, null]));
@@ -409,9 +462,13 @@ function validateResponse(text, batch) {
         if (arr.length && mapped.every(Boolean)) val = EDITIONS.filter(e => mapped.includes(e));
       } else if (f === 'tags') {
         const arr = Array.isArray(v) ? v : [];
-        const tags = [...new Set(arr.map(x => (typeof x === 'string' ? x.trim().toLowerCase().replace(/\s+/g, ' ') : '')).filter(x => x && x.length <= 40))];
+        const tags = [...new Set(arr.map(x => (typeof x === 'string' ? x.trim().toLowerCase().replace(/\s+/g, ' ') : '')).filter(x => x && x.length <= 40 && !FORMULA_START.test(x) && !/[<>]/.test(x)))];
         if (tags.length) val = tags.slice(0, TAG_CAP);
-      } else val = cleanStr(v, f === 'name' ? 100 : 80);
+      } else {
+        val = cleanStr(v, f === 'name' ? 100 : 80);
+        // "Supported", "STL Files", "..": variant / file words, not a character, genre or group
+        if (val && f !== 'name' && similar.isVariantOnlyName(val)) val = null;
+      }
       if (val == null) { errors.push(`${id}.${f}: invalid value`); continue; }
       out[f] = { v: val, c };
     }
@@ -425,14 +482,21 @@ function validateResponse(text, batch) {
       else out.merge = { into, c };
     }
     if (raw.needs_vision === true) out.needs_vision = true;
-    const why = cleanStr(raw.why ?? raw.reason, 300);
+    const whyRaw = raw.why ?? raw.reason;
+    const why = typeof whyRaw === 'string' && whyRaw.trim() ? whyRaw.trim().replace(/\s+/g, ' ').slice(0, 300) : null;
     if (why) out.why = why;
     items.set(id, out);
   }
-  return { items, errors };
+  return { items, errors, truncated };
 }
 
 // ── policy ───────────────────────────────────────────────────────────────────
+
+/** userFields + removedTags of a card. */
+function fieldAttr(card) {
+  const attr = parseJSON(card.attribution, {});
+  return { userFields: Array.isArray(attr.userFields) ? attr.userFields : [], removedTags: Array.isArray(attr.removedTags) ? attr.removedTags : [] };
+}
 
 /** Current value + provenance of a field on a card row. */
 function fieldState(card, f) {
@@ -466,12 +530,14 @@ function planActions(card, ans, ctx) {
     if (!a) continue;
     const { value: cur, prov } = fieldState(card, f);
     if (f === 'tags') {
-      const have = new Set((cur || []).map(norm));
-      const add = a.v.filter(t => !have.has(norm(t))).slice(0, Math.max(0, TAG_CAP - (cur || []).length));
+      // tags the user removed, or rejected before, are never proposed again
+      const no = new Set([...(cur || []), ...fieldAttr(card).removedTags, ...((ctx.rejectedTags && ctx.rejectedTags()) || [])].map(norm));
+      const add = a.v.filter(t => !no.has(norm(t))).slice(0, Math.max(0, TAG_CAP - (cur || []).length));
       if (!add.length) continue;
       const min = ctx.tagsOnly ? ctx.suggest : ctx.auto; // generate-tags clients expect tags applied
-      if (a.c >= min) apply.push({ field: 'tags', value: [...(cur || []), ...add], added: add, c: a.c });
-      else if (a.c >= ctx.suggest && !ctx.rejected('field', 'tags', JSON.stringify(add))) suggest.push({ type: 'field', field: 'tags', current: cur || [], proposed: add, confidence: a.c, reason: why, source });
+      // tags the user edited are theirs: proposals only
+      if (a.c >= min && prov !== 'user') apply.push({ field: 'tags', value: [...(cur || []), ...add], added: add, c: a.c });
+      else if (a.c >= ctx.suggest && !ctx.tagsOnly) suggest.push({ type: 'field', field: 'tags', current: cur || [], proposed: add, confidence: a.c, reason: why, source });
       continue;
     }
     if (f === 'name' ? String(cur || '').trim() === a.v : sameValue(cur, a.v)) continue;
@@ -482,8 +548,10 @@ function planActions(card, ans, ctx) {
     }
     if (f === 'editions' && !empty(cur)) continue; // only proposed when parsing found none
     const isNewGenre = f === 'franchise' && !ctx.isKnownGenre(a.v);
+    const wasRejected = ctx.rejected('field', f, f === 'editions' ? JSON.stringify(a.v) : a.v);
+    if (wasRejected) continue; // rejected, or undone after an automatic write: never again
     if (empty(cur) && a.c >= ctx.auto && !PROTECTED.has(prov) && !isNewGenre) apply.push({ field: f, value: a.v, c: a.c });
-    else if (a.c >= ctx.suggest && !ctx.rejected('field', f, f === 'editions' ? JSON.stringify(a.v) : a.v)) {
+    else if (a.c >= ctx.suggest) {
       suggest.push({ type: 'field', field: f, current: cur, proposed: a.v, confidence: a.c, reason: why || (isNewGenre ? 'new genre' : null), source });
     }
   }
@@ -558,10 +626,13 @@ function addSuggestion(db, card, s, runId) {
 
 /** Was the same proposal rejected before for this card? (§2 "reject memory") */
 function rejectedLookup(db, modelId) {
-  const rows = db.prepare(`SELECT type, field, proposed, target_id FROM suggestions WHERE model_id = ? AND status = 'rejected'`).all(modelId);
-  return (type, field, proposed, targetId) => rows.some(r => r.type === type && (type === 'merge'
-    ? r.target_id === targetId
-    : r.field === field && norm(parseJSON(r.proposed, r.proposed)) === norm(typeof proposed === 'string' && proposed.startsWith('[') ? parseJSON(proposed, proposed) : proposed)));
+  const rows = db.prepare(`SELECT model_id, type, field, proposed, target_id FROM suggestions WHERE (model_id = ? OR (type = 'merge' AND target_id = ?)) AND status = 'rejected'`).all(modelId, modelId);
+  const fn = (type, field, proposed, targetId) => rows.some(r => r.type === type && (type === 'merge'
+    // a rejected merge stays rejected in either direction (Geral → Geralt and Geralt → Geral)
+    ? (r.model_id === modelId && r.target_id === targetId) || (r.model_id === targetId && r.target_id === modelId)
+    : r.model_id === modelId && r.field === field && norm(parseJSON(r.proposed, r.proposed)) === norm(typeof proposed === 'string' && proposed.startsWith('[') ? parseJSON(proposed, proposed) : proposed)));
+  fn.tags = () => rows.filter(r => r.model_id === modelId && r.field === 'tags').flatMap(r => { const v = parseJSON(r.proposed, []); return Array.isArray(v) ? v : [v]; });
+  return fn;
 }
 
 function isKnownGenreFn(pc) {
@@ -600,7 +671,7 @@ async function runEnrich(o) {
 
   const finishCard = (card, ans, sources = {}) => {
     const rejected = rejectedLookup(db, card.id);
-    const plan = planActions(card, ans, { ...th, isKnownGenre, rejected, tagsOnly: o.tagsOnly, source: 'text' });
+    const plan = planActions(card, ans, { ...th, isKnownGenre, rejected, rejectedTags: rejected.tags, tagsOnly: o.tagsOnly, source: 'text' });
     db.transaction(() => {
       for (const act of plan.apply) { applyAuto(db, card, act, runId); counts.applied++; }
       for (const s of plan.suggest) {
@@ -619,6 +690,8 @@ async function runEnrich(o) {
     for (const a of plan.apply) log('tag', `  ✎ ${card.name}: ${a.field} = ${Array.isArray(a.value) ? (a.added || a.value).join(', ') : a.value} (${a.c.toFixed(2)})`);
   };
 
+  const MAX_FAILED_BATCHES = 3;
+  let failedInRow = 0;
   const call = async (body, label) => {
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
@@ -627,13 +700,48 @@ async function runEnrich(o) {
         return parsed;
       } catch (e) {
         const msg = String(e.message || e);
-        if (/Invalid API key|lacks permission/.test(msg)) { counts.fatal = msg; throw e; }
+        if (e.fatal || /Invalid API key|lacks permission/.test(msg)) { counts.fatal = msg; throw e; }
         if (/cancelled/i.test(msg) || aborted()) { counts.cancelled = true; throw e; }
-        if (/Rate limited|overloaded/i.test(msg) && attempt < 2) { log('warn', `${label}: ${msg}; waiting 30s`); await sleep(30000); if (aborted()) { counts.cancelled = true; throw e; } continue; }
+        if (/Rate limited|overloaded/i.test(msg) && attempt < 2) {
+          // the API's retry-after when it sent one, else 30 s; never more than 2 minutes
+          const wait = Math.min(120, Number.isFinite(e.retryAfter) && e.retryAfter > 0 ? e.retryAfter : 30);
+          log('warn', `${label}: ${msg}; waiting ${wait}s`);
+          await sleep(wait * 1000);
+          if (aborted()) { counts.cancelled = true; throw e; }
+          continue;
+        }
         throw e;
       }
     }
     return null;
+  };
+
+  /**
+   * One batch → answers by id. An answer cut off at max_tokens keeps its complete items; the cards
+   * left without one are asked again in two halves (twice at most), so one long batch never costs
+   * a whole run.
+   */
+  const askBatch = async (batch, label, depth = 0) => {
+    const byId = new Map(batch.map(c => [c.id, c.ev]));
+    const parsed = await call({ model, max_tokens: 8000, system, messages: [{ role: 'user', content: userPrompt(batch.map(c => c.ev)) }] }, label);
+    const v = validateResponse(apiText(parsed), byId);
+    v.errorCount = 0;
+    for (const err of v.errors.slice(0, 5)) log('warn', `${label}: ${err}`);
+    const cut = (parsed && parsed.stop_reason === 'max_tokens') || v.truncated;
+    const missing = batch.filter(c => !v.items.has(c.id));
+    if ((cut || v.fatal) && missing.length && depth < 2 && batch.length > 1) {
+      log('warn', `${label}: answer ${cut ? 'cut off at max_tokens' : 'unreadable'}; asking again for ${missing.length} card(s) in two parts`);
+      const half = Math.ceil(missing.length / 2);
+      for (const part of [missing.slice(0, half), missing.slice(half)]) {
+        if (!part.length || aborted()) continue;
+        try {
+          const sub = await askBatch(part, `${label}.${depth + 1}`, depth + 1);
+          for (const [id, a] of sub.items) v.items.set(id, a);
+          v.errorCount += sub.errorCount;
+        } catch (e) { if (counts.fatal || counts.cancelled) throw e; log('error', `${label}: ${e.message}`); }
+      }
+    }
+    return { items: v.items, fatal: v.fatal && !v.items.size, errorCount: v.errorCount + v.errors.length };
   };
 
   const batches = [];
@@ -644,19 +752,28 @@ async function runEnrich(o) {
     if (aborted()) { counts.cancelled = true; break; }
     const batch = batches[b];
     const label = `Batch ${b + 1}/${batches.length}`;
-    const byId = new Map(batch.map(c => [c.id, c.ev]));
     log('api', `${label}: ${batch.length} card(s) (${batch[0].creator_name || '?'}${batch.length > 1 && batch[batch.length - 1].creator_name !== batch[0].creator_name ? ` → ${batch[batch.length - 1].creator_name}` : ''})`);
-    let parsed;
+    let res;
     try {
-      parsed = await call({ model, max_tokens: 8000, system, messages: [{ role: 'user', content: userPrompt(batch.map(c => c.ev)) }] }, label);
+      res = await askBatch(batch, label);
     } catch (e) {
       if (counts.fatal || counts.cancelled) break;
-      counts.errors++; log('error', `${label}: ${e.message}`); continue;
+      res = null;
+      counts.errors++; log('error', `${label}: ${e.message}`);
     }
-    const { items, errors, fatal } = validateResponse(apiText(parsed), byId);
-    for (const err of errors.slice(0, 5)) log('warn', `${label}: ${err}`);
-    if (fatal) { counts.errors++; continue; }
-    counts.errors += errors.length;
+    if (!res || res.fatal) {
+      if (res) counts.errors++;
+      counts.done += batch.length;
+      if (++failedInRow >= MAX_FAILED_BATCHES) {
+        counts.stopped = `${MAX_FAILED_BATCHES} batches in a row failed`;
+        log('error', `Stopping: ${counts.stopped} (nothing more is spent; run again later)`);
+        break;
+      }
+      continue;
+    }
+    failedInRow = 0;
+    const { items } = res;
+    counts.errors += res.errorCount;
     const before = { a: counts.applied, s: counts.suggested, m: counts.merges };
     for (const card of batch) {
       const ans = items.get(card.id);
@@ -669,7 +786,7 @@ async function runEnrich(o) {
     progress({ type: 'progress', done: counts.done, total: counts.total, applied: counts.applied, suggested: counts.suggested, merges: counts.merges });
   }
 
-  if (visionQueue.length && !counts.cancelled && !counts.fatal) {
+  if (visionQueue.length && !counts.cancelled && !counts.fatal && !counts.stopped) {
     log('info', `Vision pass: ${visionQueue.length} card(s) the text pass could not resolve`);
     const vsys = `${system}\nAn image of this card's render is attached. Return a JSON array with exactly one item for the card.`;
     for (const { card, ans } of visionQueue) {
@@ -715,15 +832,14 @@ function estimate(db, opts, { promptCtx, rates, model, ctx } = {}) {
   for (const c of sel.cards) evChars += JSON.stringify(c.ev).length + 1;
   const textIn = Math.ceil(evChars / CHARS_PER_TOKEN) + batches * (sysTok + 15);
   const textOut = sel.cards.length * OUT_TOKENS_PER_ITEM;
-  const r = rates || { inRate: 1, outRate: 5 };
-  const usd = (i, o) => round2((i / 1e6) * r.inRate + (o / 1e6) * r.outRate);
+  const usd = (i, o) => round2(usdFor(i, o, rates));
   const withImg = sel.cards.filter(c => c.thumbnail_path);
   const vIn = withImg.reduce((t, c) => t + sysTok + 40 + IMAGE_TOKENS + Math.ceil(JSON.stringify(c.ev).length / CHARS_PER_TOKEN), 0);
   const vOut = withImg.length * VISION_OUT_TOKENS;
   const vision = opts.vision ? { maxItems: withImg.length, inTokens: vIn, outTokens: vOut, usd: usd(vIn, vOut) } : { maxItems: withImg.length, inTokens: 0, outTokens: 0, usd: 0, note: 'vision=1 to include' };
   const text = { inTokens: textIn, outTokens: textOut, usd: usd(textIn, textOut) };
   return {
-    model, toProcess: sel.cards.length, unchanged: sel.skipped, batches,
+    model, approx: true, toProcess: sel.cards.length, unchanged: sel.skipped, batches,
     text, vision, totalUsd: round2(text.usd + (opts.vision ? vision.usd : 0)),
     perCard: sel.cards.length ? { evidenceTokens: Math.round(evChars / CHARS_PER_TOKEN / sel.cards.length), systemTokens: sysTok } : null,
   };
@@ -804,7 +920,7 @@ function storeAlias(db, src, dst, source = 'merge') {
     .run(creator, src.kind || 'model', from, to, src.character || src.name, toName, source);
   // aliases that pointed at the source follow it
   db.prepare('UPDATE aliases SET to_key = ?, to_name = ? WHERE to_key = ?').run(to, toName, from);
-  return true;
+  return { from, to };
 }
 
 /**
@@ -812,9 +928,22 @@ function storeAlias(db, src, dst, source = 'merge') {
  * a rename sets the name and locks it; a merge folds the card into the target (lib/fold.js) and
  * stores an alias so the next scan keeps them together.
  */
-function decide(db, ids, decision) {
-  const res = { accepted: 0, rejected: 0, merged: 0, errors: [] };
+function decide(db, ids, decision, { snapshot } = {}) {
+  const res = { accepted: 0, rejected: 0, merged: 0, superseded: 0, errors: [] };
   if (!['accept', 'reject'].includes(decision)) throw new Error('decision must be "accept" or "reject"');
+  // merges fold cards: a snapshot first (lib/backup), or no merge at all
+  let mergesAllowed = true;
+  if (decision === 'accept' && ids.length) {
+    const hasMerge = db.prepare(`SELECT COUNT(*) n FROM suggestions WHERE type = 'merge' AND status = 'pending' AND id IN (${ids.map(() => '?').join(',')})`).get(...ids).n;
+    if (hasMerge) {
+      const take = snapshot || ((label) => require('./backup').snapshot(label, { db }));
+      if (!take('pre-merge')) { mergesAllowed = false; res.backupError = 'Could not write the backup taken before merging (check BACKUP_DIR); merges were not applied'; }
+    }
+  }
+  const supersede = (id, why) => {
+    db.prepare(`UPDATE suggestions SET status = 'superseded', decided_at = datetime('now') WHERE id = ?`).run(id);
+    res.superseded++; res.errors.push({ id, error: why });
+  };
   for (const id of ids) {
     const s = db.prepare('SELECT * FROM suggestions WHERE id = ?').get(id);
     if (!s) { res.errors.push({ id, error: 'not found' }); continue; }
@@ -828,13 +957,17 @@ function decide(db, ids, decision) {
       if (!row) throw new Error('card not found');
       if (row.folded_into != null) throw new Error(`card was folded into #${row.folded_into}`);
       if (s.type === 'merge') {
+        if (!mergesAllowed) throw new Error(res.backupError);
         const dst = db.prepare('SELECT * FROM models WHERE id = ?').get(s.target_id);
         if (!dst) throw new Error('target card not found');
+        if (dst.folded_into != null) throw new Error(`target card was folded into #${dst.folded_into}`);
+        if ((row.kind || 'model') !== (dst.kind || 'model')) throw new Error(`a ${row.kind || 'model'} card is not merged into a ${dst.kind || 'model'} card`);
+        if (row.creator_id !== dst.creator_id) throw new Error('cards of different creators are not merged');
         const ra = releaseOf(row.work_key), rb = releaseOf(dst.work_key);
         if ((ra.release || rb.release) && (ra.release !== rb.release || ra.base === rb.base)) throw new Error('these cards are different releases of the character; they stay separate');
         db.transaction(() => {
-          storeAlias(db, row, dst, 'merge');
-          foldInto(db, row.id, dst.id, { reason: 'merge' });
+          const alias = storeAlias(db, row, dst, 'merge');
+          foldInto(db, row.id, dst.id, { reason: 'merge', alias: alias || null });
           db.prepare(`UPDATE suggestions SET status = 'accepted', decided_at = datetime('now') WHERE id = ?`).run(id);
           // the folded card's other proposals are moot; proposals pointing at it point at the target
           db.prepare(`UPDATE suggestions SET status = 'superseded', decided_at = datetime('now') WHERE model_id = ? AND status = 'pending'`).run(row.id);
@@ -844,9 +977,16 @@ function decide(db, ids, decision) {
       }
       const f = s.field;
       let value = parseJSON(s.proposed, s.proposed);
+      // the card may have changed since the proposal: a model.json / user / reviewed value wins,
+      // and a proposal made against another value is stale
+      const { value: now, prov } = fieldState(row, f);
+      if (f !== 'tags') {
+        if (s.type === 'rename' ? (row.name_locked && String(row.name) !== String(parseJSON(s.current, s.current))) : NO_SUGGEST.has(prov)) { supersede(id, 'changed since: the card has a value of its own now'); continue; }
+        if (!sameValue(now, parseJSON(s.current, null))) { supersede(id, 'changed since: the value is not the one this proposal was made for'); continue; }
+      }
       if (f === 'tags') {
         const have = parseJSON(row.tags, []);
-        const set = new Set(have.map(norm));
+        const set = new Set([...have, ...fieldAttr(row).removedTags].map(norm));
         value = [...have, ...value.filter(t => !set.has(norm(t)))].slice(0, Math.max(TAG_CAP, have.length));
       }
       const attr = setAttrField(parseJSON(row.attribution, {}), f, 'ai-reviewed');
@@ -861,10 +1001,49 @@ function decide(db, ids, decision) {
   return res;
 }
 
-function decideFilter(db, filter = {}, decision) {
+function decideFilter(db, filter = {}, decision, opts) {
   const { sql, params } = suggestionWhere({ ...filter, status: 'pending' });
   const ids = db.prepare(`SELECT s.id ${SUGG_FROM} WHERE ${sql} ORDER BY s.id`).all(...params).map(r => r.id);
-  return decide(db, ids, decision);
+  return decide(db, ids, decision, opts);
+}
+
+/**
+ * Undo an accepted merge: the alias goes, the folded card is visible again with its own key,
+ * files, collections and queue entry. Tags, notes and status that were merged into the target
+ * stay there (they may have been edited since), and the target keeps the merged images.
+ */
+function unmerge(db, suggestionId) {
+  const s = db.prepare('SELECT * FROM suggestions WHERE id = ?').get(suggestionId);
+  if (!s || s.type !== 'merge') { const e = new Error('Merge suggestion not found'); e.status = 404; throw e; }
+  if (s.status !== 'accepted') { const e = new Error(`This merge is ${s.status}, not accepted`); e.status = 409; throw e; }
+  const src = db.prepare('SELECT * FROM models WHERE id = ?').get(s.model_id);
+  const attr = parseJSON(src && src.attribution, {});
+  const m = attr.merge;
+  if (!src || src.folded_into !== s.target_id || !m) { const e = new Error('The card is no longer folded into the merge target; nothing to undo'); e.status = 409; throw e; }
+  const out = { restored: { files: 0, collections: 0, queue: false, alias: false }, notReverted: ['tags, notes and print status merged into the target stay on it'] };
+  db.transaction(() => {
+    if (m.aliasFrom) out.restored.alias = db.prepare('DELETE FROM aliases WHERE from_key = ? AND to_key = ?').run(m.aliasFrom, m.aliasTo).changes > 0;
+    const files = Array.isArray(m.files) ? m.files : [];
+    for (let i = 0; i < files.length; i += 400) {
+      const part = files.slice(i, i + 400);
+      out.restored.files += db.prepare(`UPDATE model_files SET model_id = ? WHERE model_id = ? AND filepath IN (${part.map(() => '?').join(',')})`).run(src.id, s.target_id, ...part).changes;
+    }
+    for (const c of m.collections || []) out.restored.collections += db.prepare('INSERT OR IGNORE INTO collection_models (collection_id, model_id) VALUES (?, ?)').run(c, src.id).changes;
+    if (m.queued && !db.prepare('SELECT 1 FROM print_queue WHERE model_id = ?').get(src.id)) {
+      const pos = (db.prepare('SELECT MAX(position) p FROM print_queue').get().p || 0) + 1;
+      try { db.prepare('INSERT INTO print_queue (model_id, position) VALUES (?, ?)').run(src.id, pos); out.restored.queue = true; } catch { /* queue schema differs */ }
+    }
+    delete attr.merge; delete attr.foldedInto; delete attr.foldedBy;
+    db.prepare(`UPDATE models SET hidden = ?, folded_into = NULL, work_key = ?, attribution = ?, file_count = (SELECT COUNT(*) FROM model_files WHERE model_id = ?), updated_at = datetime('now') WHERE id = ?`)
+      .run(m.hidden ? 1 : 0, m.workKey || null, JSON.stringify(attr), src.id, src.id);
+    const tgt = db.prepare('SELECT attribution FROM models WHERE id = ?').get(s.target_id);
+    const ta = parseJSON(tgt && tgt.attribution, {});
+    if (Array.isArray(ta.foldedFrom)) ta.foldedFrom = ta.foldedFrom.filter(e => e.id !== src.id);
+    db.prepare('UPDATE models SET attribution = ?, file_count = (SELECT COUNT(*) FROM model_files WHERE model_id = ?) WHERE id = ?').run(JSON.stringify(ta), s.target_id, s.target_id);
+    // remembered as rejected: the same merge is not proposed again
+    db.prepare(`UPDATE suggestions SET status = 'rejected', decided_at = datetime('now') WHERE id = ?`).run(s.id);
+  })();
+  return out;
 }
 
 // ── runs ─────────────────────────────────────────────────────────────────────
@@ -873,11 +1052,19 @@ function createRun(db, { model, scope, params }) {
   return db.prepare('INSERT INTO enrich_runs (model, scope, params) VALUES (?, ?, ?)').run(model, scope, JSON.stringify(params || {})).lastInsertRowid;
 }
 
-function finishRun(db, runId, counts, status) {
+/** USD for token counts at a model's rates ({inRate, outRate} per million). */
+function usdFor(inTok, outTok, rates) {
+  const r = rates || { inRate: 1, outRate: 5 };
+  return Math.round(((inTok / 1e6) * r.inRate + (outTok / 1e6) * r.outRate) * 10000) / 10000;
+}
+
+function finishRun(db, runId, counts, status, rates) {
+  const usd = usdFor(counts.inTokens || 0, counts.outTokens || 0, rates);
   db.prepare(`UPDATE enrich_runs SET finished_at = datetime('now'), status = ?, to_process = ?, applied = ?, suggested = ?, merges = ?,
-    unchanged = ?, errors = ?, vision_used = ?, in_tokens = ?, out_tokens = ? WHERE id = ?`)
+    unchanged = ?, errors = ?, vision_used = ?, in_tokens = ?, out_tokens = ?, usd = ? WHERE id = ?`)
     .run(status, counts.total || 0, counts.applied || 0, counts.suggested || 0, counts.merges || 0, counts.unchanged || 0,
-      counts.errors || 0, counts.visionUsed || 0, counts.inTokens || 0, counts.outTokens || 0, runId);
+      counts.errors || 0, counts.visionUsed || 0, counts.inTokens || 0, counts.outTokens || 0, usd, runId);
+  return usd;
 }
 
 function listRuns(db, limit = 50) {
@@ -885,6 +1072,7 @@ function listRuns(db, limit = 50) {
     id: r.id, startedAt: r.started_at, finishedAt: r.finished_at, model: r.model, scope: r.scope, status: r.status,
     toProcess: r.to_process, applied: r.applied, suggested: r.suggested, merges: r.merges, unchanged: r.unchanged, errors: r.errors,
     visionUsed: r.vision_used, inTokens: r.in_tokens, outTokens: r.out_tokens, undone: !!r.undone_at, undoneAt: r.undone_at || null,
+    actualInTokens: r.in_tokens || 0, actualOutTokens: r.out_tokens || 0, actualUsd: r.usd || 0,
   }));
 }
 
@@ -901,12 +1089,19 @@ function undoRun(db, runId) {
     for (const l of logs) {
       const row = db.prepare('SELECT * FROM models WHERE id = ?').get(l.model_id);
       if (!row) { skipped++; continue; }
-      const { value: now } = fieldState(row, l.field);
-      if (!sameValue(now, parseJSON(l.new_value, null))) { skipped++; continue; }
+      const { value: now, prov } = fieldState(row, l.field);
+      // the user has (re)set the field since: theirs now, even with the same value
+      if (prov === 'user' || prov === 'ai-reviewed' || !sameValue(now, parseJSON(l.new_value, null))) { skipped++; continue; }
       const old = parseJSON(l.old_value, null);
       const attr = setAttrField(parseJSON(row.attribution, {}), l.field, l.old_provenance || null);
       db.prepare(`UPDATE models SET ${COLUMNS[l.field]} = ?, attribution = ?, updated_at = datetime('now') WHERE id = ?`).run(toColumn(l.field, old), JSON.stringify(attr), row.id);
       db.prepare(`UPDATE enrich_log SET reverted_at = datetime('now') WHERE id = ?`).run(l.id);
+      // remembered as rejected, so the next run does not write it again
+      const undone = l.field === 'tags'
+        ? (parseJSON(l.new_value, []) || []).filter(t => !(parseJSON(l.old_value, []) || []).includes(t))
+        : parseJSON(l.new_value, null);
+      db.prepare(`INSERT INTO suggestions (model_id, type, field, current, proposed, confidence, reason, source, run_id, status, decided_at)
+        VALUES (?, 'field', ?, ?, ?, NULL, 'undone', 'undo', ?, 'rejected', datetime('now'))`).run(l.model_id, l.field, l.old_value, JSON.stringify(undone), runId);
       // forget the signature so the card is looked at again by the next run
       const en = parseJSON(row.enrichment, {});
       if (en.sig || en.tagsSig) { delete en.sig; delete en.tagsSig; db.prepare('UPDATE models SET enrichment = ? WHERE id = ?').run(JSON.stringify(en), row.id); }
@@ -929,6 +1124,6 @@ module.exports = {
   releaseOf, scopeWhere, selectCards, nearDuplicates, buildEvidence, evidenceSig, fileStems, pathSegments,
   promptContext, systemPrompt, userPrompt, validateResponse, extractJSON,
   fieldState, planActions, wantsVision, combineAnswers, applyAuto, addSuggestion, rejectedLookup, isKnownGenreFn,
-  runEnrich, estimate, listSuggestions, summary, decide, decideFilter, storeAlias, createRun, finishRun, listRuns, undoRun,
+  runEnrich, estimate, usdFor, listSuggestions, summary, decide, decideFilter, unmerge, salvageObjects, fieldAttr, storeAlias, createRun, finishRun, listRuns, undoRun,
   suggestionsFor, shapeSuggestion,
 };

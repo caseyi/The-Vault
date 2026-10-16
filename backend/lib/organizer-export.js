@@ -32,8 +32,34 @@ function csvCell(v) {
   const s = v == null ? '' : String(v);
   return /[",\r\n]/.test(s) || /^\s|\s$/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 }
+/** A cell a spreadsheet would run as a formula (CSV injection): such rows are not exported. */
+const FORMULA = /^[=+\-@\t\r]/;
+const unsafeRow = (r) => r.some(c => typeof c === 'string' && FORMULA.test(c));
 function toCSV(header, rows) {
   return [header, ...rows].map(r => r.map(csvCell).join(',')).join('\r\n') + '\r\n';
+}
+
+/**
+ * Groups that are teams: a group read from a folder counts only when it holds 3+ characters of the
+ * creator ("Dark Nights Metal", "Watchmen"); "Axreal" above Azrael or "Iron Man 2023" is just the
+ * character's own folder. Returns a predicate (card) → boolean.
+ */
+function teamGroups(all) {
+  const members = new Map();
+  for (const m of all) if (m.group_name && m.character) {
+    const gk = `${m.creator_name}|${key(m.group_name)}`;
+    if (!members.has(gk)) members.set(gk, new Set());
+    members.get(gk).add(key(m.character).split(' ')[0]);
+  }
+  return (m) => {
+    if (!m.group_name || !m.character) return false;
+    const t = trust(m, 'group_name');
+    if (!t.ok) return false;
+    const gk = key(m.group_name), ck = key(m.character);
+    if (gk === ck || gk.startsWith(`${ck} `) || ck.startsWith(`${gk} `)) return false; // the character's own (release) folder
+    if (t.prov === 'path' && (members.get(`${m.creator_name}|${gk}`) || new Set()).size < 3) return false;
+    return true;
+  };
 }
 
 /** Trust of one field on a card: { ok, confidence, prov }. */
@@ -71,7 +97,7 @@ function genreMap(db, { since, metaSummary } = {}) {
     const k = key(m.character);
     if (!k || known.has(k) || seen.has(k)) continue;
     seen.add(k);
-    rows.push([m.character, m.franchise]);
+    if (!unsafeRow([m.character, m.franchise])) rows.push([m.character, m.franchise]);
   }
   return { rows, text: toCSV(['character', 'genre'], rows) };
 }
@@ -82,27 +108,28 @@ function filingRules(db, { since, metaSummary } = {}) {
   const have = (kind, k) => Object.prototype.hasOwnProperty.call(rules[kind] || {}, k);
   const rows = [];
   const seen = new Set();
-  const push = (kind, k, v) => { const id = `${kind}|${k}`; if (!k || !v || seen.has(id) || have(kind, k)) return; seen.add(id); rows.push([kind, k, v]); };
+  const push = (kind, k, v) => {
+    const id = `${kind}|${k}`;
+    if (!k || !v || seen.has(id) || have(kind, k) || unsafeRow([kind, k, v])) return;
+    seen.add(id); rows.push([kind, k, v]);
+  };
   const aliasWhere = since ? 'WHERE created_at >= ?' : '';
   for (const a of db.prepare(`SELECT * FROM aliases ${aliasWhere} ORDER BY id`).all(...(since ? [String(since).replace('T', ' ').replace(/\.\d+Z?$|Z$/, '')] : []))) {
-    const from = key(a.from_name), to = key(a.to_name);
-    if (from && to && from !== to) push('fix', from, to);
+    const from = key(a.from_name), toKey = key(a.to_name);
+    if (!from || !toKey || from === toKey) continue;
+    // file_inbox.py fixname() replaces the phrase inside longer names: "poison" → "poison ivy" would
+    // turn "Poison Ivy" into "poison ivy Ivy". Only real typo fixes become rules.
+    const fw = new Set(from.split(' ')), tw = new Set(toKey.split(' '));
+    if ([...fw].every(w => tw.has(w)) || [...tw].every(w => fw.has(w))) continue;
+    push('fix', from, String(a.to_name).trim().toLowerCase()); // keeps "jor-el" spelled as the organizer writes it
   }
   const groupGenre = new Map(); // group key → Map(genre → n)
   const all = cards(db, since);
-  // a group read from a folder is a team only when it holds several characters ("Dark Nights
-  // Metal", "Watchmen"); "Axreal" above Azrael is just a character folder
-  const members = new Map();
-  for (const m of all) if (m.group_name && m.character) {
-    const gk = `${m.creator_name}|${key(m.group_name)}`;
-    if (!members.has(gk)) members.set(gk, new Set());
-    members.get(gk).add(key(m.character).split(' ')[0]);
-  }
+  const isTeam = teamGroups(all);
   for (const m of all) {
     if (m.group_name && m.character) {
-      let tg = trust(m, 'group_name');
-      if (tg.ok && tg.prov === 'path' && (members.get(`${m.creator_name}|${key(m.group_name)}`) || new Set()).size < 3) tg = { ok: false };
-      if (tg.ok && key(m.group_name) !== key(m.character)) push('group', key(m.character), m.group_name);
+      const tg = { ok: isTeam(m) };
+      if (tg.ok) push('group', key(m.character), m.group_name);
       if (tg.ok && m.franchise && trust(m, 'franchise').ok) {
         const gk = key(m.group_name);
         if (!groupGenre.has(gk)) groupGenre.set(gk, new Map());
@@ -181,13 +208,12 @@ function studioWorks(db, since) {
  * Studio works with trustworthy character + genre, nothing about them in review, and each of their
  * folders that holds only their files (a model.json or a folder move must not catch another card).
  */
-function exportableFolders(db, since, libraries) {
-  const owners = folderOwners(db);
+function exportableFolders(db, since, libraries, owners = folderOwners(db)) {
   const doubtful = inReview(db);
   const out = [];
   for (const m of studioWorks(db, since)) {
     const tc = trust(m, 'character'), tg = trust(m, 'franchise');
-    if (!m.character || !m.franchise || !tc.ok || !tg.ok || doubtful.has(m.id)) continue;
+    if (!m.character || !m.franchise || !tc.ok || !tg.ok || doubtful.has(m.id) || unsafeRow([m.character, m.franchise, m.group_name || ''])) continue;
     for (const g of workFolders(db, m, libraries)) {
       if (!g.rel || !g.type || !ownFolder(owners, g.dir, m.id)) continue;
       out.push({ m, g, tc, tg });
@@ -198,6 +224,7 @@ function exportableFolders(db, since, libraries) {
 
 /** model_json.ndjson: one line per work folder, the organizer's model.json schema. */
 function modelJson(db, { since, libraries } = {}) {
+  const isTeam = teamGroups(cards(db, null));
   const lines = [];
   for (const { m, g } of exportableFolders(db, since, libraries)) {
     {
@@ -205,29 +232,64 @@ function modelJson(db, { since, libraries } = {}) {
         studio: m.studio, creator: m.creator_name, genre: m.franchise, character: m.character, type: g.type,
         files: [...new Set(g.files)].sort(), source: m.source || '', claim_url: m.source === 'gumroad' ? (m.source_url || '') : '', release_term: m.release_term || '',
       };
-      if (m.group_name && trust(m, 'group_name').ok) model.group = m.group_name;
+      if (isTeam(m)) model.group = m.group_name;
       lines.push({ library: g.library, rel: g.rel, model });
     }
   }
   return { rows: lines, text: lines.map(l => JSON.stringify(l)).join('\n') + (lines.length ? '\n' : '') };
 }
 
-/** Gold-layout path: Creator/Genre/[Group/]Character/Type, dioramas Creator/Genre/_Dioramas/Title. */
-function goldPath(m, g) {
+/**
+ * Each library's studio root: the top folder its studio works live in ("Wicked Archive" on
+ * Dagobah, "Wicked" on Endor). Moves stay inside it rather than inventing new top folders.
+ */
+function studioRoots(db, libraries) {
+  const counts = new Map(); // library → Map(root → n)
+  for (const r of db.prepare(`SELECT f.filepath FROM model_files f JOIN models m ON m.id = f.model_id WHERE m.kind IN ('work','diorama') AND m.studio IS NOT NULL AND m.folded_into IS NULL`).iterate()) {
+    const lr = libRel(path.dirname(r.filepath), libraries);
+    if (!lr) continue;
+    const first = lr.rel.split('/')[0];
+    if (!STUDIO_ROOTS.has(String(first).toLowerCase())) continue;
+    if (!counts.has(lr.library)) counts.set(lr.library, new Map());
+    const m = counts.get(lr.library);
+    m.set(first, (m.get(first) || 0) + 1);
+  }
+  const best = new Map();
+  for (const [lib, m] of counts) best.set(lib, [...m.entries()].sort((a, b) => b[1] - a[1])[0][0]);
+  return best;
+}
+
+/** The card's character folder name: the release label too when the character has several ("Moon Knight (2026)"). */
+function characterSeg(m) {
+  const ch = safeSeg(m.character || m.name);
+  if (!String(m.work_key || '').includes('|r:')) return ch;
+  const label = (String(m.name || '').match(/\(([^)]+)\)\s*$/) || [])[1] || String(m.work_key).split('|r:')[1];
+  return label && label !== 'base' ? `${ch} (${safeSeg(label)})` : ch;
+}
+
+/**
+ * Gold-layout path: Root/Genre/[Group/]Character/Type, dioramas Root/Genre/_Dioramas/Title.
+ * Root is the folder's own studio root when it is in one, else the library's; null when neither exists.
+ */
+function goldPath(m, g, ctx = {}) {
   const first = g.rel.split('/')[0] || '';
-  const creatorSeg = STUDIO_ROOTS.has(first.toLowerCase()) ? first : (CREATOR_FOLDER[m.creator_name] || safeSeg(m.creator_name));
+  const creatorSeg = STUDIO_ROOTS.has(first.toLowerCase()) ? first : (ctx.roots ? ctx.roots.get(g.library) : (CREATOR_FOLDER[m.creator_name] || safeSeg(m.creator_name)));
+  if (!creatorSeg) return null;
   const genre = safeSeg(m.franchise);
-  if (m.kind === 'diorama') return [creatorSeg, genre, '_Dioramas', safeSeg(m.character || m.name)].join('/');
+  if (m.kind === 'diorama') return [creatorSeg, genre, '_Dioramas', characterSeg(m)].join('/');
   const parts = [creatorSeg, genre];
-  if (m.group_name && trust(m, 'group_name').ok && key(m.group_name) !== key(m.character)) parts.push(safeSeg(m.group_name));
-  parts.push(safeSeg(m.character), g.type);
+  const team = ctx.isTeam ? ctx.isTeam(m) : (m.group_name && trust(m, 'group_name').ok && key(m.group_name) !== key(m.character));
+  if (team) parts.push(safeSeg(m.group_name));
+  parts.push(characterSeg(m), g.type);
   return parts.join('/');
 }
 
 /** moves.csv: proposals for off-layout studio works only; never applied by the app. */
 function moves(db, { since, libraries } = {}) {
   const rows = [];
-  const list = exportableFolders(db, since, libraries);
+  const owners = folderOwners(db);
+  const list = exportableFolders(db, since, libraries, owners);
+  const ctx = { roots: studioRoots(db, libraries), isTeam: teamGroups(cards(db, null)) };
   const typesIn = new Map(); // "<work>|<library>|<dir>" → types held there
   for (const { m, g } of list) {
     const k = `${m.id}|${g.library}|${g.rel}`;
@@ -243,9 +305,13 @@ function moves(db, { since, libraries } = {}) {
     {
       // one folder holding several types (Sculpture + Bust): move it to the character folder;
       // the organizer's plan splits it into type folders
-      let to = goldPath(m, g);
+      let to = goldPath(m, g, ctx);
+      if (!to) continue; // no studio root in that library to file it under
       if (types.length > 1) to = to.split('/').slice(0, -1).join('/');
+      if (to.split('/').some(seg => !seg)) continue; // an empty segment: not a real place
       if (to.toLowerCase() === g.rel.toLowerCase()) continue;
+      // the destination already holds another card's files: moving there would mix them
+      if (!ownFolder(owners, path.join(g.root, ...to.split('/')), m.id)) continue;
       const segs = g.rel.split('/');
       const reasons = [];
       if (!segs.some(s => key(s) === key(m.franchise))) reasons.push('not under its genre folder');
@@ -254,10 +320,15 @@ function moves(db, { since, libraries } = {}) {
       else if (key(segs[segs.length - 1]) !== key(g.type) && m.kind !== 'diorama') reasons.push('no type folder');
       if (/^gumroad downloads$/i.test(segs[0])) reasons.push('store download folder');
       const confidence = Math.round(Math.min(tc.confidence, tg.confidence) * 100) / 100;
-      rows.push([g.library, g.rel, to, reasons.join('; ') || 'off the gold layout', confidence]);
+      const row = [g.library, g.rel, to, reasons.join('; ') || 'off the gold layout', confidence];
+      if (!unsafeRow(row)) rows.push(row);
     }
   }
-  return { rows, text: toCSV(['library', 'from_rel', 'to_rel', 'reason', 'confidence'], rows) };
+  // two folders proposed for the same destination: neither row is safe
+  const dest = new Map();
+  for (const r of rows) { const k = `${r[0]}|${String(r[2]).toLowerCase()}`; dest.set(k, (dest.get(k) || 0) + 1); }
+  const kept = rows.filter(r => dest.get(`${r[0]}|${String(r[2]).toLowerCase()}`) === 1);
+  return { rows: kept, dropped: rows.length - kept.length, text: toCSV(['library', 'from_rel', 'to_rel', 'reason', 'confidence'], kept) };
 }
 
 const FILES = {
@@ -267,4 +338,4 @@ const FILES = {
   'moves.csv': { fn: moves, type: 'text/csv; charset=utf-8' },
 };
 
-module.exports = { FILES, genreMap, filingRules, modelJson, moves, toCSV, csvCell, key, trust, goldPath, AI_EXPORT_MIN };
+module.exports = { FILES, genreMap, filingRules, modelJson, moves, toCSV, csvCell, key, trust, goldPath, characterSeg, studioRoots, teamGroups, AI_EXPORT_MIN };

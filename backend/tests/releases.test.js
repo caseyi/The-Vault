@@ -155,8 +155,31 @@ describe('enrich and releases', () => {
     expect(r.errors[0].error).toMatch(/different releases/);
     expect(db.prepare('SELECT folded_into FROM models WHERE id = ?').get(term.id).folded_into).toBeNull();
     expect(enrich.releaseOf('Wicked|work|daredevil|r:2026-03')).toEqual({ base: 'Wicked|work|daredevil', release: '2026-03' });
-    expect(enrich.storeAlias(db, { work_key: 'Wicked|work|dare devil|r:2025', name: 'Dare Devil (2025)' }, { work_key: 'Wicked|work|daredevil|r:2026-03', name: 'Daredevil (2026)', character: 'Daredevil' })).toBe(true);
+    expect(enrich.storeAlias(db, { work_key: 'Wicked|work|dare devil|r:2025', name: 'Dare Devil (2025)' }, { work_key: 'Wicked|work|daredevil|r:2026-03', name: 'Daredevil (2026)', character: 'Daredevil' }))
+      .toEqual({ from: 'Wicked|work|dare devil', to: 'Wicked|work|daredevil' });
     expect(db.prepare(`SELECT from_key, to_key, to_name FROM aliases WHERE from_key = 'Wicked|work|dare devil'`).get())
       .toEqual({ from_key: 'Wicked|work|dare devil', to_key: 'Wicked|work|daredevil', to_name: 'Daredevil' });
+  });
+});
+
+describe('splitting an existing card again', () => {
+  test('the release with the printed files keeps the row; every split takes a pre-split snapshot', async () => {
+    const snaps = () => fs.readdirSync(process.env.BACKUP_DIR).filter(f => /^vault-pre-split-.*\.db$/.test(f)).length;
+    const n0 = snaps();
+    // an older DB: one Daredevil card holding both releases, the user printed the Netflix bust
+    const [term, netflix] = cards('Wicked|work|daredevil|r:%');
+    expect(netflix.id).toBe(before.id);
+    db.prepare('UPDATE model_files SET model_id = ? WHERE model_id = ?').run(netflix.id, term.id);
+    db.prepare('DELETE FROM models WHERE id = ?').run(term.id);
+    db.prepare(`UPDATE models SET work_key = 'Wicked|work|daredevil', name = 'Daredevil' WHERE id = ?`).run(netflix.id);
+    db.prepare(`UPDATE model_files SET printed_at = '2026-05-01T00:00:00Z' WHERE model_id = ? AND filename LIKE '%Bust (With Chain)%'`).run(netflix.id);
+    db.prepare('UPDATE models SET folder_hash = NULL').run();
+    await scanLibrary(LIB);
+    const dd = cards('Wicked|work|daredevil%');
+    expect(dd.map(c => c.work_key)).toEqual(['Wicked|work|daredevil|r:2026-03', 'Wicked|work|daredevil|r:netflix']);
+    // the 2026 release holds more of the old card's files, but the printed one wins
+    expect(dd.find(c => c.work_key.endsWith('netflix')).id).toBe(before.id);
+    expect(JSON.parse(dd.find(c => c.id === before.id).tags)).toEqual(['dd-fav']);
+    expect(snaps()).toBe(n0 + 1);
   });
 });

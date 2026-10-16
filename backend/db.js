@@ -351,6 +351,10 @@ const MIGRATIONS = [
       )
     `);
   },
+  // 6 — what a run actually cost (USD at the model's rates)
+  () => {
+    addColumn('enrich_runs', 'usd REAL DEFAULT 0');
+  },
 ];
 
 db.getSetting = (key) => {

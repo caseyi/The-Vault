@@ -865,6 +865,26 @@ function franchiseAndTeam(w, base, prevAttr, meta) {
   return { franchise: fr || auto, team: team || autoTeam };
 }
 
+/**
+ * Pending AI field proposals made stale by this scan: the field now holds a value from model.json,
+ * the genre folder or the creator's manifest that differs from what the proposal was made for.
+ */
+function supersedeStaleSuggestions(log) {
+  let pend;
+  try { pend = db.prepare(`SELECT s.id, s.field, s.current, m.character, m.franchise, m.group_name, m.editions, m.attribution FROM suggestions s JOIN models m ON m.id = s.model_id WHERE s.status = 'pending' AND s.type = 'field' AND s.field IN ('character','franchise','group_name','editions')`).all(); } catch { return; }
+  const stale = [];
+  for (const p of pend) {
+    const prov = (parseJSON(p.attribution, {}).fields || {})[p.field];
+    if (!['sidecar', 'path', 'manifest'].includes(prov)) continue;
+    const now = p.field === 'editions' ? JSON.stringify(parseJSON(p.editions, [])) : JSON.stringify(p[p.field] ?? null);
+    const was = p.field === 'editions' ? JSON.stringify(parseJSON(p.current, [])) : JSON.stringify(parseJSON(p.current, null));
+    if (now !== was) stale.push(p.id);
+  }
+  if (!stale.length) return;
+  db.transaction(() => { for (const id of stale) db.prepare(`UPDATE suggestions SET status = 'superseded', decided_at = datetime('now') WHERE id = ?`).run(id); })();
+  log('info', `${stale.length} AI proposal(s) superseded: the scan found values of its own`);
+}
+
 /** Confirmed merges: Map(from work_key → { to_key, to_name }) for worksLib.planWorks. */
 function loadAliases() {
   try {
@@ -894,7 +914,11 @@ function keptFields(w, base, prevAttr, attribution) {
   const out = { ...scan };
   for (const f of ENRICH_FIELDS) {
     const prov = user.has(f) ? 'user' : prev[f];
-    if (prov === 'user' || prov === 'ai-reviewed') {
+    const scanProv = (attribution.fields || {})[f];
+    if (prov === 'ai-reviewed' && scanProv === 'sidecar') {
+      // model.json is authoritative: it beats an accepted AI proposal (never the user's own value)
+      if (f === 'franchise') out[f] = w.attr.genre || col[f];
+    } else if (prov === 'user' || prov === 'ai-reviewed') {
       out[f] = col[f]; fields[f] = prov;
     } else if (prov === 'ai') {
       const scanVal = f === 'franchise' ? (w.attr.genre || null) : scan[f];
@@ -970,7 +994,7 @@ function layoutStmts() {
  * Without one the scan does not start: regrouping folds rows and moves user data.
  */
 function preRegroupSnapshot(log, { label = 'pre-regroup', setting = 'layout_regroup_done', why: what = 'regrouping the library into works' } = {}) {
-  if (typeof db.getSetting !== 'function' || db.getSetting(setting)) return null;
+  if (typeof db.getSetting !== 'function' || (setting && db.getSetting(setting))) return null;
   const n = db.prepare('SELECT COUNT(*) AS n FROM models').get().n;
   if (!n) return null;
   const backup = require('./lib/backup');
@@ -982,7 +1006,7 @@ function preRegroupSnapshot(log, { label = 'pre-regroup', setting = 'layout_regr
       `Fix BACKUP_DIR (currently ${backup.backupDir ? backup.backupDir() : process.env.BACKUP_DIR || 'next to the database'}; it must exist or be creatable, and be writable) and scan again. Nothing was changed.`);
   }
   log('info', `Backup written before ${what}: ${path.basename(file)}`);
-  if (setting !== 'layout_regroup_done' && typeof db.setSetting === 'function') db.setSetting(setting, new Date().toISOString());
+  if (setting && setting !== 'layout_regroup_done' && typeof db.setSetting === 'function') db.setSetting(setting, new Date().toISOString());
   return file;
 }
 
@@ -1110,14 +1134,18 @@ async function scanLibraryLayout(libraryPath, progressCallback, logger, { scope 
     for (const [from, list] of splitGroups) {
       const row = byKey.get(from);
       if (!row || claimed.has(row.id) || row.folded || list.some(w => w.base)) continue;
-      const best = list.map(w => [w, w.owners.get(row.id) || 0]).sort((a, b) => b[1] - a[1] || b[0].files.length - a[0].files.length)[0][0];
+      // the row (and its tags, status, collections) goes to the release the user printed from,
+      // else the one holding most of its files
+      const printed = (w) => w.files.filter(f => { const e = existingFiles.get(f.abs); return e && e.model_id === row.id && e.printed_at; }).length;
+      const best = list.map(w => [w, w.owners.get(row.id) || 0, printed(w)]).sort((a, b) => b[2] - a[2] || b[1] - a[1] || b[0].files.length - a[0].files.length)[0][0];
       claimed.set(row.id, best); best.base = row; best.baseByKey = true;
       for (const w of list) w.splitSource = row;
       splitting++;
     }
     if (splitting) {
       log('info', `Splitting ${splitting} card(s) into one card per release`);
-      preRegroupSnapshot(log, { label: 'pre-split', setting: 'release_split_done', why: 'splitting cards into one per release' });
+      // every scan that splits existing cards takes one (not only the first)
+      preRegroupSnapshot(log, { label: 'pre-split', setting: null, why: 'splitting cards into one per release' });
     }
     const candidates = [];
     for (const w of plan.works) {
@@ -1416,6 +1444,7 @@ async function scanLibraryLayout(libraryPath, progressCallback, logger, { scope 
 
     const orphaned = db.prepare('DELETE FROM creators WHERE id NOT IN (SELECT DISTINCT creator_id FROM models WHERE creator_id IS NOT NULL)').run();
     if (orphaned.changes > 0) log('info', `Cleaned up ${orphaned.changes} orphaned creator(s)`);
+    supersedeStaleSuggestions(log);
     if (typeof db.setSetting === 'function') {
       db.setSetting('layout_regroup_done', db.getSetting('layout_regroup_done') || new Date().toISOString());
       if (!scope) {

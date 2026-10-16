@@ -102,7 +102,7 @@ describe('evidence', () => {
   test('signature skip: an unchanged card is skipped on the next run; a change brings it back', async () => {
     const first = enrich.selectCards(db, { scope: 'all' }, { libraryRoot: LIB });
     expect(first.cards.length).toBeGreaterThan(5);
-    const r = await request(app).get('/api/ai/enrich?scope=all');
+    const r = await request(app).get('/api/ai/enrich?key=t&scope=all');
     expect(sseEvents(r.text).pop()).toMatchObject({ type: 'done', success: true });
     const again = enrich.selectCards(db, { scope: 'all' }, { libraryRoot: LIB });
     expect(again.cards).toHaveLength(0);
@@ -212,7 +212,7 @@ describe('run, review, merge, undo (API)', () => {
   let runId;
   beforeAll(async () => {
     // a fresh run over everything (the signature test above already ran once)
-    const r = await request(app).get('/api/ai/enrich?scope=all&force=1');
+    const r = await request(app).get('/api/ai/enrich?key=t&scope=all&force=1');
     const done = sseEvents(r.text).pop();
     runId = done.runId;
   });
@@ -267,7 +267,7 @@ describe('run, review, merge, undo (API)', () => {
     const fr = (await request(app).get('/api/suggestions?field=franchise')).body.items.find(i => i.model.id === hb.id);
     const rej = await request(app).post('/api/suggestions/decide').send({ ids: [fr.id], decision: 'reject' });
     expect(rej.body.rejected).toBe(1);
-    await request(app).get(`/api/ai/enrich?scope=ids&ids=${hb.id}&force=1`);
+    await request(app).get(`/api/ai/enrich?key=t&scope=ids&ids=${hb.id}&force=1`);
     const again = db.prepare(`SELECT COUNT(*) n FROM suggestions WHERE model_id = ? AND field = 'franchise' AND status = 'pending'`).get(hb.id).n;
     expect(again).toBe(0); // the same proposal is not made again
 
@@ -312,7 +312,7 @@ describe('run, review, merge, undo (API)', () => {
   });
 
   test('undo reverts the run\'s automatic writes, except fields changed since', async () => {
-    const r = await request(app).get('/api/ai/enrich?scope=all&force=1');
+    const r = await request(app).get('/api/ai/enrich?key=t&scope=all&force=1');
     const done = sseEvents(r.text).pop();
     const logs = db.prepare('SELECT * FROM enrich_log WHERE run_id = ?').all(done.runId);
     expect(logs.length).toBeGreaterThan(0);
@@ -398,7 +398,7 @@ describe('jobs', () => {
   test('/api/ai/generate-tags runs Enrich with tags only (old clients)', async () => {
     const thing = byName('Mystery Thing');
     const before = db.prepare('SELECT character, franchise, tags FROM models WHERE id = ?').get(thing.id);
-    const r = await request(app).get('/api/ai/generate-tags');
+    const r = await request(app).get('/api/ai/generate-tags?key=t');
     const done = sseEvents(r.text).pop();
     expect(done).toMatchObject({ type: 'done', success: true, tagged: expect.any(Number), total: expect.any(Number), runId: expect.any(Number) });
     const after = db.prepare('SELECT character, franchise FROM models WHERE id = ?').get(thing.id);
@@ -411,10 +411,10 @@ describe('jobs', () => {
   test('409 while another AI job runs', async () => {
     const release = acquireAiJob('vision-tags');
     try {
-      const r = await request(app).get('/api/ai/enrich?scope=all&force=1');
+      const r = await request(app).get('/api/ai/enrich?key=t&scope=all&force=1');
       expect(r.status).toBe(409);
       expect(r.body).toMatchObject({ error: expect.stringMatching(/Another AI job/), running: { name: 'vision-tags' } });
-      expect((await request(app).get('/api/ai/generate-tags')).status).toBe(409);
+      expect((await request(app).get('/api/ai/generate-tags?key=t')).status).toBe(409);
     } finally { release(); }
   });
 
@@ -427,7 +427,7 @@ describe('jobs', () => {
       await new Promise((resolve, reject) => {
         const timer = setTimeout(() => reject(new Error('no data')), 5000);
         const done = () => { clearTimeout(timer); resolve(); };
-        const req = http.get({ host: '127.0.0.1', port, path: '/api/ai/enrich?scope=all&force=1' }, (res) => {
+        const req = http.get({ host: '127.0.0.1', port, path: '/api/ai/enrich?key=t&scope=all&force=1' }, (res) => {
           res.once('data', () => { req.destroy(); done(); });
         });
         req.on('error', done);

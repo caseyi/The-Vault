@@ -21,7 +21,8 @@ const librariesLib = require('./lib/libraries');
 const zipLib = require('./lib/zip');
 const { scrapeImagesFromUrl, detectUrlFromFolderName } = require('./scraper');
 const organizeRouter = require('./organize');
-const { wrapAsyncRoutes, originPolicy, errorHandler } = require('./lib/middleware');
+const { wrapAsyncRoutes, originPolicy, spendGuard, errorHandler } = require('./lib/middleware');
+const guardSpend = spendGuard();
 const { confinePath, tryConfine, sendPathError, imageUrlToFile, isSafeImageUrl } = require('./lib/paths');
 const { openSSE } = require('./lib/sse');
 const { acquireOr409 } = require('./lib/jobs');
@@ -508,6 +509,14 @@ app.patch('/api/models/:id(\\d+)', (req, res) => {
     attr.userFields = [...new Set([...(Array.isArray(attr.userFields) ? attr.userFields : []), ...userSet])];
     attr.fields = { ...(attr.fields || {}) };
     for (const f of userSet) { attr.fields[f] = 'user'; if (attr.ai) delete attr.ai[f]; }
+    if (tags !== undefined) {
+      // tags the user took off are never proposed again; re-adding one lifts that
+      const prevTags = parseJSON(db.prepare('SELECT tags FROM models WHERE id = ?').get(req.params.id).tags, []);
+      const nowTags = new Set((tags || []).map(t => String(t).toLowerCase()));
+      const removed = new Set([...(Array.isArray(attr.removedTags) ? attr.removedTags : []), ...prevTags.filter(t => !nowTags.has(String(t).toLowerCase()))]);
+      attr.removedTags = [...removed].filter(t => !nowTags.has(String(t).toLowerCase())).slice(-200);
+      if (!attr.removedTags.length) delete attr.removedTags;
+    }
     updates.push('attribution = ?'); params.push(JSON.stringify(attr));
   }
 
@@ -1313,6 +1322,8 @@ const TAG_MODELS = {
   'claude-sonnet-4-6':         { label: 'Sonnet 4.6 — best quality', inRate: 3, outRate: 15 },
 };
 const DEFAULT_TAG_MODEL = process.env.CLAUDE_MODEL || 'claude-haiku-4-5-20251001';
+// a model without a price list is costed like Sonnet (the dearer one): estimates err high
+const UNKNOWN_MODEL_RATES = { inRate: 3, outRate: 15 };
 function resolveTagModel(requested) {
   return TAG_MODELS[requested] ? requested : DEFAULT_TAG_MODEL;
 }
@@ -1349,7 +1360,7 @@ app.get('/api/ai/tag-estimate', (req, res) => {
 
 const VISION_MEDIA = { '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.webp': 'image/webp', '.gif': 'image/gif' };
 
-app.get('/api/ai/vision-tags', async (req, res) => {
+app.get('/api/ai/vision-tags', guardSpend, async (req, res) => {
   const apiKey = req.query.key || req.headers['x-claude-key'] || process.env.CLAUDE_API_KEY || '';
   if (!apiKey) { res.status(401).json({ error: 'API key required' }); return; }
   const model = resolveTagModel(req.query.model);
@@ -1454,7 +1465,7 @@ function loadRender(card) {
   if (!file || !media) return null;
   try {
     const buf = fs.readFileSync(file);
-    if (buf.length > 4_500_000) return null;
+    if (buf.length > 3_500_000) return null; // base64 adds a third: stays under the API's 5 MB image limit
     return { media, data: buf.toString('base64') };
   } catch { return null; }
 }
@@ -1463,7 +1474,10 @@ app.get('/api/ai/enrich/estimate', async (req, res) => {
   const model = resolveTagModel(req.query.model);
   const params = enrichParams(req.query);
   const { promptCtx, evCtx } = await enrichContext();
-  res.json(enrich.estimate(db, params, { promptCtx, rates: TAG_MODELS[model], model, ctx: evCtx }));
+  const out = enrich.estimate(db, params, { promptCtx, rates: TAG_MODELS[model] || UNKNOWN_MODEL_RATES, model, ctx: evCtx });
+  if (!TAG_MODELS[model]) out.warning = `No price list for model "${model}" (CLAUDE_MODEL); the estimate uses Sonnet-level rates`;
+  else if (req.query.model && req.query.model !== model) out.warning = `Unknown model "${req.query.model}"; estimated for ${model}`;
+  res.json(out);
 });
 
 /** One enrichment run streamed over SSE. tagsOnly: the generate-tags alias. */
@@ -1488,7 +1502,7 @@ async function streamEnrich(req, res, { tagsOnly = false, jobName = 'enrich' } =
     if (!sel.cards.length) {
       enrich.finishRun(db, runId, { total: 0, unchanged: sel.skipped }, 'complete');
       release();
-      sse.end({ type: 'done', success: true, runId, applied: 0, suggested: 0, merges: 0, unchanged: sel.skipped, errors: 0, visionUsed: 0, tagged: 0, total: 0 });
+      sse.end({ type: 'done', success: true, runId, applied: 0, suggested: 0, merges: 0, unchanged: sel.skipped, errors: 0, visionUsed: 0, actualInTokens: 0, actualOutTokens: 0, actualUsd: 0, tagged: 0, total: 0 });
       return;
     }
     const counts = await enrich.runEnrich({
@@ -1497,19 +1511,20 @@ async function streamEnrich(req, res, { tagsOnly = false, jobName = 'enrich' } =
       signal: sse.signal, loadImage: loadRender,
     });
     counts.unchanged = sel.skipped;
-    const status = counts.fatal ? 'error' : (counts.cancelled ? 'cancelled' : 'complete');
-    enrich.finishRun(db, runId, counts, status);
+    const status = counts.fatal ? 'error' : (counts.cancelled ? 'cancelled' : (counts.stopped ? 'stopped' : 'complete'));
+    const actualUsd = enrich.finishRun(db, runId, counts, status, TAG_MODELS[model] || UNKNOWN_MODEL_RATES);
     if (counts.cancelled && sse.aborted) { console.log(`[enrich] run #${runId} stopped: client disconnected`); return; }
-    const ok = !counts.fatal;
+    const ok = !counts.fatal && !counts.stopped;
     log(ok ? (counts.errors ? 'warn' : 'success') : 'error', ok
       ? `Done: ${counts.applied} applied, ${counts.suggested} suggestion(s), ${counts.merges} merge proposal(s), ${counts.errors} error(s)`
-      : `Stopped: ${counts.fatal}`);
+      : `Stopped: ${counts.fatal || counts.stopped}`);
     release();
     sse.end({
       type: 'done', success: ok, runId, applied: counts.applied, suggested: counts.suggested, merges: counts.merges,
       unchanged: sel.skipped, errors: counts.errors, visionUsed: counts.visionUsed,
+      actualInTokens: counts.inTokens, actualOutTokens: counts.outTokens, actualUsd, ...(counts.stopped ? { stopped: counts.stopped } : {}),
       // generate-tags clients read these
-      tagged: counts.applied, total: sel.cards.length, ...(counts.fatal ? { error: counts.fatal } : {}),
+      tagged: counts.applied, total: sel.cards.length, ...(counts.fatal || counts.stopped ? { error: counts.fatal || counts.stopped } : {}),
     });
   } catch (e) {
     if (runId) enrich.finishRun(db, runId, {}, 'error');
@@ -1519,9 +1534,9 @@ async function streamEnrich(req, res, { tagsOnly = false, jobName = 'enrich' } =
   } finally { release(); }
 }
 
-app.get('/api/ai/enrich', (req, res) => streamEnrich(req, res));
+app.get('/api/ai/enrich', guardSpend, (req, res) => streamEnrich(req, res));
 // Old clients: "Generate tags" is Enrich with tags only (additive, never removes a tag, cap 12)
-app.get('/api/ai/generate-tags', (req, res) => streamEnrich(req, res, { tagsOnly: true, jobName: 'generate-tags' }));
+app.get('/api/ai/generate-tags', guardSpend, (req, res) => streamEnrich(req, res, { tagsOnly: true, jobName: 'generate-tags' }));
 
 app.get('/api/ai/enrich/runs', (req, res) => res.json({ runs: enrich.listRuns(db, clampInt(req.query.limit, 50, 1, 500)) }));
 app.post('/api/ai/enrich/runs/:id(\\d+)/undo', (req, res) => {
@@ -1530,6 +1545,9 @@ app.post('/api/ai/enrich/runs/:id(\\d+)/undo', (req, res) => {
 
 app.get('/api/suggestions', (req, res) => res.json(enrich.listSuggestions(db, req.query)));
 app.get('/api/suggestions/summary', (req, res) => res.json(enrich.summary(db)));
+app.post('/api/suggestions/:id(\\d+)/unmerge', (req, res) => {
+  try { res.json(enrich.unmerge(db, Number(req.params.id))); } catch (e) { res.status(e.status || 500).json({ error: e.message }); }
+});
 app.post('/api/suggestions/decide', (req, res) => {
   const { ids, decision } = req.body || {};
   if (!Array.isArray(ids) || !ids.length) return res.status(400).json({ error: 'ids array required' });
@@ -1598,7 +1616,7 @@ function scoreMatchability(model) {
   return { score, reasons };
 }
 
-app.get('/api/ai/find-images', async (req, res) => {
+app.get('/api/ai/find-images', guardSpend, async (req, res) => {
   const apiKey = req.headers['x-claude-key'] || req.query.key || process.env.CLAUDE_API_KEY || '';
   const trialMode = req.query.trial !== '0'; // trial mode ON by default
   const TRIAL_LIMIT = 10;

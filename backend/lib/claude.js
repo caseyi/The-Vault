@@ -32,6 +32,15 @@ function describeStatus(statusCode, data) {
   return errMsg;
 }
 
+/** Error for a non-200 answer, with .status and .retryAfter (seconds, from the retry-after header). */
+function statusError(apiRes, data) {
+  const err = new Error(describeStatus(apiRes.statusCode, data));
+  err.status = apiRes.statusCode;
+  const ra = parseFloat((apiRes.headers || {})['retry-after']);
+  if (Number.isFinite(ra)) err.retryAfter = ra;
+  return err;
+}
+
 function networkError(e) {
   if (e.name === 'AbortError' || e.code === 'ABORT_ERR') return new Error('Request cancelled');
   if (e.code === 'ECONNRESET') return new Error('Connection to Claude API was reset — check your network');
@@ -79,7 +88,7 @@ function callClaudeAPI(apiKey, body, { timeoutMs = 120000, signal } = {}) {
       apiRes.on('data', chunk => { data += chunk; });
       apiRes.on('error', e => reject(networkError(e)));
       apiRes.on('end', () => {
-        if (apiRes.statusCode !== 200) return reject(new Error(describeStatus(apiRes.statusCode, data)));
+        if (apiRes.statusCode !== 200) return reject(statusError(apiRes, data));
         try {
           const parsed = JSON.parse(data);
           if (parsed.error) return reject(new Error(`Claude API error: ${parsed.error.message}`));
@@ -101,7 +110,7 @@ function claudeStream(apiKey, body, onChunk, { timeoutMs = 180000, signal } = {}
       if (apiRes.statusCode !== 200) {
         let data = '';
         apiRes.on('data', c => { data += c; });
-        apiRes.on('end', () => reject(new Error(describeStatus(apiRes.statusCode, data))));
+        apiRes.on('end', () => reject(statusError(apiRes, data)));
         return;
       }
       apiRes.on('data', chunk => { try { onChunk(chunk); } catch {} });

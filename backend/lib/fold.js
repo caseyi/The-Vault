@@ -19,7 +19,7 @@ const addLine = (text, line) => (text && text.includes(line) ? text : (text ? `$
  * @param {{ reason?: string }} [opts]
  * @returns {{ moved: number }} files moved
  */
-function foldInto(db, sourceId, targetId, { reason = 'merge' } = {}) {
+function foldInto(db, sourceId, targetId, { reason = 'merge', alias = null } = {}) {
   if (sourceId === targetId) throw new Error('A card cannot be merged into itself');
   const src = db.prepare('SELECT * FROM models WHERE id = ?').get(sourceId);
   const dst = db.prepare('SELECT * FROM models WHERE id = ?').get(targetId);
@@ -50,6 +50,14 @@ function foldInto(db, sourceId, targetId, { reason = 'merge' } = {}) {
   const sAttr = parseJSON(src.attribution, {});
   sAttr.foldedInto = dst.id;
   sAttr.foldedBy = reason;
+  // what an unmerge needs to put back (POST /api/suggestions/:id/unmerge)
+  sAttr.merge = {
+    into: dst.id, at: new Date().toISOString(), hidden: !!src.hidden, workKey: src.work_key || null,
+    aliasFrom: alias ? alias.from : null, aliasTo: alias ? alias.to : null,
+    files: db.prepare('SELECT filepath FROM model_files WHERE model_id = ?').all(src.id).map(r => r.filepath),
+    collections: db.prepare('SELECT collection_id FROM collection_models WHERE model_id = ?').all(src.id).map(r => r.collection_id),
+    queued: !!db.prepare('SELECT 1 FROM print_queue WHERE model_id = ?').get(src.id),
+  };
 
   let moved = 0;
   db.transaction(() => {
