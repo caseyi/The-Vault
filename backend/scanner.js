@@ -865,6 +865,69 @@ function franchiseAndTeam(w, base, prevAttr, meta) {
   return { franchise: fr || auto, team: team || autoTeam };
 }
 
+/**
+ * Pending AI field proposals made stale by this scan: the field now holds a value from model.json,
+ * the genre folder or the creator's manifest that differs from what the proposal was made for.
+ */
+function supersedeStaleSuggestions(log) {
+  let pend;
+  try { pend = db.prepare(`SELECT s.id, s.field, s.current, m.character, m.franchise, m.group_name, m.editions, m.attribution FROM suggestions s JOIN models m ON m.id = s.model_id WHERE s.status = 'pending' AND s.type = 'field' AND s.field IN ('character','franchise','group_name','editions')`).all(); } catch { return; }
+  const stale = [];
+  for (const p of pend) {
+    const prov = (parseJSON(p.attribution, {}).fields || {})[p.field];
+    if (!['sidecar', 'path', 'manifest'].includes(prov)) continue;
+    const now = p.field === 'editions' ? JSON.stringify(parseJSON(p.editions, [])) : JSON.stringify(p[p.field] ?? null);
+    const was = p.field === 'editions' ? JSON.stringify(parseJSON(p.current, [])) : JSON.stringify(parseJSON(p.current, null));
+    if (now !== was) stale.push(p.id);
+  }
+  if (!stale.length) return;
+  db.transaction(() => { for (const id of stale) db.prepare(`UPDATE suggestions SET status = 'superseded', decided_at = datetime('now') WHERE id = ?`).run(id); })();
+  log('info', `${stale.length} AI proposal(s) superseded: the scan found values of its own`);
+}
+
+/** Confirmed merges: Map(from work_key → { to_key, to_name }) for worksLib.planWorks. */
+function loadAliases() {
+  try {
+    const m = new Map();
+    for (const a of db.prepare('SELECT from_key, to_key, to_name FROM aliases').all()) m.set(a.from_key, { to_key: a.to_key, to_name: a.to_name });
+    return m;
+  } catch { return new Map(); } // scanner.test.js mocks the DB
+}
+
+/**
+ * Values the scan must not overwrite (docs/ai-enrichment.md §2): fields the user set
+ * (attribution.userFields) or accepted from the review list (provenance "ai-reviewed") keep the
+ * row's value; values the AI filled automatically ("ai") stay until the scan finds a value of its
+ * own (sidecar, path, manifest…). Mutates `attribution` (provenance, userFields, enrichment trail).
+ * @returns {{ character, group_name, editions, franchise? }} franchise undefined → franchiseAndTeam decides
+ */
+const ENRICH_FIELDS = ['character', 'group_name', 'editions', 'franchise'];
+function keptFields(w, base, prevAttr, attribution) {
+  const scan = { character: w.character || null, group_name: w.group || null, editions: w.editions || [], franchise: undefined };
+  if (!base) return scan;
+  const fields = attribution.fields = { ...(attribution.fields || {}) };
+  const user = new Set(Array.isArray(prevAttr.userFields) ? prevAttr.userFields : []);
+  if (user.size) attribution.userFields = [...user];
+  const prev = prevAttr.fields || {};
+  const col = { character: base.character || null, group_name: base.group_name || null, editions: parseJSON(base.editions, []), franchise: base.franchise || null };
+  const empty = (v) => v == null || v === '' || (Array.isArray(v) && !v.length);
+  const out = { ...scan };
+  for (const f of ENRICH_FIELDS) {
+    const prov = user.has(f) ? 'user' : prev[f];
+    const scanProv = (attribution.fields || {})[f];
+    if (prov === 'ai-reviewed' && scanProv === 'sidecar') {
+      // model.json is authoritative: it beats an accepted AI proposal (never the user's own value)
+      if (f === 'franchise') out[f] = w.attr.genre || col[f];
+    } else if (prov === 'user' || prov === 'ai-reviewed') {
+      out[f] = col[f]; fields[f] = prov;
+    } else if (prov === 'ai') {
+      const scanVal = f === 'franchise' ? (w.attr.genre || null) : scan[f];
+      if (empty(scanVal)) { out[f] = col[f]; fields[f] = 'ai'; } else if (f === 'franchise') out[f] = scanVal;
+    }
+  }
+  return out;
+}
+
 /** release_name like the old analyzeFolder: first sub-folder below the work folder, or the archive stem. */
 function releaseNameFor(file, folder, creatorName) {
   const rel = path.relative(folder, file.abs);
@@ -919,6 +982,7 @@ function layoutStmts() {
     fold: db.prepare(`UPDATE models SET hidden = 1, folder_hash = NULL, work_key = NULL, folded_into = ?, attribution = ?, creator_id = COALESCE(?, creator_id), updated_at = datetime('now') WHERE id = ?`),
     setHidden: db.prepare(`UPDATE models SET hidden = ?, updated_at = datetime('now') WHERE id = ?`),
     setAttr: db.prepare('UPDATE models SET attribution = ? WHERE id = ?'),
+    setNotes: db.prepare('UPDATE models SET notes = ? WHERE id = ?'),
     full: db.prepare('SELECT * FROM models WHERE id = ?'),
     mergeUser: db.prepare(`UPDATE models SET tags=?, is_favorite=?, print_status=?, notes=?, images=?, thumbnail_path=?, name=?, name_locked=?, source_url=COALESCE(NULLIF(source_url,''), ?), updated_at=datetime('now') WHERE id=?`),
   };
@@ -929,19 +993,20 @@ function layoutStmts() {
  * Before the first layout scan of any scope regroups rows into works, write a snapshot.
  * Without one the scan does not start: regrouping folds rows and moves user data.
  */
-function preRegroupSnapshot(log) {
-  if (typeof db.getSetting !== 'function' || db.getSetting('layout_regroup_done')) return null;
+function preRegroupSnapshot(log, { label = 'pre-regroup', setting = 'layout_regroup_done', why: what = 'regrouping the library into works' } = {}) {
+  if (typeof db.getSetting !== 'function' || (setting && db.getSetting(setting))) return null;
   const n = db.prepare('SELECT COUNT(*) AS n FROM models').get().n;
   if (!n) return null;
   const backup = require('./lib/backup');
   let reason = '';
-  const file = backup.snapshot('pre-regroup', { db, log: { log: (m) => log('info', m), error: (m) => { reason = m; log('warn', m); } } });
+  const file = backup.snapshot(label, { db, log: { log: (m) => log('info', m), error: (m) => { reason = m; log('warn', m); } } });
   if (!file) {
-    const why = String(reason).replace(/^\[backup\] snapshot "pre-regroup" failed: /, '') || 'unknown error';
-    throw new Error(`Could not write the backup taken before regrouping the library into works (${why}). ` +
+    const why = String(reason).replace(/^\[backup\] snapshot "[^"]+" failed: /, '') || 'unknown error';
+    throw new Error(`Could not write the backup taken before ${what} (${why}). ` +
       `Fix BACKUP_DIR (currently ${backup.backupDir ? backup.backupDir() : process.env.BACKUP_DIR || 'next to the database'}; it must exist or be creatable, and be writable) and scan again. Nothing was changed.`);
   }
-  log('info', `Backup written before regrouping into works: ${path.basename(file)}`);
+  log('info', `Backup written before ${what}: ${path.basename(file)}`);
+  if (setting && setting !== 'layout_regroup_done' && typeof db.setSetting === 'function') db.setSetting(setting, new Date().toISOString());
   return file;
 }
 
@@ -966,11 +1031,18 @@ async function scanLibraryLayout(libraryPath, progressCallback, logger, { scope 
     const tw = Date.now();
     const tree = worksLib.walkTree(libraryPath, { ignore, scope });
     log('info', `Walked ${tree.fileCount} file(s) in ${Date.now() - tw} ms`);
-    const plan = worksLib.planWorks({ libraryPath, tree, meta, overrides, log, scope });
+    const plan = worksLib.planWorks({ libraryPath, tree, meta, overrides, log, scope, aliases: loadAliases() });
     worksLib.finalizeWorks(plan.works, { libraries: libs, libraryOf: librariesLib.libraryOf });
     for (const w of plan.works) {
       w.attr = worksLib.attributeWork(w, meta);
       if (w.attr.character) { w.name = w.attr.character; w.character = w.attr.character; }
+      if (w.releaseId) {
+        // one card per release: "Daredevil (2025)", "Daredevil (Netflix)"; the plain release keeps the name
+        if (w.releaseLabel) w.name = `${w.character || w.name} (${w.releaseLabel})`;
+        if (/^\d{4}-\d{2}$/.test(w.releaseId)) w.attr.release_term = w.releaseId; // the release IS that term
+        else if (/^\d{4}$/.test(w.releaseId) && w.attr.release_term && !w.attr.release_term.startsWith(w.releaseId)) w.attr.release_term = null;
+        if (!w.attr.release_label && w.releaseLabel) w.attr.release_label = w.releaseLabel;
+      }
     }
     const byKind = {};
     for (const w of plan.works) byKind[w.kind] = (byKind[w.kind] || 0) + 1;
@@ -991,7 +1063,7 @@ async function scanLibraryLayout(libraryPath, progressCallback, logger, { scope 
         if (!printedByNameSize.has(k) || printedByNameSize.get(k) < r.printed_at) printedByNameSize.set(k, r.printed_at);
       }
     }
-    const rows = new Map(db.prepare('SELECT id, uuid, work_key, folder_path, folded_into, hidden, name, name_locked, folder_hash, images, thumbnail_path, render_zip_hint, creator_id, attribution, franchise, team, group_name, source_url FROM models').all().map(r => [r.id, r]));
+    const rows = new Map(db.prepare('SELECT id, uuid, work_key, folder_path, folded_into, hidden, name, name_locked, folder_hash, images, thumbnail_path, render_zip_hint, creator_id, attribution, franchise, team, group_name, character, editions, source_url FROM models').all().map(r => [r.id, r]));
     const byKey = new Map();
     const byFolder = new Map();
     for (const r of rows.values()) {
@@ -1053,6 +1125,27 @@ async function scanLibraryLayout(libraryPath, progressCallback, logger, { scope 
     for (const w of plan.works) {
       const base = byKey.get(w.key);
       if (base && !claimed.has(base.id)) { claimed.set(base.id, w); w.base = base; w.baseByKey = true; } else w.base = null;
+    }
+    // A card split into releases: the release holding most of the card's files keeps its row
+    // (id, tags, status, collections); the others become new cards
+    const splitGroups = new Map();
+    for (const w of plan.works) if (w.splitFrom) { if (!splitGroups.has(w.splitFrom)) splitGroups.set(w.splitFrom, []); splitGroups.get(w.splitFrom).push(w); }
+    let splitting = 0;
+    for (const [from, list] of splitGroups) {
+      const row = byKey.get(from);
+      if (!row || claimed.has(row.id) || row.folded || list.some(w => w.base)) continue;
+      // the row (and its tags, status, collections) goes to the release the user printed from,
+      // else the one holding most of its files
+      const printed = (w) => w.files.filter(f => { const e = existingFiles.get(f.abs); return e && e.model_id === row.id && e.printed_at; }).length;
+      const best = list.map(w => [w, w.owners.get(row.id) || 0, printed(w)]).sort((a, b) => b[2] - a[2] || b[1] - a[1] || b[0].files.length - a[0].files.length)[0][0];
+      claimed.set(row.id, best); best.base = row; best.baseByKey = true;
+      for (const w of list) w.splitSource = row;
+      splitting++;
+    }
+    if (splitting) {
+      log('info', `Splitting ${splitting} card(s) into one card per release`);
+      // every scan that splits existing cards takes one (not only the first)
+      preRegroupSnapshot(log, { label: 'pre-split', setting: null, why: 'splitting cards into one per release' });
     }
     const candidates = [];
     for (const w of plan.works) {
@@ -1149,12 +1242,13 @@ async function scanLibraryLayout(libraryPath, progressCallback, logger, { scope 
         const products = JSON.stringify(w.attr.products);
         const attribution = { ...w.attr.attribution, autoFranchise: w.attr.genre || null, sourceUrl: w.attr.sourceUrl || null };
         if (Array.isArray(prevAttr.foldedFrom) && prevAttr.foldedFrom.length) attribution.foldedFrom = prevAttr.foldedFrom;
+        const kept = keptFields(w, base, prevAttr, attribution);
         const attrSig = JSON.stringify([products, w.attr.attribution, w.attr.genre, w.attr.release_term, w.attr.release_label, w.group || null, w.editions || [], w.libraries, w.name]);
         attribution.sig = crypto.createHash('sha1').update(attrSig).digest('hex').slice(0, 12);
         const filesOwned = base && w.owners.size === 1 && w.owners.get(base.id) === w.files.length;
         const ft = franchiseAndTeam(w, base, prevAttr, meta);
         const sameLabels = base && (base.franchise || null) === ft.franchise && (base.team || null) === ft.team;
-        if (base && base.folder_hash === w.hash && filesOwned && prevAttr.sig === attribution.sig && base.folder_path === w.folderPath && sameLabels) {
+        if (base && base.work_key === w.key && base.folder_hash === w.hash && filesOwned && prevAttr.sig === attribution.sig && base.folder_path === w.folderPath && sameLabels) {
           w.rowId = base.id;
           prepared.push({ w, skip: true });
           continue;
@@ -1183,7 +1277,7 @@ async function scanLibraryLayout(libraryPath, progressCallback, logger, { scope 
         images = rankImages(images);
         const thumbnail = base && base.thumbnail_path && images.includes(base.thumbnail_path) ? base.thumbnail_path
           : (kidThumb && images.includes(kidThumb) ? kidThumb : (images[0] || null));
-        prepared.push({ w, uuid, images, thumbnail, products, attribution, prevAttr, ft });
+        prepared.push({ w, uuid, images, thumbnail, products, attribution, prevAttr, ft, kept });
       }
 
       db.transaction(() => {
@@ -1195,11 +1289,12 @@ async function scanLibraryLayout(libraryPath, progressCallback, logger, { scope 
           const a = analysisFromFiles(w.files);
           const sourceSite = detectSourceSite(real) || detectSourceSite(w.name) || (w.attr.source === 'gumroad' || w.attr.source === 'patreon' ? w.attr.source : null);
           const base = w.base;
-          const { franchise, team } = p.ft; // franchise = genre; user edits win (see franchiseAndTeam)
+          const { team } = p.ft; // franchise = genre; user edits win (see franchiseAndTeam)
+          const franchise = p.kept.franchise !== undefined ? p.kept.franchise : p.ft.franchise;
           const prevAutoUrl = p.prevAttr.sourceUrl;
           const sourceUrl = !base || !base.source_url || (prevAutoUrl && base.source_url === prevAutoUrl) ? (w.attr.sourceUrl || (base ? base.source_url : null) || null) : base.source_url;
           const vals = [
-            JSON.stringify(w.libraries || []), w.studio || null, w.character || null, w.group || null, JSON.stringify(w.editions || []),
+            JSON.stringify(w.libraries || []), w.studio || null, p.kept.character, p.kept.group_name, JSON.stringify(p.kept.editions || []),
             w.attr.release_term || null, w.attr.release_label || null, w.attr.source || null, p.products, JSON.stringify(p.attribution), p.attribution.confidence,
           ];
           let id;
@@ -1218,6 +1313,7 @@ async function scanLibraryLayout(libraryPath, progressCallback, logger, { scope 
               w.key, w.kind, w.library, ...vals).lastInsertRowid;
             counters.modelsAdded++;
             log('add', `    + ${w.name} (${w.files.length} files${p.images.length ? `, ${p.images.length} img` : ''})`);
+            if (w.splitSource) S.setNotes.run(`Split from ${w.splitSource.name} (release ${w.releaseLabel || w.releaseId})`, id);
           }
           w.rowId = id;
           // files: take them from their old owners, replace this row's files in scope
@@ -1348,6 +1444,7 @@ async function scanLibraryLayout(libraryPath, progressCallback, logger, { scope 
 
     const orphaned = db.prepare('DELETE FROM creators WHERE id NOT IN (SELECT DISTINCT creator_id FROM models WHERE creator_id IS NOT NULL)').run();
     if (orphaned.changes > 0) log('info', `Cleaned up ${orphaned.changes} orphaned creator(s)`);
+    supersedeStaleSuggestions(log);
     if (typeof db.setSetting === 'function') {
       db.setSetting('layout_regroup_done', db.getSetting('layout_regroup_done') || new Date().toISOString());
       if (!scope) {

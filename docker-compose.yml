@@ -91,6 +91,9 @@ services:
       # layout = group files into works and attribute them from <library>/_Meta;
       # legacy = the old one-card-per-folder scanner
       - LAYOUT_MODE=${LAYOUT_MODE:-layout}
+      # AI Enrich: auto-fill threshold and review threshold (0-1)
+      - ENRICH_AUTO_MIN=${ENRICH_AUTO_MIN:-0.8}
+      - ENRICH_SUGGEST_MIN=${ENRICH_SUGGEST_MIN:-0.5}
       # 1 = let the web scraper fetch LAN/private addresses (off by default)
       - SCRAPER_ALLOW_PRIVATE=${SCRAPER_ALLOW_PRIVATE:-0}
       # Optional: extra browser origins allowed to call the API cross-origin

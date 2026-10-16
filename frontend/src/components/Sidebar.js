@@ -43,7 +43,7 @@ function VersionTag({ appVersion, gitSha }) {
   );
 }
 
-export default function Sidebar({ open, onToggle, stats, creators, tags, filters, onFilterChange, onScanClick, onOrganizeClick, onHomeClick, showHidden, onToggleHidden, appVersion, gitSha, isMobile, onRescanCreator, franchises, facets, collections, queueCount, onQueueClick, onWishlistClick, wishlistCount, onCollectionClick, onCollectionsChange, recentlyViewed, onRecentClick, folderTree, onFolderSelect, density, onToggleDensity, theme, onToggleTheme, onTagsChange, scanRunning, scanCount, scanLast }) {
+export default function Sidebar({ open, onToggle, stats, creators, tags, filters, onFilterChange, onScanClick, onOrganizeClick, onHomeClick, showHidden, onToggleHidden, appVersion, gitSha, isMobile, onRescanCreator, franchises, facets, pendingSuggestions, onReviewClick, collections, queueCount, onQueueClick, onWishlistClick, wishlistCount, onCollectionClick, onCollectionsChange, recentlyViewed, onRecentClick, folderTree, onFolderSelect, density, onToggleDensity, theme, onToggleTheme, onTagsChange, scanRunning, scanCount, scanLast }) {
   const [confirmUi, askConfirm] = useConfirm();
   const notify = useNotify();
   const [showTagManager, setShowTagManager] = useState(false);
@@ -197,6 +197,13 @@ export default function Sidebar({ open, onToggle, stats, creators, tags, filters
                 ☆ Wishlist
                 <span className="side-nav-count">{wishlistCount > 0 ? wishlistCount : ''}</span>
               </button>
+              {pendingSuggestions > 0 && onReviewClick && (
+                <button onClick={onReviewClick} className="side-nav-btn purple" style={{ marginTop: 4 }}
+                  title="AI suggestions waiting for your review">
+                  ✓ Review suggestions
+                  <span className="side-nav-count">{pendingSuggestions.toLocaleString()}</span>
+                </button>
+              )}
               <div style={{ display: 'flex', gap: 4, marginTop: 4 }}>
                 <button
                   onClick={onToggleDensity}

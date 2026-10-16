@@ -467,10 +467,28 @@ management. These features are entirely optional - the app works without a key.
 Enter your API key in the **Scan** modal (it's stored in your browser's
 localStorage and never saved on the server), or set `CLAUDE_API_KEY` in `.env`.
 
-**Batch auto-tagging** - Generates up to 5 tags per model (creator, franchise,
-category, FDM/resin) by analysing folder names, file types, and slicer presence.
-Streams progress in real time. Models with resin slicer files (Chitubox, Lychee)
-are tagged "resin"; models with FDM slicer files are tagged "fdm".
+**Enrich metadata** (Scan Library → Enrich metadata, or "Enrich selected" in bulk
+select) - replaces "Generate tags". Claude reads each card's evidence (names, folder
+path, matched Gumroad products, Drive term labels, near-duplicate names) and fills
+structured fields: character, genre, group/sub-franchise (X-Men, Jurassic Park),
+editions and theme tags. High-confidence answers fill **empty** fields only; anything
+that would change a value, or is less certain, lands in **Organize → Review**, where you
+accept or reject in bulk (keys j/k/a/r). Merges ("Geral" → "Geralt") are always
+suggestions; accepting one folds the cards (data kept) and remembers the alias. Values
+from model.json, the genre folder, your purchases or your own edits are never
+overwritten. Re-runs skip unchanged cards, every run can be undone, and a cost
+estimate is shown first (about $2 for a full 4,500-card library on Haiku; renders are
+only sent for cards the text pass can't resolve, if you tick the option). Details:
+`docs/ai-enrichment.md`.
+
+**Organizer export** - Organize → Health → Organizer export: `genre_map.csv`,
+`filing_rules.csv` (typo fixes, groups, genres), `model_json.ndjson` (sidecar drafts)
+and `moves.csv` (proposed gold-layout paths) at `/api/organizer/export/...`, for the
+stl-library-organizer skill to pull. The app itself never moves files.
+
+**Releases** - the same character from two releases (Daredevil Netflix vs the 2026
+term) gets separate cards, linked as "Other releases"; Sculpture and Bust of one release
+stay together.
 
 **Image finder** - Scores each model's "matchability" based on available metadata
 (source URL, creator name, folder naming patterns) and uses Claude with web search

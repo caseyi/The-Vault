@@ -1,4 +1,5 @@
-import React from 'react';
+import React, { useState } from 'react';
+import { aiTooltip, isAiProv, pct, band, BAND_LABELS, FIELD_LABELS, asValues, addedValues } from '../enrich';
 import {
   asList, sortEditions, formatTerm, sourceLabel, explainConfidence, CONFIDENCE_LABELS,
   FIELD_SOURCE_LABELS, isAttributed,
@@ -88,14 +89,118 @@ function ProductRow({ product, showLinks }) {
   );
 }
 
+/** Small "AI" marker for a field filled by enrichment (tooltip: confidence + run). */
+export function AiMark({ attribution, enrichment, field }) {
+  const prov = attribution && attribution.fields && attribution.fields[field];
+  if (!isAiProv(prov)) return null;
+  const conf = attribution.ai && attribution.ai[field];
+  const tip = aiTooltip(prov, conf, enrichment);
+  return (
+    <span className={`ai-mark ${prov === 'ai-reviewed' ? 'reviewed' : ''}`} title={tip}>
+      <span aria-hidden="true">{prov === 'ai-reviewed' ? 'AI ✓' : 'AI'}</span>
+      <span className="sr-only"> ({tip})</span>
+    </span>
+  );
+}
+
+function EditForm({ fields, onSave, onCancel }) {
+  const [vals, setVals] = useState(() => Object.fromEntries(fields.map(f => [f.key, f.value || ''])));
+  const [busy, setBusy] = useState(false);
+  const submit = async (e) => {
+    e.preventDefault();
+    setBusy(true);
+    const changed = Object.fromEntries(fields.filter(f => (vals[f.key] || '') !== (f.value || '')).map(f => [f.key, vals[f.key].trim()]));
+    const ok = Object.keys(changed).length ? await onSave(changed) : true;
+    setBusy(false);
+    if (ok !== false) onCancel();
+  };
+  return (
+    <form className="attr-edit" onSubmit={submit} onKeyDown={e => { if (e.key === 'Escape') { e.stopPropagation(); onCancel(); } }}>
+      {fields.map((f, i) => (
+        <label key={f.key} className="attr-edit-field">
+          <span>{f.label}</span>
+          <input className="url-input" value={vals[f.key]} autoFocus={i === 0} placeholder={f.placeholder}
+            onChange={e => setVals(v => ({ ...v, [f.key]: e.target.value }))} disabled={busy} />
+        </label>
+      ))}
+      <div className="attr-edit-actions">
+        <button type="button" className="org-btn org-btn-sm" onClick={onCancel} disabled={busy}>Cancel</button>
+        <button type="submit" className="org-btn org-btn-sm org-btn-success" disabled={busy}>{busy ? 'Saving…' : 'Save'}</button>
+      </div>
+      <div className="attr-faint" style={{ fontSize: 10 }}>Values you set are never overwritten by scans or AI.</div>
+    </form>
+  );
+}
+
+function EditButton({ label, onClick }) {
+  return <button type="button" className="attr-edit-btn" onClick={onClick} aria-label={`Edit ${label}`} title={`Edit ${label}`}>✎</button>;
+}
+
+function suggestionText(s) {
+  if (s.type === 'merge') return null;
+  const cur = asValues(s.current);
+  if (s.field === 'tags' || s.field === 'editions' || Array.isArray(s.proposed)) {
+    return <>{addedValues(s.current, s.proposed).map(v => <ins key={v} className="diff-new">+ {v}</ins>)}</>;
+  }
+  return (
+    <>
+      {cur.length ? <del className="diff-old">{cur.join(', ')}</del> : <span className="diff-empty">empty</span>}
+      <span className="diff-arrow" aria-hidden="true"> → </span><span className="sr-only"> becomes </span>
+      <ins className="diff-new">{String(s.proposed ?? '')}</ins>
+    </>
+  );
+}
+
+function InlineSuggestions({ items, onDecide }) {
+  const [busy, setBusy] = useState(null);
+  if (!items.length) return null;
+  const decide = async (s, decision) => {
+    setBusy(s.id);
+    try { await onDecide([s.id], decision, s); } finally { setBusy(null); }
+  };
+  return (
+    <div className="attr-suggestions">
+      <div className="attr-subtitle">AI suggestions ({items.length})</div>
+      <ul>
+        {items.map(s => {
+          const b = band(s.confidence);
+          const label = s.type === 'merge' ? 'Same character as' : s.type === 'rename' ? 'Name' : (FIELD_LABELS[s.field] || s.field);
+          return (
+            <li key={s.id} className="attr-sugg">
+              <div className="attr-sugg-line">
+                <span className="review-field">{label}</span>
+                {s.type === 'merge' ? <b className="attr-sugg-target">{s.target?.name || `#${s.target?.id}`}</b> : <span className="diff">{suggestionText(s)}</span>}
+              </div>
+              <div className="attr-sugg-meta">
+                {b && <span className={`conf-chip conf-${b}`}>{BAND_LABELS[b]} {pct(s.confidence)}</span>}
+                {s.source === 'vision' && <span className="source-chip">👁 vision</span>}
+                <span className="review-reason">{s.reason}</span>
+              </div>
+              <div className="attr-sugg-actions">
+                <button className="org-btn org-btn-sm org-btn-success" disabled={busy != null} onClick={() => decide(s, 'accept')}
+                  aria-label={`Accept: ${label} ${s.type === 'merge' ? s.target?.name : s.proposed}`}>✓ {s.type === 'merge' ? 'Merge' : 'Accept'}</button>
+                <button className="org-btn org-btn-sm" disabled={busy != null} onClick={() => decide(s, 'reject')}
+                  aria-label={`Reject: ${label} ${s.type === 'merge' ? s.target?.name : s.proposed}`}>✕ Reject</button>
+              </div>
+            </li>
+          );
+        })}
+      </ul>
+    </div>
+  );
+}
+
 export function hasAttributionData(model) {
   if (!model) return false;
   return !!(model.studio || model.character || model.release_term || model.attribution || model.confidence
     || asList(model.products).length || asList(model.editions).length);
 }
 
-export default function AttributionPanel({ model }) {
+export default function AttributionPanel({ model, onSaveField, onDecide }) {
+  const [editing, setEditing] = useState(null); // 'character' | 'genre'
   if (!hasAttributionData(model)) return null;
+  const editable = !!onSaveField;
+  const suggestions = Array.isArray(model.suggestions) ? model.suggestions.filter(s => !s.status || s.status === 'pending') : [];
   const products = Array.isArray(model.products) ? model.products : [];
   const attribution = model.attribution || (model.confidence ? { confidence: model.confidence } : null);
   const fields = attribution && attribution.fields;
@@ -115,6 +220,7 @@ export default function AttributionPanel({ model }) {
   const folded = (Array.isArray(attribution && attribution.foldedFrom) ? attribution.foldedFrom : [])
     .map(e => (typeof e === 'string' ? e : e && e.name)).filter(Boolean);
   const explanation = confidence ? explainConfidence(attribution, { source: model.source }) : '';
+  const mark = (f) => <AiMark attribution={attribution} enrichment={model.enrichment} field={f} />;
 
   return (
     <section className="detail-card attr-panel" aria-labelledby={`attr-title-${model.id}`}>
@@ -133,17 +239,33 @@ export default function AttributionPanel({ model }) {
           {model.studio && creator && <><span className="attr-sep" aria-hidden="true"> › </span><span className="sr-only">, creator </span>{creator}</>}
         </Row>
       )}
-      {model.franchise && (
+      {editing === 'genre' ? (
+        <EditForm onSave={onSaveField} onCancel={() => setEditing(null)} fields={[
+          { key: 'franchise', label: 'Genre', value: model.franchise, placeholder: 'Marvel, DC, Movies…' },
+          { key: 'group_name', label: 'Group', value: model.group_name, placeholder: 'X-Men, Jurassic Park…' },
+        ]} />
+      ) : (model.franchise || (editable && !group)) ? (
         <Row label="Genre" field="franchise" fields={fields}>
-          {model.franchise}
-          {group && <><span className="attr-sep" aria-hidden="true"> › </span><span className="sr-only">, group </span>{group}</>}
+          {model.franchise || <span className="attr-faint">—</span>}{mark('franchise')}
+          {group && <><span className="attr-sep" aria-hidden="true"> › </span><span className="sr-only">, group </span>{group}{mark('group_name')}</>}
+          {editable && <EditButton label="genre and group" onClick={() => setEditing('genre')} />}
         </Row>
-      )}
-      {!model.franchise && group && <Row label="Group">{group}</Row>}
-      {model.character && <Row label="Character" field="character" fields={fields}>{model.character}</Row>}
+      ) : group ? (
+        <Row label="Group">{group}{mark('group_name')}{editable && <EditButton label="genre and group" onClick={() => setEditing('genre')} />}</Row>
+      ) : null}
+      {editing === 'character' ? (
+        <EditForm onSave={onSaveField} onCancel={() => setEditing(null)} fields={[
+          { key: 'character', label: 'Character', value: model.character, placeholder: 'Canonical name, e.g. Jean Grey' },
+        ]} />
+      ) : (model.character || editable) ? (
+        <Row label="Character" field="character" fields={fields}>
+          {model.character || <span className="attr-faint">—</span>}{mark('character')}
+          {editable && <EditButton label="character" onClick={() => setEditing('character')} />}
+        </Row>
+      ) : null}
       {editions.length > 0 && (
         <Row label="Editions" field="editions" fields={fields}>
-          <span className="attr-chips">{editions.map(e => <span key={e} className={`edition-chip ed-${e.toLowerCase()}`}>{e}</span>)}</span>
+          <span className="attr-chips">{editions.map(e => <span key={e} className={`edition-chip ed-${e.toLowerCase()}`}>{e}</span>)}{mark('editions')}</span>
         </Row>
       )}
       {model.release_label && model.kind === 'release-item' && <Row label="Release">{model.release_label}</Row>}
@@ -166,6 +288,8 @@ export default function AttributionPanel({ model }) {
         </Row>
       )}
       {libraries.length > 0 && <Row label={libraries.length > 1 ? 'Libraries' : 'Library'}>{libraries.join(' + ')}</Row>}
+
+      {onDecide && <InlineSuggestions items={suggestions} onDecide={onDecide} />}
 
       {folded.length > 0 && (
         <p className="attr-folded">Includes data from: {[...new Set(folded)].join(', ')}</p>

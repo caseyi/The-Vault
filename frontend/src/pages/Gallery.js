@@ -1,8 +1,12 @@
-import React, { useState, useEffect, useCallback, useRef, useMemo, memo } from 'react';
+import React, { useState, useEffect, useCallback, useRef, useMemo, memo, Suspense } from 'react';
 import { apiGet, apiSend, errorMessage, isAbortError } from '../api';
 import { useNotify } from '../components/Notices';
 import { activeFilterChips, EMPTY_FILTERS, filterParams } from '../filters';
 import { cardEditions, multiLibraryLabel, formatTerm, isAttributed } from '../library';
+import { isTermLabel } from '../enrich';
+import Modal from '../components/Modal';
+
+const EnrichPanel = React.lazy(() => import('../components/EnrichPanel'));
 
 const STATUS_ICONS = {
   unprinted: '○', sliced: '◑', printing: '◕', printed: '●', painted: '★', failed: '✗'
@@ -111,6 +115,9 @@ const ModelCard = memo(function ModelCard({ model, onClick, bulkMode, selected, 
           <span className="model-card-creator">{model.creator_name || 'Unknown'}</span>
           {model.release_term && <span className="model-card-term" title={`Release term ${formatTerm(model.release_term)}`}>{formatTerm(model.release_term)}</span>}
         </div>
+        {model.release_label && !isTermLabel(model.release_label) && (
+          <div className="model-card-release" title={`Release: ${model.release_label}`}>{model.release_label}</div>
+        )}
         <CardMeta model={model} showAttribution={showAttribution} />
         <div className="model-card-footer">
           <span className={`status-badge status-${model.print_status}`}>
@@ -127,7 +134,7 @@ const ModelCard = memo(function ModelCard({ model, onClick, bulkMode, selected, 
   );
 });
 
-function BulkActionBar({ selectedIds, onClearSelection, onBulkStatus, onBulkTag, onBulkHide, onSelectAll, totalVisible, collections, onRefreshCollections }) {
+function BulkActionBar({ selectedIds, onClearSelection, onBulkStatus, onBulkTag, onBulkHide, onSelectAll, totalVisible, collections, onRefreshCollections, onEnrich }) {
   const notify = useNotify();
   const [showStatusMenu, setShowStatusMenu] = useState(false);
   const [showTagMenu, setShowTagMenu] = useState(false);
@@ -269,6 +276,7 @@ function BulkActionBar({ selectedIds, onClearSelection, onBulkStatus, onBulkTag,
         </div>
       )}
 
+      {onEnrich && <button onClick={onEnrich} className="bulk-btn bulk-btn-ai" title="Uses Claude API credits">$ ✦ Enrich selected</button>}
       <button onClick={() => run(() => onBulkHide(true), 'Hide')} className="bulk-btn bulk-btn-muted">🙈 Hide</button>
       <button onClick={() => run(() => onBulkHide(false), 'Unhide')} className="bulk-btn bulk-btn-muted">👁 Unhide</button>
 
@@ -321,7 +329,9 @@ const SORT_OPTIONS = [
 
 const CARD_MIN = { small: 150, medium: 200, large: 290 };
 
-export default function Gallery({ filters, onFilterChange, onModelClick, showHidden, onToggleHidden, onRefreshStats, refreshKey, collections, onRefreshCollections, onScanClick }) {
+export default function Gallery({ filters, onFilterChange, onModelClick, showHidden, onToggleHidden, onRefreshStats, refreshKey, collections, onRefreshCollections, onScanClick, onOpenReview, onSuggestionsChange }) {
+  const [enrichIds, setEnrichIds] = useState(null);
+  const [enrichRunning, setEnrichRunning] = useState(false);
   const notify = useNotify();
   const [models, setModels] = useState([]);
   const [total, setTotal] = useState(0);
@@ -589,7 +599,23 @@ export default function Gallery({ filters, onFilterChange, onModelClick, showHid
         <BulkActionBar selectedIds={selectedList} onClearSelection={clearSelection}
           onBulkStatus={handleBulkStatus} onBulkTag={handleBulkTag} onBulkHide={handleBulkHide}
           onSelectAll={() => setSelectedIds(new Set(models.map(m => m.id)))} totalVisible={models.length}
-          collections={collections} onRefreshCollections={onRefreshCollections} />
+          collections={collections} onRefreshCollections={onRefreshCollections}
+          onEnrich={() => setEnrichIds(selectedList)} />
+      )}
+
+      {enrichIds && (
+        <Modal onClose={() => setEnrichIds(null)} label="Enrich selected cards" className="modal modal-wide"
+          closeOnBackdrop={!enrichRunning} closeOnEscape={!enrichRunning}>
+          <div className="modal-title">ENRICH SELECTED</div>
+          <Suspense fallback={<div className="modal-hint">Loading…</div>}>
+            <EnrichPanel presetIds={enrichIds} filters={filters} onRunningChange={setEnrichRunning}
+              onOpenReview={onOpenReview ? () => { setEnrichIds(null); onOpenReview(); } : undefined}
+              onDone={() => { reload(); if (onRefreshStats) onRefreshStats(); if (onSuggestionsChange) onSuggestionsChange(); }} />
+          </Suspense>
+          <div className="modal-actions">
+            <button className="btn-cancel" onClick={() => setEnrichIds(null)} disabled={enrichRunning}>Close</button>
+          </div>
+        </Modal>
       )}
     </div>
   );
