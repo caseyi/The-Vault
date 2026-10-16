@@ -302,23 +302,58 @@ gets scanned like any local folder.
 
 ## Folder structure expected
 
+The Vault reads the folder tree as metadata (full design: `docs/library-metadata.md`).
+
 ```
-/volume1/STL Archive/        ← your library root (mapped to /library/STL Archive)
-  CreatorName/               ← one folder per creator
-    ReleaseName/             ← release = subfolder name  (e.g. "FDM", "Resin v2")
-      model.stl
-      renders.zip
-    AnotherRelease.zip       ← or a ZIP at creator level
+/library/STL Archive/                    ← library "Dagobah" (LIBRARY_LABELS)
+  _Meta/                                 ← attribution files, read on every scan
+  Wicked Archive/<Genre>/[<Group>/]<Character>/<Type>/   ← studio layout
+  Loot Studios/2022-03 - Ship Ahoy!/<Item>/32mm/Supported/   ← release layout
+  _Tools/  _Inbox/  _Duplicates_Pending_Delete/          ← special folders
+/library/3dPrint/                        ← library "Endor" (second mount)
+  Wicked/<Genre>/<Character>/...
 ```
 
-Files inside each release folder are grouped by release name in the UI.
-ZIPs named with "render/preview/photo" keywords are auto-extracted for images.
+- **Studios** (Wicked, B3DSERK, SW3D / Star Wars 3D Models, ZEZ, and the `Wicked Archive`
+  and `Gumroad Downloads` containers): files are grouped by what they are, not where they
+  sit. One card per creator + character; Sculpture, Bust and Accessory are *editions* on that
+  card; Non Supported, One Piece, Chitubox / STL / Lychee pre-supported, X Pose and Images
+  zips (and their extracted folders) are *variants*. Dioramas get their own card.
+- **Releases** (`YYYY-MM - Title`, `#NN - Title`, `Vol. X`): one card per item; scale and
+  support folders (`32mm`, `75mm`, `Supported`, `Lychee`, …) are variants.
+- **Special folders:** `_Inbox`, `_Duplicates_Pending_Delete`, `_Meta` are skipped; `_Tools`
+  is indexed but hidden unless you pick the Tools filter; `_Unsorted`, `_Dioramas`,
+  `_Undated`, `_Bundles` are transparent.
+- The same file (name + size) in two libraries is a backup copy, not a duplicate.
+- `LAYOUT_MODE=legacy` brings back the old one-card-per-folder behaviour. The first
+  layout-aware scan snapshots the DB (`backups/vault-pre-regroup-*.db`) and folds old cards
+  (tags, status, favorites, collections, queue, printed files) into the new ones; nothing is
+  deleted.
 
-The scanner supports deeply nested archive structures too (e.g.,
-`Creator/Category/Subcategory/Model` up to 5 levels deep). If your Docker mount
-places creators under a root folder like `/library/STL Archive`, the scanner
-auto-detects this "pass-through" directory and treats its children as the real
-creators.
+### Attribution files (`_Meta`)
+
+Put these in `<library>/_Meta/` (the Vault only reads them; refresh them whenever the
+downloader/organizer produces new ones, then click Organize → Health → Reload metadata):
+
+| File | From | Gives |
+|---|---|---|
+| `gumroad_manifest*.json` | gumroad-stl-downloader | Products, Gumroad library links, file names and sizes |
+| `gumroad_unclaimed_tracker.csv` | claim tracker | Public product page, claim status and date |
+| `drive_listing.csv`, `drive_links_all.csv` | Drive intake | Term label and date per file |
+| `genre_map.csv`, `filing_rules.csv` | stl-library-organizer | Genres, typo fixes, groups |
+| `model.json` (any work folder) | organizer `apply` | Authoritative studio, creator, genre, character, type, source, term |
+
+Files are matched by exact byte size first, then by name. On the Oct 12 2026 inventory,
+about 70% of Wicked-family cards matched a purchase exactly; the rest are Drive-only or
+older Patreon downloads and fall back to the folder path.
+
+### Endor as a second library
+
+1. On Dagobah: File Station → Tools → Mount Remote Folder → CIFS, Endor's `3dPrint` share,
+   read-only, mounted somewhere **outside** the `STL Archive` share (e.g. `/volume1/Mounts/Endor-3dPrint`).
+2. In `.env`: `LIBRARY2_HOST_PATH=/volume1/Mounts/Endor-3dPrint` and `LIBRARY2_NAME=3dPrint`,
+   then uncomment the `LIBRARY2` line in `docker-compose.yml` (or run `sh add-library.sh`).
+3. `sudo sh update.sh`, then Scan. Endor shows up as its own library filter.
 
 ---
 

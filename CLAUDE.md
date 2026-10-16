@@ -85,6 +85,15 @@ All Claude API calls go through the shared `callClaudeAPI()` helper in `backend/
 
 API key is stored in browser localStorage and passed via `x-claude-key` header (POST endpoints) or `?key=` query param (SSE endpoints). nginx logs `$uri` (no query string) so keys don't land in `docker logs`.
 
+### Scanner: works and attribution (default `LAYOUT_MODE=layout`)
+Read `docs/library-metadata.md` before touching discovery. `backend/lib/works.js` groups files
+into works (studio identity parsing in `lib/naming.js`, release packs, folder fallback),
+`lib/meta.js` attributes them from `<library>/_Meta` (Gumroad manifests, tracker, Drive listing,
+genre_map, model.json), `lib/libraries.js` maps top-level folders to libraries (Dagobah, Endor).
+Models are keyed by `work_key`; `folder_path` may carry a virtual `#slug`, so any filesystem use
+must go through `realFolder()`. Real-library regression data: the organizer's `inv_*.txt`
+inventories can be rebuilt into a sparse tree (never copy it) and scanned.
+
 ### Scanner: Pass-Through Directory Detection
 The scanner auto-detects "pass-through" directories - top-level folders that contain ONLY subdirectories and no printable files (e.g., "STL Archive"). It treats their children as the real creators instead of attributing everything to the pass-through name.
 
