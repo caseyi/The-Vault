@@ -1,6 +1,8 @@
 # Dependencies
 node_modules/
-package-lock.json
+# NOTE: package-lock.json (backend/, frontend/, native/) and
+# native/src-tauri/Cargo.lock ARE committed: Docker builds and CI use `npm ci`
+# so every build installs exactly the tested dependency tree.
 
 # Build output
 frontend/build/
@@ -8,7 +10,11 @@ frontend/build/
 # Runtime data
 *.db
 *.db-journal
+*.db-wal
+*.db-shm
 /data/
+# Database snapshots written next to docker-compose.yml (see README → Backups)
+/backups/
 
 # OS junk
 .DS_Store
@@ -28,7 +34,9 @@ npm-debug.log*
 # Environment
 .env
 .env.local
+.env.update.*
 
 # Per-machine library config (may contain SMB credentials)
 docker-compose.override.yml
 .vault-libraries
+.vault-libraries.tmp

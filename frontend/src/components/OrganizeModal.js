@@ -1,35 +1,26 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
 import FolderRoles from './FolderRoles';
+import Modal, { useUniqueId } from './Modal';
+import { useConfirm } from './ConfirmDialog';
+import { useNotify } from './Notices';
+import { apiGet, apiSend, errorMessage } from '../api';
+
+const READ_ONLY_TIP = 'Library is mounted read-only';
 
 // ── shared helpers ────────────────────────────────────────────────────────────
 
 function getApiKey() {
-  return localStorage.getItem('claude_api_key') || '';
+  try { return localStorage.getItem('claude_api_key') || ''; } catch { return ''; }
 }
 
-function ModalOverlay({ onClose, children }) {
-  // Close on Escape
-  useEffect(() => {
-    const handler = (e) => { if (e.key === 'Escape') onClose(); };
-    window.addEventListener('keydown', handler);
-    return () => window.removeEventListener('keydown', handler);
-  }, [onClose]);
-
+function TabBar({ tabs, active, onChange, label }) {
   return (
-    <div className="organize-overlay" onClick={e => { if (e.target === e.currentTarget) onClose(); }}>
-      <div className="organize-modal">
-        {children}
-      </div>
-    </div>
-  );
-}
-
-function TabBar({ tabs, active, onChange }) {
-  return (
-    <div className="org-tabs">
+    <div className="org-tabs" role="tablist" aria-label={label}>
       {tabs.map(t => (
         <button
           key={t.id}
+          role="tab"
+          aria-selected={active === t.id}
           className={`org-tab ${active === t.id ? 'active' : ''}`}
           onClick={() => onChange(t.id)}
         >
@@ -107,7 +98,7 @@ function AnnotateTab({ target, onClearTarget }) {
       localStorage.setItem(ANNOTATE_STORAGE_KEY, JSON.stringify({ directives, creator, savedAt: ts }));
       setSavedAt(ts);
     } catch {}
-  }, [directives]);
+  }, [directives]); // eslint-disable-line
 
   useEffect(() => {
     fetch('/api/creators').then(r => r.json()).then(setCreators).catch(() => {});
@@ -196,7 +187,7 @@ function AnnotateTab({ target, onClearTarget }) {
       setStatusMsg('');
     }
     setRunning(false);
-  }, [creator, pathFilter]);
+  }, [creator, pathFilter, target]);
 
   const exportForClaude = useCallback(async () => {
     setExporting(true);
@@ -245,13 +236,10 @@ function AnnotateTab({ target, onClearTarget }) {
     const chosen = directives.filter((_, i) => selected.has(i));
     if (!chosen.length) { setError('Select at least one directive'); return; }
     setError('');
-    const res = await fetch('/api/organize/annotate/preview', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ directives: chosen }),
-    });
-    const data = await res.json();
-    setPreview(data);
+    try {
+      const data = await apiSend('/api/organize/annotate/preview', 'POST', { directives: chosen });
+      setPreview(data);
+    } catch (e) { setError(`Preview failed: ${errorMessage(e)}`); }
   }, [directives, selected]);
 
   const applySelected = useCallback(async () => {
@@ -259,18 +247,21 @@ function AnnotateTab({ target, onClearTarget }) {
     setApplying(true);
     setError('');
     const chosen = directives.filter((_, i) => selected.has(i));
-    const res = await fetch('/api/organize/annotate/apply', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ directives: chosen }),
-    });
-    const data = await res.json();
-    setApplyResult(data);
+    // Newer backends tag each preview change with an `id`; send those back so the
+    // server applies exactly what was previewed. Directives are still sent for
+    // older backends.
+    const ids = (preview.changes || []).filter(c => c.found && c.id != null).map(c => c.id);
+    const body = { directives: chosen };
+    if (ids.length) body.ids = ids;
+    try {
+      const data = await apiSend('/api/organize/annotate/apply', 'POST', body);
+      setApplyResult(data);
+      setPreview(null);
+    } catch (e) { setError(`Apply failed: ${errorMessage(e)}`); }
     setApplying(false);
-    setPreview(null);
   }, [directives, selected, preview]);
 
-  const typeColor = { FRANCHISE: '#c17f3a', RENAME: '#5b9bd5', MERGE: '#9b72cf', TAG: '#4caf7d' };
+  const typeColor = { FRANCHISE: 'var(--accent-text)', RENAME: 'var(--blue-text)', MERGE: 'var(--purple-text)', TAG: 'var(--green-text)' };
 
   function directiveType(line) {
     const m = line.match(/^(FRANCHISE|RENAME|MERGE|TAG):/i);
@@ -302,7 +293,7 @@ function AnnotateTab({ target, onClearTarget }) {
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
         <div className="org-row" style={{ marginBottom: 0 }}>
           <label className="org-label">Filter by creator</label>
-          <select className="org-select" value={creator} onChange={e => { setCreator(e.target.value); setPathFilter(''); }}>
+          <select className="org-select" aria-label="Filter by creator" value={creator} onChange={e => { setCreator(e.target.value); setPathFilter(''); }}>
             <option value="">All creators</option>
             {creators.map(c => <option key={c.id} value={c.name}>{c.name}</option>)}
           </select>
@@ -312,6 +303,7 @@ function AnnotateTab({ target, onClearTarget }) {
           <input
             className="org-select"
             placeholder="e.g. Marvel, Star Wars, X-Men…"
+            aria-label="Filter by subfolder or path"
             value={pathFilter}
             onChange={e => { setPathFilter(e.target.value); setCreator(''); }}
             style={{ fontFamily: 'var(--font-mono)', fontSize: 11 }}
@@ -335,6 +327,7 @@ function AnnotateTab({ target, onClearTarget }) {
           <label className="org-label">Paste Claude's response here to import directives</label>
           <textarea
             className="org-textarea"
+            aria-label="Paste Claude's response to import directives"
             rows={5}
             placeholder={"Paste Claude's output here — lines starting with FRANCHISE:, TAG:, RENAME:, or MERGE: will be imported automatically"}
             onPaste={e => {
@@ -363,7 +356,7 @@ function AnnotateTab({ target, onClearTarget }) {
           <span style={{ fontSize: 10, color: 'var(--text-faint)', fontFamily: 'var(--font-mono)' }}>
             💾 Auto-saved {new Date(savedAt).toLocaleTimeString()}
           </span>
-          <button className="org-btn org-btn-sm" onClick={clearSession} style={{ color: '#cf7272', borderColor: '#cf727240' }}>
+          <button className="org-btn org-btn-sm org-btn-danger" onClick={clearSession}>
             ✕ Clear
           </button>
         </div>
@@ -394,11 +387,15 @@ function AnnotateTab({ target, onClearTarget }) {
               return (
                 <div
                   key={i}
+                  role="checkbox"
+                  aria-checked={selected.has(i)}
+                  tabIndex={0}
                   className={`org-directive ${selected.has(i) ? 'selected' : ''}`}
                   onClick={() => toggleOne(i)}
+                  onKeyDown={e => { if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); toggleOne(i); } }}
                 >
-                  <span className="org-directive-check">{selected.has(i) ? '☑' : '☐'}</span>
-                  <span className="org-directive-type" style={{ color: typeColor[type] || '#888' }}>{type}</span>
+                  <span className="org-directive-check" aria-hidden="true">{selected.has(i) ? '☑' : '☐'}</span>
+                  <span className="org-directive-type" style={{ color: typeColor[type] || 'var(--text-faint)' }}>{type}</span>
                   <span className="org-directive-text">{line.replace(/^[A-Z]+:\s*/i, '')}</span>
                 </div>
               );
@@ -419,22 +416,22 @@ function AnnotateTab({ target, onClearTarget }) {
           {preview && (
             <div className="org-preview-box">
               <div className="org-preview-header">Preview — {preview.stats.found} will apply · {preview.stats.notFound} not found</div>
-              <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', padding: '8px 12px', borderBottom: '1px solid #2a2a35', fontSize: 11 }}>
+              <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', padding: '8px 12px', borderBottom: '1px solid var(--border)', fontSize: 11 }}>
                 {Object.entries(preview.stats.byType).map(([type, count]) => (
-                  <span key={type} style={{ color: typeColor[type] || '#888' }}>{type}: {count}</span>
+                  <span key={type} style={{ color: typeColor[type] || 'var(--text-faint)' }}>{type}: {count}</span>
                 ))}
               </div>
               <div style={{ maxHeight: 180, overflowY: 'auto', padding: '8px 12px' }}>
                 {preview.changes.map((c, i) => (
-                  <div key={i} style={{ fontSize: 11, padding: '3px 0', borderBottom: '1px solid #18181f', display: 'flex', gap: 8, alignItems: 'center' }}>
-                    <span style={{ color: typeColor[c.type] || '#888', minWidth: 70, fontSize: 10 }}>{c.type}</span>
+                  <div key={c.id ?? i} style={{ fontSize: 11, padding: '3px 0', borderBottom: '1px solid var(--border)', display: 'flex', gap: 8, alignItems: 'center' }}>
+                    <span style={{ color: typeColor[c.type] || 'var(--text-faint)', minWidth: 70, fontSize: 10 }}>{c.type}</span>
                     <span style={{ color: c.found ? 'var(--text-main)' : 'var(--text-faint)', flex: 1 }}>
                       {c.type === 'FRANCHISE' && `${c.modelName} → franchise: ${c.franchise}`}
                       {c.type === 'RENAME' && `${c.oldName} → ${c.newName}`}
                       {c.type === 'TAG' && `${c.modelName}: ${(c.tags || []).join(', ')}`}
                       {c.type === 'MERGE' && `${c.srcName} → ${c.targetName} (advisory)`}
                     </span>
-                    {!c.found && <span style={{ color: '#cf7272', fontSize: 10 }}>NOT FOUND</span>}
+                    {!c.found && <span style={{ color: 'var(--red-text)', fontSize: 10 }}>NOT FOUND</span>}
                   </div>
                 ))}
               </div>
@@ -454,7 +451,90 @@ function AnnotateTab({ target, onClearTarget }) {
 
 // ── Health tab ────────────────────────────────────────────────────────────────
 
-function HealthTab({ onAnnotateThese }) {
+/** Folder path relative to the library root (falls back to the last 2 segments). */
+export function relativeFolder(folderPath, libraryPath) {
+  if (!folderPath) return '';
+  const root = (libraryPath || '').replace(/\/+$/, '');
+  if (root && (folderPath === root || folderPath.startsWith(root + '/'))) {
+    return folderPath.slice(root.length + 1) || '/';
+  }
+  return folderPath.split('/').filter(Boolean).slice(-2).join('/');
+}
+
+// Defined at module scope (not inside HealthTab) so re-renders of the tab don't
+// remount rows and wipe their local state.
+function ModelRow({ m, extra, onHide }) {
+  const [hidden, setHidden] = useState(false);
+  const [busy, setBusy] = useState(false);
+  if (hidden) return null;
+  return (
+    <div className="org-health-row">
+      <div className="org-health-name">{m.name}</div>
+      {m.creator_name && <div className="org-health-creator">{m.creator_name}</div>}
+      {extra && <div className="org-health-extra">{extra}</div>}
+      {onHide && (
+        <button
+          disabled={busy}
+          onClick={async () => {
+            setBusy(true);
+            const ok = await onHide(m);
+            setBusy(false);
+            if (ok) setHidden(true);
+          }}
+          className="org-btn org-btn-sm" style={{ marginLeft: 'auto', flexShrink: 0 }}
+          title="Hide this model (files stay on disk)">
+          🙈 Hide
+        </button>
+      )}
+    </div>
+  );
+}
+
+function DupGroup({ groupKey, models, label, busy, onResolve, libraryPath }) {
+  const best = [...models].sort((a, b) =>
+    (Number(!!b.thumbnail_path) - Number(!!a.thumbnail_path)) || ((b.file_count || 0) - (a.file_count || 0))
+  )[0];
+  const [keepId, setKeepId] = useState(best?.id);
+  const others = models.length - 1;
+  return (
+    <div className="org-dupe-pair">
+      <div className="org-dupe-score">{label}</div>
+      <div role="radiogroup" aria-label={`Choose which copy to keep: ${label}`}
+        style={{ display: 'flex', flexWrap: 'wrap', gap: 8, padding: '8px' }}>
+        {models.map(m => {
+          const sel = keepId === m.id;
+          let tagCount = 0;
+          try { tagCount = Array.isArray(m.tags) ? m.tags.length : JSON.parse(m.tags || '[]').length; } catch {}
+          const rel = relativeFolder(m.folder_path, libraryPath);
+          return (
+            <label key={m.id} className={`org-dupe-choice ${sel ? 'selected' : ''}`}>
+              <input type="radio" name={`keep-${groupKey}`} checked={sel} onChange={() => setKeepId(m.id)} />
+              {m.thumbnail_path
+                ? <img src={m.thumbnail_path} alt="" className="org-dupe-thumb" loading="lazy" />
+                : <div className="org-dupe-thumb org-dupe-thumb-ph" aria-hidden="true">🧩</div>}
+              <div style={{ minWidth: 0, flex: 1 }}>
+                <div className="org-dupe-name">{sel && <span className="org-dupe-keep-badge">KEEP</span>}{m.name}</div>
+                <div className="org-dupe-meta">{m.creator_name || '?'} · {m.file_count || 0} files · {tagCount} tags{m.thumbnail_path ? ' · 🖼' : ''}</div>
+                {rel && <div className="org-dupe-path" title={m.folder_path}>📁 {rel}</div>}
+              </div>
+            </label>
+          );
+        })}
+      </div>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '4px 8px 8px', flexWrap: 'wrap' }}>
+        <button className="org-btn org-btn-success" disabled={busy || !keepId}
+          onClick={() => onResolve(groupKey, keepId, models)}>
+          {busy ? 'Merging…' : `✓ Keep selected · hide ${others} other${others !== 1 ? 's' : ''}`}
+        </button>
+        <span className="org-hint-inline">Tags & collections fold into the kept model; the rest are hidden (not deleted).</span>
+      </div>
+    </div>
+  );
+}
+
+function HealthTab({ onAnnotateThese, libraryPath }) {
+  const notify = useNotify();
+  const [confirmUi, askConfirm] = useConfirm();
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
@@ -466,27 +546,55 @@ function HealthTab({ onAnnotateThese }) {
   const [resolvedKeys, setResolvedKeys] = useState(new Set()); // dup groups already handled this session
   const [resolvingKey, setResolvingKey] = useState(null);
 
-  const resolveDup = async (groupKey, keepId, allIds) => {
-    const dropIds = allIds.filter(id => id !== keepId);
-    if (!dropIds.length) return;
+  const resolveDup = useCallback(async (groupKey, keepId, models) => {
+    const drop = models.filter(m => m.id !== keepId);
+    if (!drop.length) return;
+    const keep = models.find(m => m.id === keepId);
+    const n = drop.length;
+    const ok = await askConfirm({
+      title: `Hide ${n} model${n !== 1 ? 's' : ''}?`,
+      message: (
+        <>
+          <p>Keep <b>{keep?.name}</b>{keep?.creator_name ? ` (${keep.creator_name})` : ''} and hide {n === 1 ? 'the other copy' : `the other ${n} copies`}:</p>
+          <ul className="confirm-list">
+            {drop.map(m => <li key={m.id}>{m.name} <span className="confirm-dim">— {m.creator_name || '?'}{m.folder_path ? ` · ${relativeFolder(m.folder_path, libraryPath)}` : ''}</span></li>)}
+          </ul>
+          <p>Files stay on disk; you can unhide them later.</p>
+        </>
+      ),
+      confirmLabel: `Hide ${n} model${n !== 1 ? 's' : ''}`,
+    });
+    if (!ok) return;
     setResolvingKey(groupKey);
     try {
-      await fetch('/api/organize/dedupe/resolve', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ keepId, dropIds }),
-      });
+      await apiSend('/api/organize/dedupe/resolve', 'POST', { keepId, dropIds: drop.map(m => m.id) });
       setResolvedKeys(prev => new Set(prev).add(groupKey));
-    } catch (e) { setError(e.message); }
+      notify(`Kept "${keep?.name}", hid ${n} duplicate${n !== 1 ? 's' : ''}`, { type: 'success' });
+    } catch (e) {
+      setError(errorMessage(e));
+      notify(`Couldn't resolve duplicates: ${errorMessage(e)}`);
+    }
     setResolvingKey(null);
-  };
+  }, [askConfirm, libraryPath, notify]);
+
+  const hideOne = useCallback(async (m) => {
+    const ok = await askConfirm({
+      title: 'Hide 1 model?',
+      message: <p>Hide <b>{m.name}</b>? Files stay on disk; you can unhide it later.</p>,
+      confirmLabel: 'Hide model',
+    });
+    if (!ok) return false;
+    try {
+      await apiSend('/api/models/bulk', 'POST', { ids: [m.id], hidden: true });
+      return true;
+    } catch (e) { notify(`Couldn't hide model: ${errorMessage(e)}`); return false; }
+  }, [askConfirm, notify]);
 
   const run = useCallback(async () => {
     setLoading(true); setError('');
     try {
-      const res = await fetch('/api/organize/health');
-      if (!res.ok) { setError(`Error ${res.status}`); setLoading(false); return; }
-      setData(await res.json());
-    } catch (e) { setError(e.message); }
+      setData(await apiGet('/api/organize/health'));
+    } catch (e) { setError(errorMessage(e)); }
     setLoading(false);
   }, []);
 
@@ -495,20 +603,18 @@ function HealthTab({ onAnnotateThese }) {
   const fixThumbnails = async () => {
     setThumbFixing(true); setThumbResult('');
     try {
-      const res = await fetch('/api/organize/fix-thumbnails', { method: 'POST' });
-      const d = await res.json();
+      const d = await apiSend('/api/organize/fix-thumbnails', 'POST');
       setThumbResult(`✓ Fixed ${d.fixed}${d.extracted ? ` + extracted ${d.extracted} from archives` : ''}`);
       run();
-    } catch (e) { setError(e.message); }
+    } catch (e) { setError(errorMessage(e)); }
     setThumbFixing(false);
   };
 
   const runIntegrity = async () => {
     setIntegrityLoading(true); setActiveSection('integrity');
     try {
-      const r = await fetch('/api/organize/integrity');
-      setIntegrityData(await r.json());
-    } catch (e) { setError(e.message); }
+      setIntegrityData(await apiGet('/api/organize/integrity'));
+    } catch (e) { setError(errorMessage(e)); }
     setIntegrityLoading(false);
   };
 
@@ -523,43 +629,16 @@ function HealthTab({ onAnnotateThese }) {
     { id: 'noSource',     label: 'No Source URL',    icon: '🔗', count: data?.summary?.noSource },
   ];
 
-  function ModelRow({ m, extra, onHide }) {
-    const [hidden, setHidden] = useState(false);
-    if (hidden) return null;
-    return (
-      <div className="org-health-row">
-        <div className="org-health-name">{m.name}</div>
-        {m.creator_name && <div className="org-health-creator">{m.creator_name}</div>}
-        {extra && <div className="org-health-extra">{extra}</div>}
-        {onHide && (
-          <button
-            onClick={async () => {
-              await fetch('/api/models/bulk', {
-                method: 'POST', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ ids: [m.id], hidden: true }),
-              });
-              setHidden(true);
-              if (onHide) onHide(m.id);
-            }}
-            style={{ marginLeft: 'auto', background: 'none', border: '1px solid #3f3f4d', borderRadius: 3, color: '#7a7a8c', cursor: 'pointer', fontSize: 10, fontFamily: 'var(--font-mono)', padding: '2px 7px', flexShrink: 0 }}
-            title="Hide this model (keep the other)">
-            🙈 Hide
-          </button>
-        )}
-      </div>
-    );
-  }
+  const folderExtra = (m) => relativeFolder(m.folder_path, libraryPath) || undefined;
 
   // Quick-fix action bar for the current section
-  function SectionActions() {
+  function renderSectionActions() {
     if (!data) return null;
     if (activeSection === 'noFranchise' && data.noFranchise.length > 0 && onAnnotateThese) {
       return (
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '6px 0', marginBottom: 6 }}>
-          <span style={{ fontSize: 11, color: 'var(--text-faint)' }}>
-            {data.noFranchise.length} models without franchise assignment
-          </span>
-          <button className="org-btn org-btn-sm" style={{ color: 'var(--accent)', borderColor: 'rgba(193,127,58,0.4)' }}
+        <div className="org-section-actions">
+          <span className="org-hint-inline">{data.noFranchise.length} models without franchise assignment</span>
+          <button className="org-btn org-btn-sm org-btn-accent"
             onClick={() => onAnnotateThese(data.noFranchise.map(m => m.id), `${data.noFranchise.length} unfranchised models`)}>
             ✦ Annotate These
           </button>
@@ -568,11 +647,9 @@ function HealthTab({ onAnnotateThese }) {
     }
     if (activeSection === 'noTags' && data.noTags.length > 0 && onAnnotateThese) {
       return (
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '6px 0', marginBottom: 6 }}>
-          <span style={{ fontSize: 11, color: 'var(--text-faint)' }}>
-            {data.noTags.length} models without tags
-          </span>
-          <button className="org-btn org-btn-sm" style={{ color: 'var(--accent)', borderColor: 'rgba(193,127,58,0.4)' }}
+        <div className="org-section-actions">
+          <span className="org-hint-inline">{data.noTags.length} models without tags</span>
+          <button className="org-btn org-btn-sm org-btn-accent"
             onClick={() => onAnnotateThese(data.noTags.map(m => m.id), `${data.noTags.length} untagged models`)}>
             ✦ Annotate These
           </button>
@@ -581,67 +658,25 @@ function HealthTab({ onAnnotateThese }) {
     }
     if (activeSection === 'noThumbnail' && data.noThumbnail.length > 0) {
       return (
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '6px 0', marginBottom: 6 }}>
-          <span style={{ fontSize: 11, color: 'var(--text-faint)' }}>
-            {data.noThumbnail.length} models missing thumbnails
-          </span>
-          <button className="org-btn org-btn-sm" onClick={fixThumbnails} disabled={thumbFixing}
-            style={{ color: '#5b9bd5', borderColor: 'rgba(91,155,213,0.4)' }}>
+        <div className="org-section-actions">
+          <span className="org-hint-inline">{data.noThumbnail.length} models missing thumbnails</span>
+          <button className="org-btn org-btn-sm org-btn-blue" onClick={fixThumbnails} disabled={thumbFixing}>
             {thumbFixing ? '⏳' : '🖼'} Auto-Fix + Extract
           </button>
-          {thumbResult && <span style={{ fontSize: 11, color: '#4caf7d' }}>{thumbResult}</span>}
+          {thumbResult && <span className="org-ok-text">{thumbResult}</span>}
         </div>
       );
     }
     if (activeSection === 'integrity') {
       return (
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '6px 0', marginBottom: 6 }}>
-          <button className="org-btn org-btn-sm" onClick={runIntegrity} disabled={integrityLoading}
-            style={{ color: '#5b9bd5', borderColor: 'rgba(91,155,213,0.4)' }}>
+        <div className="org-section-actions">
+          <button className="org-btn org-btn-sm org-btn-blue" onClick={runIntegrity} disabled={integrityLoading}>
             {integrityLoading ? '⏳ Checking…' : '↻ Re-run Check'}
           </button>
         </div>
       );
     }
     return null;
-  }
-
-  function DupGroup({ groupKey, models, label }) {
-    const best = [...models].sort((a, b) =>
-      (Number(!!b.thumbnail_path) - Number(!!a.thumbnail_path)) || ((b.file_count || 0) - (a.file_count || 0))
-    )[0];
-    const [keepId, setKeepId] = useState(best?.id);
-    const busy = resolvingKey === groupKey;
-    return (
-      <div className="org-dupe-pair">
-        <div className="org-dupe-score" style={{ color: '#5b9bd5' }}>{label}</div>
-        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, padding: '4px 8px' }}>
-          {models.map(m => {
-            const sel = keepId === m.id;
-            let tagCount = 0; try { tagCount = JSON.parse(m.tags || '[]').length; } catch {}
-            return (
-              <label key={m.id} style={{ flex: '1 1 200px', minWidth: 180, display: 'flex', gap: 8, alignItems: 'center', padding: 8, borderRadius: 6, cursor: 'pointer', background: sel ? 'rgba(76,175,125,0.1)' : 'var(--bg2)', border: `1px solid ${sel ? '#4caf7d' : 'var(--border)'}` }}>
-                <input type="radio" name={`keep-${groupKey}`} checked={sel} onChange={() => setKeepId(m.id)} style={{ accentColor: '#4caf7d', flexShrink: 0 }} />
-                {m.thumbnail_path
-                  ? <img src={m.thumbnail_path} alt="" style={{ width: 40, height: 40, objectFit: 'cover', borderRadius: 4, flexShrink: 0, background: 'var(--bg3)' }} />
-                  : <div style={{ width: 40, height: 40, borderRadius: 4, background: 'var(--bg3)', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>🧩</div>}
-                <div style={{ minWidth: 0 }}>
-                  <div style={{ fontSize: 12, color: 'var(--text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{m.name}</div>
-                  <div style={{ fontSize: 10, color: 'var(--text-faint)', fontFamily: 'var(--font-mono)' }}>{m.creator_name || '?'} · {m.file_count || 0}f · {tagCount}t{m.thumbnail_path ? ' · 🖼' : ''}</div>
-                </div>
-              </label>
-            );
-          })}
-        </div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '4px 8px 8px', flexWrap: 'wrap' }}>
-          <button className="org-btn org-btn-success" disabled={busy}
-            onClick={() => resolveDup(groupKey, keepId, models.map(m => m.id))}>
-            {busy ? 'Merging…' : `✓ Keep selected · hide ${models.length - 1} other${models.length - 1 !== 1 ? 's' : ''}`}
-          </button>
-          <span style={{ fontSize: 10, color: 'var(--text-faint)' }}>Tags & collections fold into the kept model; the rest are hidden (not deleted).</span>
-        </div>
-      </div>
-    );
   }
 
   function renderSection() {
@@ -652,7 +687,8 @@ function HealthTab({ onAnnotateThese }) {
         return groups.length === 0
           ? <div className="org-empty">No cross-creator duplicates to resolve 🎉</div>
           : groups.map(g => (
-            <DupGroup key={g.key} groupKey={`xc-${g.key}`} models={g.models}
+            <DupGroup key={`xc-${g.key}`} groupKey={`xc-${g.key}`} models={g.models} libraryPath={libraryPath}
+              busy={resolvingKey === `xc-${g.key}`} onResolve={resolveDup}
               label={`"${g.key}" — ${g.models.length} copies across ${new Set(g.models.map(m => m.creator_name)).size} creators`} />
           ));
       }
@@ -661,7 +697,8 @@ function HealthTab({ onAnnotateThese }) {
         return pairs.length === 0
           ? <div className="org-empty">No similar-name pairs to resolve 🎉</div>
           : pairs.map(p => (
-            <DupGroup key={`${p.a.id}-${p.b.id}`} groupKey={`dup-${p.a.id}-${p.b.id}`} models={[p.a, p.b]}
+            <DupGroup key={`dup-${p.a.id}-${p.b.id}`} groupKey={`dup-${p.a.id}-${p.b.id}`} models={[p.a, p.b]} libraryPath={libraryPath}
+              busy={resolvingKey === `dup-${p.a.id}-${p.b.id}`} onResolve={resolveDup}
               label={`${Math.round(p.score * 100)}% similar`} />
           ));
       }
@@ -671,7 +708,7 @@ function HealthTab({ onAnnotateThese }) {
             <button className="org-btn org-btn-secondary" onClick={runIntegrity} disabled={integrityLoading}>
               {integrityLoading ? '⏳ Checking…' : '🔍 Run Integrity Check'}
             </button>
-            <div style={{ fontSize: 11, color: 'var(--text-faint)', marginTop: 8 }}>
+            <div className="org-hint-inline" style={{ marginTop: 8 }}>
               Checks whether each model's folder still exists on disk.
             </div>
           </div>
@@ -679,40 +716,41 @@ function HealthTab({ onAnnotateThese }) {
         return integrityData.missingFolders.length === 0
           ? <div className="org-empty">All {integrityData.summary.checked} model folders found on disk 🎉</div>
           : (<>
-            <div style={{ fontSize: 11, color: 'var(--text-faint)', marginBottom: 8 }}>
+            <div className="org-hint-inline" style={{ margin: 8 }}>
               {integrityData.summary.missingFolders} of {integrityData.summary.checked} folders not found on disk.
               These models may have been moved or deleted.
             </div>
-            {integrityData.missingFolders.map((m, i) => (
-              <ModelRow key={i} m={m} extra={m.folder_path?.split('/').slice(-2).join('/')} />
+            {integrityData.missingFolders.map(m => (
+              <ModelRow key={m.id} m={m} extra={folderExtra(m)} onHide={hideOne} />
             ))}
           </>);
       case 'emptyFolders':
         return data.emptyFolders.length === 0
           ? <div className="org-empty">No empty folders 🎉</div>
-          : data.emptyFolders.map((m, i) => <ModelRow key={i} m={m} extra={`${m.file_count} files`} />);
+          : data.emptyFolders.map(m => <ModelRow key={m.id} m={m} extra={`${folderExtra(m) || ''} · ${m.file_count || 0} files`} onHide={hideOne} />);
       case 'noThumbnail':
         return data.noThumbnail.length === 0
           ? <div className="org-empty">All models have thumbnails 🎉</div>
-          : data.noThumbnail.map((m, i) => <ModelRow key={i} m={m} />);
+          : data.noThumbnail.map(m => <ModelRow key={m.id} m={m} extra={folderExtra(m)} />);
       case 'noTags':
         return data.noTags.length === 0
           ? <div className="org-empty">All models have tags 🎉</div>
-          : data.noTags.map((m, i) => <ModelRow key={i} m={m} />);
+          : data.noTags.map(m => <ModelRow key={m.id} m={m} extra={folderExtra(m)} />);
       case 'noFranchise':
         return data.noFranchise.length === 0
           ? <div className="org-empty">All models have a franchise 🎉</div>
-          : data.noFranchise.map((m, i) => <ModelRow key={i} m={m} />);
+          : data.noFranchise.map(m => <ModelRow key={m.id} m={m} extra={folderExtra(m)} />);
       case 'noSource':
         return data.noSource.length === 0
           ? <div className="org-empty">All models have a source URL 🎉</div>
-          : data.noSource.map((m, i) => <ModelRow key={i} m={m} />);
+          : data.noSource.map(m => <ModelRow key={m.id} m={m} extra={folderExtra(m)} />);
       default: return null;
     }
   }
 
   return (
     <div className="org-tab-body">
+      {confirmUi}
       <p className="org-desc">
         Scan your library for issues. Use the quick-fix buttons to jump directly to action.
       </p>
@@ -727,18 +765,18 @@ function HealthTab({ onAnnotateThese }) {
         <>
           <div className="org-health-summary">
             <div className="org-health-stat"><span className="org-health-stat-num">{data.summary.total}</span><span>Total</span></div>
-            <div className="org-health-stat org-health-warn" style={{ cursor: 'pointer' }} onClick={() => setActiveSection('crossCreator')}>
-              <span className="org-health-stat-num" style={{ color: data.summary.crossCreatorDupes > 0 ? '#5b9bd5' : undefined }}>{data.summary.crossCreatorDupes ?? 0}</span><span>X-Dupes</span>
-            </div>
-            <div className="org-health-stat org-health-warn"><span className="org-health-stat-num">{data.summary.duplicatePairs}</span><span>Similar</span></div>
-            <div className="org-health-stat org-health-warn"><span className="org-health-stat-num">{data.summary.noTags}</span><span>No Tags</span></div>
-            <div className="org-health-stat org-health-warn"><span className="org-health-stat-num">{data.summary.noThumbnail}</span><span>No Thumb</span></div>
-            <div className="org-health-stat org-health-warn"><span className="org-health-stat-num">{data.summary.noFranchise}</span><span>No Franchise</span></div>
+            <button className="org-health-stat org-health-warn" onClick={() => setActiveSection('crossCreator')}>
+              <span className="org-health-stat-num org-num-blue">{data.summary.crossCreatorDupes ?? 0}</span><span>X-Dupes</span>
+            </button>
+            <button className="org-health-stat org-health-warn" onClick={() => setActiveSection('duplicates')}><span className="org-health-stat-num">{data.summary.duplicatePairs}</span><span>Similar</span></button>
+            <button className="org-health-stat org-health-warn" onClick={() => setActiveSection('noTags')}><span className="org-health-stat-num">{data.summary.noTags}</span><span>No Tags</span></button>
+            <button className="org-health-stat org-health-warn" onClick={() => setActiveSection('noThumbnail')}><span className="org-health-stat-num">{data.summary.noThumbnail}</span><span>No Thumb</span></button>
+            <button className="org-health-stat org-health-warn" onClick={() => setActiveSection('noFranchise')}><span className="org-health-stat-num">{data.summary.noFranchise}</span><span>No Franchise</span></button>
           </div>
 
-          <div className="org-health-sections">
+          <div className="org-health-sections" role="tablist" aria-label="Health checks">
             {sections.map(s => (
-              <button key={s.id}
+              <button key={s.id} role="tab" aria-selected={activeSection === s.id}
                 className={`org-health-section-btn ${activeSection === s.id ? 'active' : ''}`}
                 onClick={() => setActiveSection(s.id)}>
                 {s.icon} {s.label}
@@ -747,7 +785,7 @@ function HealthTab({ onAnnotateThese }) {
             ))}
           </div>
 
-          <SectionActions />
+          {renderSectionActions()}
 
           <div className="org-health-list">
             {renderSection()}
@@ -792,8 +830,9 @@ function GapTab() {
       </p>
 
       <div className="org-row">
-        <label className="org-label">Gumroad CSV or model name list</label>
+        <label className="org-label" htmlFor="gap-csv">Gumroad CSV or model name list</label>
         <textarea
+          id="gap-csv"
           className="org-textarea"
           rows={6}
           placeholder={'Paste CSV here — or one model name per line...\n\nCSV: must have a "Model Name" or "Name" column header\nPlain list: one name per line'}
@@ -803,8 +842,9 @@ function GapTab() {
       </div>
 
       <div className="org-row org-row-inline">
-        <label className="org-label" style={{ marginBottom: 0 }}>Match threshold</label>
+        <label className="org-label" htmlFor="gap-threshold" style={{ marginBottom: 0 }}>Match threshold</label>
         <input
+          id="gap-threshold"
           type="range" min={0.5} max={1} step={0.05}
           value={threshold}
           onChange={e => setThreshold(parseFloat(e.target.value))}
@@ -825,8 +865,8 @@ function GapTab() {
         <div style={{ marginTop: 16 }}>
           <div className="org-gap-summary">
             <span>Checked: <b style={{ color: 'var(--text-main)' }}>{result.stats.checked}</b></span>
-            <span style={{ color: '#cf7272' }}>Missing: <b>{result.stats.missing}</b></span>
-            <span style={{ color: '#4caf7d' }}>Present: <b>{result.stats.present}</b></span>
+            <span style={{ color: 'var(--red-text)' }}>Missing: <b>{result.stats.missing}</b></span>
+            <span style={{ color: 'var(--green-text)' }}>Present: <b>{result.stats.present}</b></span>
           </div>
 
           {result.missing.length > 0 && (
@@ -878,6 +918,7 @@ function GapTab() {
 // ── Franchise Browser tab ─────────────────────────────────────────────────────
 
 function FranchiseTab({ onAnnotateThese }) {
+  const [confirmUi, askConfirm] = useConfirm();
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
@@ -891,10 +932,8 @@ function FranchiseTab({ onAnnotateThese }) {
   const load = useCallback(async () => {
     setLoading(true); setError('');
     try {
-      const res = await fetch('/api/organize/franchise-browser');
-      if (!res.ok) throw new Error(`Error ${res.status}`);
-      setData(await res.json());
-    } catch (e) { setError(e.message); }
+      setData(await apiGet('/api/organize/franchise-browser'));
+    } catch (e) { setError(errorMessage(e)); }
     setLoading(false);
   }, []);
 
@@ -909,13 +948,20 @@ function FranchiseTab({ onAnnotateThese }) {
 
   const applyFranchise = async () => {
     if (!selected.size || !franchiseInput.trim()) return;
+    // Reassigning models that already have a franchise overwrites it: confirm first
+    const all = data ? [...data.unassigned, ...data.franchises.flatMap(f => f.models)] : [];
+    const overwriting = all.filter(m => selected.has(m.id) && m.franchise && m.franchise !== franchiseInput.trim()).length;
+    if (overwriting > 0) {
+      const ok = await askConfirm({
+        title: `Reassign ${selected.size} model${selected.size !== 1 ? 's' : ''}?`,
+        message: <p>{overwriting} of the selected models already belong to another franchise; they will be moved to <b>{franchiseInput.trim()}</b>.</p>,
+        confirmLabel: `Assign to ${selected.size}`,
+      });
+      if (!ok) return;
+    }
     setApplying(true); setError(''); setResult('');
     try {
-      const res = await fetch('/api/organize/bulk-update', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ modelIds: [...selected], franchise: franchiseInput.trim() }),
-      });
-      const d = await res.json();
+      const d = await apiSend('/api/organize/bulk-update', 'POST', { modelIds: [...selected], franchise: franchiseInput.trim() });
       setResult(`✓ Assigned "${franchiseInput.trim()}" to ${d.updated} model${d.updated !== 1 ? 's' : ''}`);
       setSelected(new Set()); setFranchiseInput(''); load();
     } catch (e) { setError(e.message); }
@@ -926,15 +972,17 @@ function FranchiseTab({ onAnnotateThese }) {
   const filterModels = (mods) => !filter ? mods
     : mods.filter(m => m.name.toLowerCase().includes(filter) || (m.creator_name || '').toLowerCase().includes(filter));
 
-  const unassignedFiltered = data ? filterModels(data.unassigned) : [];
-
-  function ModelRow({ m }) {
+  // Plain render helpers (not nested components) so rows aren't remounted —
+  // and their thumbnails re-fetched — every time the selection changes.
+  function renderModelRow(m) {
     const isSel = selected.has(m.id);
     return (
-      <div className={`org-franchise-model${isSel ? ' selected' : ''}`} onClick={() => toggleModel(m.id)}>
-        <span className="org-franchise-check">{isSel ? '☑' : '☐'}</span>
+      <div key={m.id} className={`org-franchise-model${isSel ? ' selected' : ''}`} onClick={() => toggleModel(m.id)}
+        role="checkbox" aria-checked={isSel} tabIndex={0}
+        onKeyDown={e => { if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); toggleModel(m.id); } }}>
+        <span className="org-franchise-check" aria-hidden="true">{isSel ? '☑' : '☐'}</span>
         {m.thumbnail_path
-          ? <img src={m.thumbnail_path} className="org-franchise-thumb" alt="" />
+          ? <img src={m.thumbnail_path} className="org-franchise-thumb" alt="" loading="lazy" />
           : <span className="org-franchise-thumb-ph">🧩</span>}
         <span className="org-franchise-model-name">{m.name}</span>
         <span className="org-franchise-model-creator">{m.creator_name}</span>
@@ -942,15 +990,17 @@ function FranchiseTab({ onAnnotateThese }) {
     );
   }
 
-  function GroupSection({ groupKey, label, labelColor, models, badgeColor }) {
+  function renderGroup({ groupKey, label, models, warn }) {
     const filtered = filterModels(models);
     if (filter && !filtered.length) return null;
     const isOpen = expanded.has(groupKey);
     return (
-      <div className="org-franchise-group">
-        <div className="org-franchise-header" onClick={() => toggleExpand(groupKey)}>
-          <span style={{ color: labelColor || 'var(--accent)', fontFamily: 'var(--font-mono)', fontSize: 12 }}>{label}</span>
-          <span className="org-franchise-count" style={{ background: badgeColor || 'rgba(193,127,58,0.15)', color: badgeColor ? '#fff' : 'var(--accent)' }}>
+      <div className="org-franchise-group" key={groupKey}>
+        <div className="org-franchise-header" onClick={() => toggleExpand(groupKey)}
+          role="button" tabIndex={0} aria-expanded={isOpen}
+          onKeyDown={e => { if ((e.key === 'Enter' || e.key === ' ') && e.target === e.currentTarget) { e.preventDefault(); toggleExpand(groupKey); } }}>
+          <span className={warn ? 'org-franchise-label warn' : 'org-franchise-label'}>{label}</span>
+          <span className={`org-franchise-count ${warn ? 'warn' : ''}`}>
             {models.length}
           </span>
           <button className="org-btn org-btn-sm" style={{ marginLeft: 'auto', marginRight: 6, fontSize: 9 }}
@@ -967,7 +1017,7 @@ function FranchiseTab({ onAnnotateThese }) {
         </div>
         {isOpen && (
           <div>
-            {filtered.slice(0, 60).map(m => <ModelRow key={m.id} m={m} />)}
+            {filtered.slice(0, 60).map(renderModelRow)}
             {filtered.length > 60 && (
               <div style={{ fontSize: 11, color: 'var(--text-faint)', padding: '4px 12px' }}>
                 +{filtered.length - 60} more — use filter to narrow down
@@ -981,6 +1031,7 @@ function FranchiseTab({ onAnnotateThese }) {
 
   return (
     <div className="org-tab-body" style={{ paddingBottom: selected.size ? 60 : 0 }}>
+      {confirmUi}
       <p className="org-desc">
         Browse models by franchise. Select unassigned models and bulk-assign them, or select across franchises to reassign.
       </p>
@@ -988,13 +1039,13 @@ function FranchiseTab({ onAnnotateThese }) {
       {data && (
         <div style={{ display: 'flex', gap: 16, marginBottom: 10, fontSize: 12 }}>
           <span style={{ color: 'var(--text-muted)' }}>Total <b style={{ color: 'var(--text)' }}>{data.total}</b></span>
-          <span style={{ color: '#cf7272' }}>Unassigned <b>{data.unassigned.length}</b></span>
-          <span style={{ color: '#4caf7d' }}>Franchises <b>{data.franchises.length}</b></span>
+          <span style={{ color: 'var(--red-text)' }}>Unassigned <b>{data.unassigned.length}</b></span>
+          <span style={{ color: 'var(--green-text)' }}>Franchises <b>{data.franchises.length}</b></span>
           <button className="org-btn org-btn-sm" style={{ marginLeft: 'auto' }} onClick={load}>↻ Refresh</button>
         </div>
       )}
 
-      <input className="org-select" placeholder="Filter by model name or creator…" value={filterText}
+      <input className="org-select" placeholder="Filter by model name or creator…" aria-label="Filter by model name or creator" value={filterText}
         onChange={e => setFilterText(e.target.value)}
         style={{ marginBottom: 10, fontFamily: 'var(--font-mono)', fontSize: 11 }} />
 
@@ -1004,13 +1055,8 @@ function FranchiseTab({ onAnnotateThese }) {
       {data && (
         <div className="org-franchise-list">
           {/* Unassigned always first */}
-          {data.unassigned.length > 0 && (
-            <GroupSection groupKey="__unassigned__" label="⚠ Unassigned"
-              labelColor="#cf7272" models={data.unassigned} badgeColor="#cf727288" />
-          )}
-          {data.franchises.map(f => (
-            <GroupSection key={f.name} groupKey={f.name} label={f.name} models={f.models} />
-          ))}
+          {data.unassigned.length > 0 && renderGroup({ groupKey: '__unassigned__', label: '⚠ Unassigned', models: data.unassigned, warn: true })}
+          {data.franchises.map(f => renderGroup({ groupKey: f.name, label: f.name, models: f.models }))}
           {data.total === 0 && <div className="org-empty">No models found</div>}
         </div>
       )}
@@ -1021,7 +1067,7 @@ function FranchiseTab({ onAnnotateThese }) {
       {selected.size > 0 && (
         <div className="org-franchise-actions">
           <span style={{ fontSize: 12, color: 'var(--text-muted)', whiteSpace: 'nowrap' }}>{selected.size} selected</span>
-          <input className="org-select" placeholder="Franchise name…" value={franchiseInput}
+          <input className="org-select" placeholder="Franchise name…" aria-label="Franchise name to assign" value={franchiseInput}
             onChange={e => setFranchiseInput(e.target.value)}
             onKeyDown={e => { if (e.key === 'Enter') applyFranchise(); }}
             style={{ flex: 1, fontFamily: 'var(--font-mono)', fontSize: 11 }} />
@@ -1029,8 +1075,8 @@ function FranchiseTab({ onAnnotateThese }) {
             disabled={applying || !franchiseInput.trim()}>
             {applying ? '⏳' : '✓'} Assign
           </button>
-          <button className="org-btn org-btn-sm" onClick={() => setSelected(new Set())}
-            style={{ color: '#cf7272' }}>✕</button>
+          <button className="org-btn org-btn-sm org-btn-danger" onClick={() => setSelected(new Set())}
+            aria-label="Clear selection">✕</button>
         </div>
       )}
     </div>
@@ -1039,7 +1085,20 @@ function FranchiseTab({ onAnnotateThese }) {
 
 // ── Batch Actions tab ─────────────────────────────────────────────────────────
 
+// Module scope: a component defined inside BatchTab would remount its children
+// (and drop input focus) on every keystroke.
+function Section({ title, children }) {
+  return (
+    <div className="org-batch-section">
+      <div className="org-batch-section-title">{title}</div>
+      {children}
+    </div>
+  );
+}
+
 function BatchTab() {
+  const notify = useNotify();
+  const [confirmUi, askConfirm] = useConfirm();
   const [creators, setCreators] = useState([]);
   const [thumbStats, setThumbStats] = useState(null);
   // Bulk tag/franchise
@@ -1067,17 +1126,28 @@ function BatchTab() {
     if (!bulkCreatorId) { setError('Select a creator first'); return; }
     const tags = bulkTags.split(',').map(t => t.trim().toLowerCase()).filter(Boolean);
     if (!bulkFranchise && !tags.length) { setError('Enter a franchise and/or tags to apply'); return; }
+    const creator = creators.find(c => String(c.id) === String(bulkCreatorId));
+    const n = creator?.model_count ?? 0;
+    const ok = await askConfirm({
+      title: `Update all ${n} model${n !== 1 ? 's' : ''} by ${creator?.name || 'this creator'}?`,
+      message: (
+        <>
+          {bulkFranchise.trim() && <p>Every model's franchise will be set to <b>{bulkFranchise.trim()}</b>, replacing any franchise already assigned.</p>}
+          {tags.length > 0 && <p>Tags added: <b>{tags.join(', ')}</b> (existing tags are kept).</p>}
+        </>
+      ),
+      confirmLabel: `Apply to ${n} model${n !== 1 ? 's' : ''}`,
+      danger: !!bulkFranchise.trim(),
+    });
+    if (!ok) return;
     setBulkApplying(true); setError(''); setBulkResult('');
     try {
-      const body = { creatorId: parseInt(bulkCreatorId) };
+      const body = { creatorId: parseInt(bulkCreatorId, 10) };
       if (bulkFranchise) body.franchise = bulkFranchise.trim();
       if (tags.length) body.tags = tags;
-      const res = await fetch('/api/organize/bulk-update', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
-      });
-      const d = await res.json();
+      const d = await apiSend('/api/organize/bulk-update', 'POST', body);
       setBulkResult(`✓ Updated ${d.updated} of ${d.total} models`);
-    } catch (e) { setError(e.message); }
+    } catch (e) { setError(errorMessage(e)); notify(`Bulk update failed: ${errorMessage(e)}`); }
     setBulkApplying(false);
   };
 
@@ -1085,40 +1155,39 @@ function BatchTab() {
     if (!srcCreator || !dstCreator || srcCreator === dstCreator) {
       setError('Select two different creators'); return;
     }
+    const src = creators.find(c => String(c.id) === String(srcCreator));
+    const dst = creators.find(c => String(c.id) === String(dstCreator));
+    const n = src?.model_count ?? 0;
+    const ok = await askConfirm({
+      title: 'Merge creators?',
+      message: <p>Move {n} model{n !== 1 ? 's' : ''} from <b>{src?.name}</b> into <b>{dst?.name}</b> and delete the creator entry "{src?.name}". Files on disk are not touched.</p>,
+      confirmLabel: `Merge ${n} model${n !== 1 ? 's' : ''}`,
+      danger: true,
+    });
+    if (!ok) return;
     setMerging(true); setError(''); setMergeResult('');
     try {
-      const res = await fetch(`/api/creators/${srcCreator}/merge`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ targetCreatorId: parseInt(dstCreator) }),
-      });
-      const d = await res.json();
+      const d = await apiSend(`/api/creators/${srcCreator}/merge`, 'POST', { targetCreatorId: parseInt(dstCreator, 10) });
       setMergeResult(`✓ Merged "${d.sourceCreator}" → "${d.targetCreator}" (${d.moved} models moved)`);
       setSrcCreator(''); setDstCreator('');
-      fetch('/api/creators').then(r => r.json()).then(setCreators);
-    } catch (e) { setError(e.message); }
+      fetch('/api/creators').then(r => r.json()).then(setCreators).catch(() => {});
+    } catch (e) { setError(errorMessage(e)); notify(`Merge failed: ${errorMessage(e)}`); }
     setMerging(false);
   };
 
   const fixThumbnails = async () => {
     setThumbFixing(true); setError(''); setThumbResult('');
     try {
-      const res = await fetch('/api/organize/fix-thumbnails', { method: 'POST' });
-      const d = await res.json();
+      const d = await apiSend('/api/organize/fix-thumbnails', 'POST');
       setThumbResult(`✓ Fixed ${d.fixed} thumbnails from existing images`);
-      fetch('/api/organize/thumbnail-stats').then(r => r.json()).then(setThumbStats);
-    } catch (e) { setError(e.message); }
+      fetch('/api/organize/thumbnail-stats').then(r => r.json()).then(setThumbStats).catch(() => {});
+    } catch (e) { setError(errorMessage(e)); }
     setThumbFixing(false);
   };
 
-  const Section = ({ title, children }) => (
-    <div className="org-batch-section">
-      <div className="org-batch-section-title">{title}</div>
-      {children}
-    </div>
-  );
-
   return (
     <div className="org-tab-body">
+      {confirmUi}
       <p className="org-desc">
         Bulk operations: apply franchise and tags to an entire creator's library, merge duplicate creators, and fix missing thumbnails.
       </p>
@@ -1128,22 +1197,22 @@ function BatchTab() {
       {/* Bulk apply to creator */}
       <Section title="⚡ Bulk Apply to Creator">
         <div className="org-row">
-          <label className="org-label">Creator</label>
-          <select className="org-select" value={bulkCreatorId} onChange={e => setBulkCreatorId(e.target.value)}>
+          <label className="org-label" htmlFor="bulk-creator">Creator</label>
+          <select id="bulk-creator" className="org-select" value={bulkCreatorId} onChange={e => setBulkCreatorId(e.target.value)}>
             <option value="">Select creator…</option>
             {creators.map(c => <option key={c.id} value={c.id}>{c.name} ({c.model_count} models)</option>)}
           </select>
         </div>
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
           <div className="org-row" style={{ marginBottom: 0 }}>
-            <label className="org-label">Set franchise (optional)</label>
-            <input className="org-select" placeholder="e.g. Marvel" value={bulkFranchise}
+            <label className="org-label" htmlFor="bulk-franchise">Set franchise (optional)</label>
+            <input id="bulk-franchise" className="org-select" placeholder="e.g. Marvel" value={bulkFranchise}
               onChange={e => setBulkFranchise(e.target.value)}
               style={{ fontFamily: 'var(--font-mono)', fontSize: 11 }} />
           </div>
           <div className="org-row" style={{ marginBottom: 0 }}>
-            <label className="org-label">Add tags (comma-separated, optional)</label>
-            <input className="org-select" placeholder="e.g. 28mm, resin, presupported" value={bulkTags}
+            <label className="org-label" htmlFor="bulk-tags">Add tags (comma-separated, optional)</label>
+            <input id="bulk-tags" className="org-select" placeholder="e.g. 28mm, resin, presupported" value={bulkTags}
               onChange={e => setBulkTags(e.target.value)}
               style={{ fontFamily: 'var(--font-mono)', fontSize: 11 }} />
           </div>
@@ -1158,8 +1227,8 @@ function BatchTab() {
       <Section title="🖼 Fix Missing Thumbnails">
         {thumbStats ? (
           <div style={{ display: 'flex', gap: 16, fontSize: 12, marginBottom: 10 }}>
-            <span style={{ color: 'var(--text-muted)' }}>No thumbnail: <b style={{ color: '#cf7272' }}>{thumbStats.noThumb}</b></span>
-            <span style={{ color: 'var(--text-muted)' }}>Auto-fixable: <b style={{ color: '#4caf7d' }}>{thumbStats.fixable}</b></span>
+            <span style={{ color: 'var(--text-muted)' }}>No thumbnail: <b style={{ color: 'var(--red-text)' }}>{thumbStats.noThumb}</b></span>
+            <span style={{ color: 'var(--text-muted)' }}>Auto-fixable: <b style={{ color: 'var(--green-text)' }}>{thumbStats.fixable}</b></span>
             <span style={{ color: 'var(--text-faint)', fontSize: 11 }}>(have images already extracted, just need linking)</span>
           </div>
         ) : (
@@ -1182,16 +1251,16 @@ function BatchTab() {
         </div>
         <div style={{ display: 'grid', gridTemplateColumns: '1fr auto 1fr', gap: 8, alignItems: 'center' }}>
           <div>
-            <div className="org-label" style={{ marginBottom: 4 }}>Merge FROM (will be deleted)</div>
-            <select className="org-select" value={srcCreator} onChange={e => setSrcCreator(e.target.value)}>
+            <label className="org-label" htmlFor="merge-src" style={{ marginBottom: 4, display: 'block' }}>Merge FROM (will be deleted)</label>
+            <select id="merge-src" className="org-select" style={{ width: '100%' }} value={srcCreator} onChange={e => setSrcCreator(e.target.value)}>
               <option value="">Source creator…</option>
               {creators.map(c => <option key={c.id} value={c.id}>{c.name} ({c.model_count})</option>)}
             </select>
           </div>
-          <span style={{ color: 'var(--text-faint)', fontSize: 18, textAlign: 'center' }}>→</span>
+          <span style={{ color: 'var(--text-faint)', fontSize: 18, textAlign: 'center' }} aria-hidden="true">→</span>
           <div>
-            <div className="org-label" style={{ marginBottom: 4 }}>Merge INTO (kept)</div>
-            <select className="org-select" value={dstCreator} onChange={e => setDstCreator(e.target.value)}>
+            <label className="org-label" htmlFor="merge-dst" style={{ marginBottom: 4, display: 'block' }}>Merge INTO (kept)</label>
+            <select id="merge-dst" className="org-select" style={{ width: '100%' }} value={dstCreator} onChange={e => setDstCreator(e.target.value)}>
               <option value="">Target creator…</option>
               {creators.filter(c => c.id !== parseInt(srcCreator)).map(c => (
                 <option key={c.id} value={c.id}>{c.name} ({c.model_count})</option>
@@ -1199,9 +1268,9 @@ function BatchTab() {
             </select>
           </div>
         </div>
-        <button className="org-btn org-btn-secondary" onClick={mergeCreators}
+        <button onClick={mergeCreators}
           disabled={merging || !srcCreator || !dstCreator}
-          style={{ marginTop: 10, borderColor: '#cf727240', color: '#cf7272' }}>
+          className="org-btn org-btn-secondary org-btn-danger" style={{ marginTop: 10 }}>
           {merging ? '⏳ Merging…' : '🔀 Merge Creators'}
         </button>
         {mergeResult && <div className="org-success-box" style={{ marginTop: 6 }}>{mergeResult}</div>}
@@ -1214,7 +1283,8 @@ function BatchTab() {
 
 // ── Loose File Grouper tab ────────────────────────────────────────────────────
 
-function LooseTab() {
+function LooseTab({ libraryWritable }) {
+  const [confirmUi, askConfirm] = useConfirm();
   const [creators, setCreators] = useState([]);
   const [creatorId, setCreatorId] = useState('');
   const [manualPath, setManualPath] = useState('');
@@ -1275,6 +1345,17 @@ function LooseTab() {
   };
 
   const generateScript = async (dryRun = true) => {
+    if (!dryRun) {
+      if (libraryWritable !== true) { setError(READ_ONLY_TIP); return; }
+      const nFiles = groups.reduce((s, g) => s + g.files.length, 0);
+      const ok = await askConfirm({
+        title: `Move ${nFiles} file${nFiles !== 1 ? 's' : ''} now?`,
+        message: <p>This moves {nFiles} file{nFiles !== 1 ? 's' : ''} into {groups.length} new folder{groups.length !== 1 ? 's' : ''} inside <code>{activePath}</code> on disk. Rescan afterwards.</p>,
+        confirmLabel: 'Move files',
+        danger: true,
+      });
+      if (!ok) return;
+    }
     setError(''); setScriptResult(null);
     setScanning(true);
     try {
@@ -1298,10 +1379,9 @@ function LooseTab() {
     }).catch(() => {});
   };
 
-  const totalFiles = groups.reduce((s, g) => s + g.files.length, 0);
-
   return (
     <div className="org-tab-body">
+      {confirmUi}
       {/* ── Step 1: Pick folder ── */}
       <div className="org-section-title">📂 UNPACK LOOSE FILES</div>
       <p className="org-hint">
@@ -1311,8 +1391,8 @@ function LooseTab() {
 
       <div style={{ display: 'flex', gap: 8, marginBottom: 8, alignItems: 'flex-end' }}>
         <div style={{ flex: 1 }}>
-          <label className="org-label">Creator (auto-fills path)</label>
-          <select className="org-select" value={creatorId} onChange={e => { setCreatorId(e.target.value); setManualPath(''); }}>
+          <label className="org-label" htmlFor="loose-creator">Creator (auto-fills path)</label>
+          <select id="loose-creator" className="org-select" value={creatorId} onChange={e => { setCreatorId(e.target.value); setManualPath(''); }}>
             <option value="">— pick a creator —</option>
             {creators.filter(c => c.folder_path).map(c => (
               <option key={c.id} value={c.id}>{c.name} ({c.model_count} models)</option>
@@ -1321,8 +1401,9 @@ function LooseTab() {
         </div>
       </div>
       <div style={{ marginBottom: 12 }}>
-        <label className="org-label">…or enter a folder path directly</label>
+        <label className="org-label" htmlFor="loose-path">…or enter a folder path directly</label>
         <input
+          id="loose-path"
           className="org-input"
           placeholder="/library/STL Archive/CA 3D"
           value={manualPath}
@@ -1364,6 +1445,7 @@ function LooseTab() {
                       value={editName}
                       autoFocus
                       onClick={e => e.stopPropagation()}
+                      aria-label="Folder name for this group"
                       onChange={e => setEditName(e.target.value)}
                       onBlur={() => { renameGroup(idx, editName); setEditingIdx(null); }}
                       onKeyDown={e => { if (e.key === 'Enter') { renameGroup(idx, editName); setEditingIdx(null); } if (e.key === 'Escape') setEditingIdx(null); }}
@@ -1377,6 +1459,7 @@ function LooseTab() {
                     className="org-loose-rename-btn"
                     onClick={e => { e.stopPropagation(); setEditingIdx(idx); setEditName(g.name); }}
                     title="Rename group"
+                    aria-label={`Rename group ${g.name}`}
                   >✏</button>
                 </div>
 
@@ -1389,6 +1472,7 @@ function LooseTab() {
                           className="org-loose-remove-btn"
                           onClick={() => removeFileFromGroup(idx, fi)}
                           title="Remove from group"
+                          aria-label={`Remove ${f} from group`}
                         >✕</button>
                       </div>
                     ))}
@@ -1400,13 +1484,23 @@ function LooseTab() {
 
           {groups.length > 0 && !scriptResult && (
             <div style={{ marginTop: 16 }}>
-              <button className="org-btn org-btn-primary" onClick={() => generateScript(true)} disabled={scanning}>
-                📋 Generate Move Script
-              </button>
-              <div className="org-hint" style={{ marginTop: 6 }}>
-                The library is mounted read-only, so The Vault can't move files itself.
-                This generates a safe bash script — review it, run it over SSH on your NAS,
-                then rescan.
+              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                <button className="org-btn org-btn-primary" onClick={() => generateScript(true)} disabled={scanning}>
+                  📋 Generate Move Script
+                </button>
+                {/* Moving files directly needs a writable library mount */}
+                <span title={libraryWritable === true ? 'Move the files on disk now' : READ_ONLY_TIP}>
+                  <button className="org-btn org-btn-secondary" onClick={() => generateScript(false)}
+                    disabled={scanning || libraryWritable !== true}
+                    aria-describedby={libraryWritable === true ? undefined : 'loose-ro-hint'}>
+                    📦 Move Files Now
+                  </button>
+                </span>
+              </div>
+              <div className="org-hint" id="loose-ro-hint" style={{ marginTop: 6 }}>
+                {libraryWritable === true
+                  ? 'Generate a bash script to review and run yourself, or move the files directly. Rescan afterwards.'
+                  : <>{READ_ONLY_TIP}, so The Vault can't move files itself. Generate a safe bash script instead — review it, run it over SSH on your NAS, then rescan.</>}
               </div>
             </div>
           )}
@@ -1432,7 +1526,7 @@ function LooseTab() {
 
           {scriptResult.dryRun && (
             <div className="org-hint" style={{ marginBottom: 8 }}>
-              SSH into Dagobah and paste this script to move the files. After running, trigger a library rescan.
+              SSH into your NAS and paste this script to move the files. After running, trigger a library rescan.
             </div>
           )}
 
@@ -1451,7 +1545,7 @@ function LooseTab() {
 
 // Advanced — less-used tools grouped under one tab with secondary sub-tabs,
 // so the top level stays uncluttered.
-function AdvancedTab() {
+function AdvancedTab({ libraryWritable }) {
   const [sub, setSub] = useState('batch');
   const subTabs = [
     { id: 'batch',  label: 'Bulk & Merge',       icon: '⚡' },
@@ -1462,12 +1556,12 @@ function AdvancedTab() {
   return (
     <div>
       <div style={{ padding: '8px 16px 0' }}>
-        <TabBar tabs={subTabs} active={sub} onChange={setSub} />
+        <TabBar tabs={subTabs} active={sub} onChange={setSub} label="Advanced tools" />
       </div>
       {sub === 'batch'  && <BatchTab />}
       {sub === 'roles'  && <FolderRoles />}
       {sub === 'gaps'   && <GapTab />}
-      {sub === 'unpack' && <LooseTab />}
+      {sub === 'unpack' && <LooseTab libraryWritable={libraryWritable} />}
     </div>
   );
 }
@@ -1479,7 +1573,8 @@ const TABS = [
   { id: 'advanced',  label: 'Advanced',  icon: '⚙' },
 ];
 
-export default function OrganizeModal({ onClose }) {
+export default function OrganizeModal({ onClose, libraryWritable, libraryPath }) {
+  const titleId = useUniqueId('org-title');
   const [tab, setTab] = useState('annotate');
   // Shared target for health → annotate "Annotate These" flow
   const [annotateTarget, setAnnotateTarget] = useState(null); // { modelIds, label }
@@ -1490,21 +1585,25 @@ export default function OrganizeModal({ onClose }) {
   }, []);
 
   return (
-    <ModalOverlay onClose={onClose}>
+    <Modal onClose={onClose} labelledBy={titleId} overlayClassName="organize-overlay" className="organize-modal">
       <div className="org-header">
         <div>
-          <div className="org-title">🗂 ORGANIZE LIBRARY</div>
+          <div className="org-title" id={titleId}>🗂 ORGANIZE LIBRARY</div>
           <div className="org-subtitle">Annotate with AI · Health & fixes · Franchises · Advanced tools</div>
         </div>
-        <button className="org-close" onClick={onClose}>✕</button>
+        <button className="org-close" onClick={onClose} aria-label="Close Organize Library">✕</button>
       </div>
 
-      <TabBar tabs={TABS} active={tab} onChange={setTab} />
+      {libraryWritable === false && (
+        <div className="org-readonly-banner" role="note">🔒 {READ_ONLY_TIP}: tools that would move files generate a script for you to run instead.</div>
+      )}
+
+      <TabBar tabs={TABS} active={tab} onChange={setTab} label="Organize sections" />
 
       {tab === 'annotate'  && <AnnotateTab target={annotateTarget} onClearTarget={() => setAnnotateTarget(null)} />}
-      {tab === 'health'    && <HealthTab onAnnotateThese={handleAnnotateThese} />}
+      {tab === 'health'    && <HealthTab onAnnotateThese={handleAnnotateThese} libraryPath={libraryPath} />}
       {tab === 'franchise' && <FranchiseTab onAnnotateThese={handleAnnotateThese} />}
-      {tab === 'advanced'  && <AdvancedTab />}
-    </ModalOverlay>
+      {tab === 'advanced'  && <AdvancedTab libraryWritable={libraryWritable} />}
+    </Modal>
   );
 }

@@ -1,7 +1,7 @@
-# The Vault — Project Specification
+# The Vault - Project Specification
 
-**Version:** 0.2.0 (build auto-incremented via pre-commit hook)
-**Last Updated:** 2026-03-31
+**Version:** see `backend/version.json` (the running build also reports its git commit)
+**Last Updated:** 2026-09-27 (deployment/ops sections)
 **Maintainer:** Casey (caseyi@uw.edu)
 **Repository:** github.com/caseyi/The-Vault
 **Host:** Synology NAS "Dagobah"
@@ -14,19 +14,19 @@ The Vault is a self-hosted 3D print library manager designed to run on a Synolog
 
 ### Core Capabilities
 
-- **Library scanning:** Recursively indexes a NAS folder tree with deep folder discovery — handles both flat `Creator/Model` and nested archive structures like `Creator/Category/Subcategory/Model`
+- **Library scanning:** Recursively indexes a NAS folder tree with deep folder discovery - handles both flat `Creator/Model` and nested archive structures like `Creator/Category/Subcategory/Model`
 - **Image extraction:** Pulls images from ZIP and RAR archives (render packs) and scrapes source websites for thumbnails
 - **Gallery browsing:** Filterable/searchable grid of model cards with image cycling, bulk operations, hide/show
 - **Model detail:** Full metadata view, thumbnail management, STL 3D preview, file listing by release
 - **Print status tracking:** Per-model lifecycle (unprinted → sliced → printing → printed → painted → failed)
 - **AI assistant:** Claude-powered tag suggestions, organization advice, print notes, and **web search** for finding model sources online
 - **AI batch tagging:** Auto-generate up to 5 tags per model (creator name, franchise, category, FDM/resin) via Claude Sonnet, streamed per-batch via SSE
-- **AI image finder:** Smart matchability scoring + trial mode — finds and scrapes images for models without thumbnails, skipping low-confidence candidates
+- **AI image finder:** Smart matchability scoring + trial mode - finds and scrapes images for models without thumbnails, skipping low-confidence candidates
 - **Tag cloud:** Clickable tag chips in sidebar with AND-logic filtering
 - **Render archive hints:** Creator-level and model-level wildcard patterns for identifying render archives (ZIP + RAR)
 - **Junk file filtering:** Automatically skips Synology metadata (@SynoEAStream, @SynoResource), macOS (._*, .DS_Store), and Windows (Thumbs.db) junk files
-- **Scan persistence:** Scan progress survives page reloads — reconnects to running scan via SSE
-- **Version tracking:** Auto-incrementing build number via git pre-commit hook, displayed in sidebar and `/api/health`
+- **Scan persistence:** Scan progress survives page reloads - reconnects to running scan via SSE
+- **Version tracking:** `backend/version.json` plus the git commit (`GIT_SHA`) and build date baked into the Docker image, displayed in the sidebar and `/api/health`
 
 ---
 
@@ -36,8 +36,8 @@ The Vault is a self-hosted 3D print library manager designed to run on a Synolog
 
 | Layer | Technology |
 |---|---|
-| Backend | Node.js 20 + Express |
-| Database | SQLite via better-sqlite3 (synchronous, WAL mode) |
+| Backend | Node.js 22 (>= 22.13) + Express |
+| Database | SQLite via the built-in `node:sqlite` (synchronous, WAL mode) |
 | Frontend | React 18 (Create React App) |
 | Reverse proxy | nginx (inside frontend container) |
 | Deployment | Docker Compose (2 containers) |
@@ -165,7 +165,7 @@ All schema changes use the try/catch ALTER TABLE pattern for backwards compatibi
 try { db.exec(`ALTER TABLE tablename ADD COLUMN col_name TYPE DEFAULT val`); } catch {}
 ```
 
-`CREATE TABLE IF NOT EXISTS` is a **no-op for existing tables** — it does NOT add new columns. Every new column MUST have a corresponding ALTER TABLE migration line in `db.js`.
+`CREATE TABLE IF NOT EXISTS` is a **no-op for existing tables** - it does NOT add new columns. Every new column MUST have a corresponding ALTER TABLE migration line in `db.js`.
 
 ---
 
@@ -177,7 +177,7 @@ try { db.exec(`ALTER TABLE tablename ADD COLUMN col_name TYPE DEFAULT val`); } c
 |---|---|---|
 | GET | `/api/scan/status` | Current scan status and latest log entry |
 | POST | `/api/scan` | Start a scan. Body: `{ path?: string, force?: boolean }`. Force nulls all folder_hash values first. |
-| GET | `/api/scan/stream` | **SSE** — Real-time scan progress events |
+| GET | `/api/scan/stream` | **SSE** - Real-time scan progress events |
 
 ### Models
 
@@ -187,7 +187,7 @@ try { db.exec(`ALTER TABLE tablename ADD COLUMN col_name TYPE DEFAULT val`); } c
 | GET | `/api/models/:id` | Single model with its files |
 | PATCH | `/api/models/:id` | Update model fields: `print_status`, `tags`, `notes`, `source_url`, `name`, `thumbnail_path`, `hidden` |
 | POST | `/api/models/bulk` | Bulk update: `{ ids: number[], print_status?, tags_add?, tags_remove?, hidden? }` |
-| GET | `/api/models/:id/scrape-stream` | **SSE** — Scrape source website for images and metadata |
+| GET | `/api/models/:id/scrape-stream` | **SSE** - Scrape source website for images and metadata |
 
 ### Files
 
@@ -203,7 +203,7 @@ try { db.exec(`ALTER TABLE tablename ADD COLUMN col_name TYPE DEFAULT val`); } c
 |---|---|---|
 | GET | `/api/creators` | List all creators with model counts |
 | PATCH | `/api/creators/:id` | Update creator. Body: `{ render_zip_hint?, notes? }` |
-| POST | `/api/creators/:id/reextract` | **SSE** — Re-extract render images for all models by this creator |
+| POST | `/api/creators/:id/reextract` | **SSE** - Re-extract render images for all models by this creator |
 
 ### Stats
 
@@ -217,8 +217,8 @@ try { db.exec(`ALTER TABLE tablename ADD COLUMN col_name TYPE DEFAULT val`); } c
 |---|---|---|
 | POST | `/api/ai/assist` | Proxy to Claude API. Body: `{ modelId, action?, userMessage?, history[] }`. Requires `x-claude-key` header. |
 | POST | `/api/ai/search` | Web search via Claude with `web_search` tool. Body: `{ modelId?, query? }`. Returns `{ text, results[], citations[] }`. Requires `x-claude-key` header. |
-| GET | `/api/ai/generate-tags` | **SSE** — Batch AI tagging. Query: `key` (API key). Batches models in groups of 50, streams per-batch progress with token usage, example tags, hit rate. Auto-retries rate limits, stops on auth errors. |
-| GET | `/api/ai/find-images` | **SSE** — AI image finder. Query: `key`, `trial` (default `1`). Scores models by matchability, skips poor candidates (<20 pts), processes trial batch of 10 first. Streams per-model progress with confidence indicators. |
+| GET | `/api/ai/generate-tags` | **SSE** - Batch AI tagging. Query: `key` (API key). Batches models in groups of 50, streams per-batch progress with token usage, example tags, hit rate. Auto-retries rate limits, stops on auth errors. |
+| GET | `/api/ai/find-images` | **SSE** - AI image finder. Query: `key`, `trial` (default `1`). Scores models by matchability, skips poor candidates (<20 pts), processes trial batch of 10 first. Streams per-model progress with confidence indicators. |
 | POST | `/api/ai/test-key` | Quick API key validation. Requires `x-claude-key` header. Returns `{ ok, model, usage, message }`. |
 
 ### Tags
@@ -277,7 +277,7 @@ The scanner supports both flat and deeply nested folder structures:
 
 Below the creator level, the `discoverModelFolders()` function recursively walks directories until it finds folders containing printable files (STL, ZIP, RAR, slicer files, gcode). Folders that only contain subdirectories are treated as categories and traversed further. Maximum recursion depth: 5 levels.
 
-**Transaction chunking:** Models are processed in transaction batches of 10 with `setImmediate()` yields between batches, allowing SSE progress to stream in real time (better-sqlite3 transactions are synchronous and block the event loop).
+**Transaction chunking:** Models are processed in transaction batches of 10 with `setImmediate()` yields between batches, allowing SSE progress to stream in real time (SQLite transactions are synchronous and block the event loop; full scans also run in a worker thread).
 
 Nested models get breadcrumb-style names: `"Star Wars / Vehicles / X-wing"`.
 
@@ -297,11 +297,11 @@ $RECYCLE.BIN, System Volume Information
 
 The `isJunkFile()` function skips individual files matching these patterns at every code path (directory listing, image extraction, folder hashing):
 
-- `@SynoEAStream` — Synology extended attribute streams
-- `@SynoResource` — Synology resource forks
-- `._*` prefix — macOS resource forks
-- `.DS_Store` — macOS folder metadata
-- `Thumbs.db` — Windows thumbnail cache
+- `@SynoEAStream` - Synology extended attribute streams
+- `@SynoResource` - Synology resource forks
+- `._*` prefix - macOS resource forks
+- `.DS_Store` - macOS folder metadata
+- `Thumbs.db` - Windows thumbnail cache
 
 ### Scan Optimization (folder_hash)
 
@@ -388,8 +388,8 @@ Supported archive formats: `.zip` (via adm-zip), `.rar` (via node-unrar-js, pure
 - **API key input** with show/hide toggle, saved to localStorage, "Test" button for validation
 - SSE-connected progress display via TaskLog
 - **Scan persistence:** On mount, checks `/api/scan/status` and auto-reconnects to running scan
-- **Generate Tags** button — SSE-streamed AI batch tagging with per-batch progress
-- **Find Images (trial 10)** button — AI image finder with matchability scoring, trial mode, "Continue All" after trial
+- **Generate Tags** button - SSE-streamed AI batch tagging with per-batch progress
+- **Find Images (trial 10)** button - AI image finder with matchability scoring, trial mode, "Continue All" after trial
 - Shows "Checking scan status…" loading state while detecting state
 - Start/close controls
 
@@ -398,7 +398,7 @@ Supported archive formats: `.zip` (via adm-zip), `.rar` (via node-unrar-js, pure
 - Lists ZIP files for a model via `/api/files/:fileId/zip-contents`
 - Shows image entries as checkboxes
 - Extract selected images via `/api/files/:fileId/extract-images`
-- **Known issue:** ZIP files with empty `filepath` (V1 models) show "File not found on disk" — requires force rescan
+- **Known issue:** ZIP files with empty `filepath` (V1 models) show "File not found on disk" - requires force rescan
 
 ### StlViewer.js
 
@@ -441,39 +441,22 @@ Supported archive formats: `.zip` (via adm-zip), `.rar` (via node-unrar-js, pure
 
 ## 7. Nginx Configuration
 
-```nginx
-# SSE endpoints — streaming proxy
-location ~ /api/(scan/stream|models/\d+/scrape-stream|creators/\d+/reextract|ai/generate-tags|ai/find-images) {
-    proxy_pass http://backend:3001;
-    proxy_http_version 1.1;
-    proxy_set_header Host $host;
-    proxy_set_header Connection '';
-    proxy_buffering off;
-    proxy_cache off;
-    proxy_read_timeout 600s;
-    chunked_transfer_encoding off;
-}
+`frontend/nginx.conf` is the source of truth. Key rules:
 
-# Regular API
-location /api/ {
-    proxy_pass http://backend:3001;
-    proxy_http_version 1.1;
-    proxy_set_header Host $host;
-    proxy_read_timeout 300s;
-}
-
-# Static images
-location /images/ {
-    proxy_pass http://backend:3001;
-}
-
-# SPA fallback
-location / {
-    try_files $uri $uri/ /index.html;
-}
-```
-
-**Critical:** SSE endpoints MUST have `Connection ''` (not `upgrade`), `proxy_buffering off`, and `proxy_cache off` to work through nginx.
+- Every streaming (SSE) route is listed in the regex location (`scan/stream`,
+  `models/:id/scrape-stream`, `models/:id/scrape`, `creators/:id/reextract`,
+  `ai/generate-tags`, `ai/find-images`, `ai/vision-tags`,
+  `organize/auto-annotate`) with `proxy_buffering off`, `Connection ''`,
+  HTTP/1.1 and a 1-hour read timeout. The backend also sends
+  `X-Accel-Buffering: no` and a `:` heartbeat every 15 s, so streams survive
+  extra reverse proxies (e.g. Synology's).
+- The access log uses `$uri`, not `$request`, so `?key=` API keys never reach
+  `docker logs`.
+- The backend is resolved through Docker DNS at request time
+  (`resolver 127.0.0.11`), so recreating only the backend never leaves nginx on
+  a stale IP.
+- `/static/` (hashed assets) is cached for a year; `index.html` is `no-cache`.
+- `client_max_body_size 10m` matches the backend's JSON body limit.
 
 ---
 
@@ -481,30 +464,36 @@ location / {
 
 ### CI/CD Pipeline
 
-GitHub Actions builds and pushes multi-arch Docker images to `ghcr.io/caseyi/stlvault-{backend,frontend}:latest` on push to main.
+`.github/workflows/docker-publish.yml`: on every PR and push to `main`, run the
+backend (Jest) and frontend tests plus a scan smoke test, build both images,
+boot them together and scan a fixture library. Only pushes to `main` (tag
+`latest` + `sha-<7 chars>`) and `v*` tags (`X.Y.Z`, `X.Y`) are published to
+`ghcr.io/caseyi/stlvault-{backend,frontend}`. Images carry OCI labels and
+`GIT_SHA`/`BUILD_DATE`.
 
 ### Update Script (`update.sh`)
 
-1. Saves current `:latest` images as `:rollback` tags (with proper if/else error handling under `set -e`)
-2. Pulls new images via `docker compose pull`
-3. Restarts containers via `docker compose up -d --remove-orphans`
-4. Displays access URL using `get_ip()` portable function (fallback chain: `hostname -I` → `hostname -i` → `ip route` → `localhost`)
-5. Prunes dangling images (keeping rollback)
-
-Rollback: `./update.sh rollback` re-tags `:rollback` as `:latest` and restarts.
-
-**Synology compatibility:** BusyBox on Synology only supports `hostname -i` (lowercase), not `hostname -I` (uppercase). The `get_ip()` function handles this transparently.
+Run as `sudo sh update.sh [tag]` next to `docker-compose.yml`. It records the
+data volume of the running backend, refuses to switch to a different volume
+(project-name trap), snapshots the DB into `./backups`
+(`vault-pre-update-<timestamp>.db`, newest 5 kept), keeps the running images
+as `:pre-update`, pulls, `up -d --wait`, re-checks the volume (restoring the
+previous version if it changed), prints version/commit from `/api/health` and
+removes old unused Vault images. A tag argument (`sha-1a2b3c4`, `latest`,
+`pre-update`) is written to `VAULT_TAG` in `.env`.
 
 ### Version Tracking
 
-`backend/version.json` contains `{"version": "0.2.0", "build": N}` where the build number auto-increments on every git commit via a `.git/hooks/pre-commit` hook. The version is:
-- Displayed in the sidebar footer
-- Returned by `/api/health`
-- Logged at server startup
+`backend/version.json` holds `{"version", "build"}`; the image adds `GIT_SHA`
+and `BUILD_DATE`. All are shown in the sidebar footer, returned by
+`/api/health`, and logged at server startup.
 
-### First-Time Setup (`setup-from-github.sh`)
+### Backups
 
-Creates directory structure, downloads `docker-compose.yml`, runs initial pull and start.
+The backend writes a daily `vault-YYYYMMDD.db` snapshot (`VACUUM INTO`,
+`BACKUP_KEEP` kept) and one before every forced rescan into `BACKUP_DIR`
+(`/backups`, bind-mounted from `./backups`). Restore procedure: README →
+"Backups and restore".
 
 ---
 
@@ -550,11 +539,9 @@ Creates directory structure, downloads `docker-compose.yml`, runs initial pull a
 
 5. **Single-user:** No concurrent scan protection. Starting a scan while one is running will cause issues.
 
-6. **localStorage for API key:** The Claude API key is stored in browser localStorage — lost on browser data clear.
+6. **localStorage for API key:** The Claude API key is stored in browser localStorage - lost on browser data clear.
 
-7. **better-sqlite3 native binary:** The better-sqlite3 package requires a prebuilt native binary (GLIBC 2.29+). Running `npm install` on Synology NAS can wipe the binary if compilation fails. Use `npm install <package> --ignore-scripts` for adding new packages on the NAS, and recover the binary via `docker cp` from the running container if lost.
-
-8. **update.sh must be manually bootstrapped:** If `update.sh` itself needs updating, you must manually `git pull` since the script can't update itself mid-run.
+7. **update.sh is not self-updating:** a new `update.sh` must be copied to the NAS (File Station) before it is run.
 
 ---
 
@@ -570,13 +557,14 @@ the-vault/
 │   ├── package.json
 │   ├── version.json         # Auto-incremented build number
 │   ├── db.js                # Schema + migrations
-│   ├── server.js            # Express API (~1296 lines)
-│   ├── scanner.js           # Library indexer (~556 lines)
-│   ├── scraper.js           # Web scraper (~258 lines)
+│   ├── server.js            # Express API
+│   ├── scanner.js           # Library indexer
+│   ├── scraper.js           # Web scraper
+│   ├── lib/                 # Shared helpers (SSE, backups, paths, …)
 │   └── tests/
-│       ├── scanner.test.js  # 47 tests (utility + discovery)
-│       ├── api.test.js      # 17 tests (API endpoints)
-│       └── scraper.test.js  # 7 tests (web scrapers)
+│       ├── scanner.test.js
+│       ├── api.test.js
+│       └── scraper.test.js
 ├── frontend/
 │   ├── Dockerfile
 │   ├── package.json
@@ -584,13 +572,13 @@ the-vault/
 │   └── src/
 │       ├── App.js
 │       ├── App.test.js
-│       ├── App.css           # All styles (~776 lines)
+│       ├── App.css           # All styles
 │       ├── index.js
 │       ├── pages/
 │       │   ├── Gallery.js
-│       │   ├── Gallery.test.js    # 13 tests
-│       │   ├── ModelDetail.js     # (~425 lines)
-│       │   └── ModelDetail.test.js # 14 tests
+│       │   ├── Gallery.test.js
+│       │   ├── ModelDetail.js
+│       │   └── ModelDetail.test.js
 │       └── components/
 │           ├── Sidebar.js
 │           ├── Sidebar.test.js
@@ -602,37 +590,25 @@ the-vault/
 │           ├── ReleaseFileList.js
 │           └── RenderHintPanel.js
 ├── docker-compose.yml
-├── update.sh                 # Synology-compatible with get_ip() fallback
-├── setup-from-github.sh
-└── .github/workflows/        # CI/CD
+├── update.sh                 # NAS update/rollback (sudo sh update.sh [tag])
+├── add-library.sh            # Extra library folders (compose override)
+├── native/                   # Tauri desktop app (macOS + Windows)
+└── .github/                  # CI workflows, smoke-scan.js, dependabot
 ```
 
 ---
 
 ## 12. Test Suite
 
-**118 tests total** (71 backend + 47 frontend)
+Counts change often, so they are not listed here; run the suites:
 
-### Backend Tests (Jest)
+- Backend (Jest): `cd backend && npm test` - scanner, API and scraper tests.
+- Frontend (React Testing Library): `cd frontend && CI=true npm test`.
+- Scan smoke test (boots the real backend, scans a fixture):
+  `node .github/scripts/smoke-scan.js`.
 
-| File | Tests | Coverage |
-|---|---|---|
-| scanner.test.js | 47 | matchesHint, pickRenderArchives, analyzeFolder, inferReleaseName, discoverModelFolders |
-| api.test.js | 17 | API endpoint integration tests |
-| scraper.test.js | 7 | Web scraper tests |
-
-Run: `cd backend && npx jest`
-
-### Frontend Tests (React Testing Library)
-
-| File | Tests | Coverage |
-|---|---|---|
-| Gallery.test.js | 13 | Cards, count, empty state, badges, click, search, bulk, hidden |
-| ModelDetail.test.js | 14 | Loading, metadata, status, tags, notes, images, save, Claude, hide |
-| Sidebar.test.js | 15 | Sidebar rendering, filters, tag cloud |
-| App.test.js | 5 | Root component rendering |
-
-Run: `cd frontend && npx react-scripts test --watchAll=false`
+CI runs all three on every PR, plus a container boot/scan test of the built
+images.
 
 ---
 
@@ -640,18 +616,16 @@ Run: `cd frontend && npx react-scripts test --watchAll=false`
 
 ### Backend (package.json)
 
+`backend/package.json` is authoritative; at the time of writing:
+
 | Package | Purpose |
 |---|---|
 | express | HTTP server + routing |
-| better-sqlite3 | Synchronous SQLite driver |
-| cors | Cross-origin support (dev) |
-| multer | File upload handling |
+| node:sqlite (built into Node 22) | Synchronous SQLite driver - no native addon |
 | adm-zip | ZIP file reading/extraction |
 | node-unrar-js | RAR file extraction (pure WASM, no native deps) |
-| chokidar | File system watching |
-| sharp | Image processing/resizing |
-| uuid | UUIDv4 generation |
-| node-cron | Scheduled tasks |
+
+No dependency needs a compiler, so the Docker image has no build toolchain.
 
 ### Frontend (package.json)
 
@@ -660,11 +634,4 @@ Run: `cd frontend && npx react-scripts test --watchAll=false`
 | react | UI framework |
 | react-dom | DOM rendering |
 | react-scripts | CRA build toolchain |
-
-### CDN Dependencies (loaded at runtime)
-
-| Library | Version | Component |
-|---|---|---|
-| Three.js | r128 | StlViewer.js |
-| STLLoader | 0.128.0 | StlViewer.js |
-| OrbitControls | 0.128.0 | StlViewer.js |
+| three | STL preview (StlViewer.js), bundled from npm - no CDN scripts |

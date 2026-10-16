@@ -1,92 +1,79 @@
 import React, { useEffect, useRef } from 'react';
 
-const LEVEL_STYLES = {
-  info:    { color: '#8899aa', prefix: '·' },
-  scan:    { color: '#a0b4c8', prefix: '  ↳' },
-  creator: { color: '#c17f3a', prefix: '▸' },
-  add:     { color: '#4caf7d', prefix: '+' },
-  update:  { color: '#5b9bd5', prefix: '↻' },
-  skip:    { color: '#3a4a3a', prefix: '⟳' },
-  zip:     { color: '#d4aa4c', prefix: '📦' },
-  img:     { color: '#9b72cf', prefix: '🖼' },
-  success: { color: '#4caf7d', prefix: '✓' },
-  warn:    { color: '#d4aa4c', prefix: '⚠' },
-  error:   { color: '#cf7272', prefix: '✗' },
+// Terminal-style log viewer for SSE task output. Colors come from CSS
+// variables (see .tasklog in App.css) so it follows the light/dark theme.
+
+const LEVEL_PREFIX = {
+  info: '·', scan: '  ↳', creator: '▸', add: '+', update: '↻', skip: '⟳',
+  zip: '📦', img: '🖼', success: '✓', warn: '⚠', error: '✗',
 };
+
+export const MAX_LOG_LINES = 500;
 
 function timestamp(ts) {
   if (!ts) return '';
   const d = new Date(ts);
-  return `${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}:${String(d.getSeconds()).padStart(2,'0')}`;
+  if (isNaN(d)) return '';
+  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}:${String(d.getSeconds()).padStart(2, '0')}`;
 }
 
-export default function TaskLog({ lines = [], running = false, height = 260, title = 'LOG' }) {
-  const bottomRef = useRef(null);
+export default function TaskLog({ lines = [], running = false, height = 260, title = 'LOG', maxLines = MAX_LOG_LINES }) {
+  const scrollRef = useRef(null);
+  const stickRef = useRef(true); // follow the tail unless the user scrolled up
 
+  const hiddenCount = Math.max(0, lines.length - maxLines);
+  const visible = hiddenCount ? lines.slice(hiddenCount) : lines;
+
+  // Scroll only the log container (never scrollIntoView, which also scrolls the
+  // surrounding modal and hides its title / folder picker).
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+    const el = scrollRef.current;
+    if (el && stickRef.current) el.scrollTop = el.scrollHeight;
   }, [lines.length]);
 
+  const onScroll = () => {
+    const el = scrollRef.current;
+    if (!el) return;
+    stickRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+  };
+
   return (
-    <div style={{
-      background: '#0a0a0c',
-      border: '1px solid #2a2a35',
-      borderRadius: 6,
-      overflow: 'hidden',
-      fontFamily: 'var(--font-mono)',
-    }}>
-      {/* Terminal chrome */}
-      <div style={{
-        display: 'flex', alignItems: 'center', gap: 6,
-        padding: '7px 12px',
-        background: '#111118',
-        borderBottom: '1px solid #2a2a35',
-      }}>
-        <div style={{ display: 'flex', gap: 5 }}>
-          <div style={{ width: 10, height: 10, borderRadius: '50%', background: '#cf7272', opacity: 0.7 }} />
-          <div style={{ width: 10, height: 10, borderRadius: '50%', background: '#d4aa4c', opacity: 0.7 }} />
-          <div style={{ width: 10, height: 10, borderRadius: '50%', background: '#4caf7d', opacity: 0.7 }} />
+    <div className="tasklog">
+      <div className="tasklog-chrome">
+        <div className="tasklog-dots" aria-hidden="true">
+          <span className="tasklog-dot red" /><span className="tasklog-dot yellow" /><span className="tasklog-dot green" />
         </div>
-        <span style={{ fontSize: 10, color: '#556', letterSpacing: 2, marginLeft: 6, textTransform: 'uppercase' }}>
-          {title}
-        </span>
+        <span className="tasklog-title">{title}</span>
         {running && (
-          <span style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 5, fontSize: 10, color: '#c17f3a' }}>
-            <span style={{ display: 'inline-block', width: 6, height: 6, borderRadius: '50%', background: '#c17f3a', animation: 'blink 1s ease-in-out infinite' }} />
+          <span className="tasklog-running">
+            <span className="tasklog-blink" aria-hidden="true" />
             RUNNING
           </span>
         )}
         {!running && lines.length > 0 && (
-          <span style={{ marginLeft: 'auto', fontSize: 10, color: '#556' }}>{lines.length} lines</span>
+          <span className="tasklog-count">{lines.length} lines</span>
         )}
       </div>
 
-      {/* Log lines */}
-      <div style={{
-        height,
-        overflowY: 'auto',
-        padding: '10px 12px',
-        display: 'flex',
-        flexDirection: 'column',
-        gap: 2,
-      }}>
+      <div ref={scrollRef} className="tasklog-body" style={{ height }} onScroll={onScroll}
+        role="log" aria-live="polite" aria-label={title} data-testid="tasklog-body">
         {lines.length === 0 && (
-          <span style={{ color: '#334', fontSize: 11 }}>Waiting to start...</span>
+          <span className="tasklog-empty">Waiting to start...</span>
         )}
-        {lines.map((line, i) => {
-          const style = LEVEL_STYLES[line.level] || LEVEL_STYLES.info;
+        {hiddenCount > 0 && (
+          <div className="tasklog-hidden-note">{hiddenCount.toLocaleString()} earlier line{hiddenCount === 1 ? '' : 's'} hidden</div>
+        )}
+        {visible.map((line, i) => {
+          const level = LEVEL_PREFIX[line.level] ? line.level : 'info';
           return (
-            <div key={i} style={{ display: 'flex', gap: 8, fontSize: 11, lineHeight: 1.5, alignItems: 'baseline' }}>
-              <span style={{ color: '#334', flexShrink: 0, fontSize: 10 }}>{timestamp(line.ts)}</span>
-              <span style={{ color: style.color, flexShrink: 0, width: 14, textAlign: 'right' }}>{style.prefix}</span>
-              <span style={{ color: style.color, wordBreak: 'break-all' }}>{line.msg}</span>
+            <div key={hiddenCount + i} className={`tasklog-line lvl-${level}`}>
+              <span className="tasklog-ts">{timestamp(line.ts)}</span>
+              <span className="tasklog-prefix">{LEVEL_PREFIX[level]}</span>
+              <span className="tasklog-msg">{line.msg}</span>
             </div>
           );
         })}
-        <div ref={bottomRef} />
       </div>
-
-      <style>{`@keyframes blink { 0%,100%{opacity:0.3} 50%{opacity:1} }`}</style>
     </div>
   );
 }

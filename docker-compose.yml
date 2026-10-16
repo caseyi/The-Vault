@@ -1,29 +1,39 @@
-version: '3.8'
-
+# The Vault - Docker Compose
+#
 # ── Image source ──────────────────────────────────────────────────────────────
-# Images are built automatically by GitHub Actions and published to GHCR.
-# Run ./update.sh on your NAS to pull the latest build.
+# Images are built by GitHub Actions and published to GHCR. Run
+# `sudo sh update.sh` next to this file to pull the newest build.
 #
-# To build locally instead (e.g. for development), comment out the `image:`
-# lines and uncomment the `build:` lines.
-# ─────────────────────────────────────────────────────────────────────────────
+# VAULT_TAG (in .env) picks which build runs. It defaults to `latest`.
+# Pin or roll back with e.g. `sudo sh update.sh sha-1a2b3c4` (writes VAULT_TAG
+# into .env for you) and go back to tracking main with `sudo sh update.sh latest`.
 #
-# ── Configuring library paths ───────────────────────────────────────────────
-# You no longer edit paths in this file by hand. Copy `.env.example` to `.env`
-# and set your folders there:
+# To build locally instead (development), comment out the `image:` lines and
+# uncomment the `build:` lines.
 #
-#   cp .env.example .env
-#   nano .env
+# ── Configuring library paths ─────────────────────────────────────────────────
+# You never edit paths in this file by hand. Copy `.env.example` to `.env` and
+# set your folders there. All the ${...} values below are read from `.env`.
 #
-# All the ${...} values below are read from that .env file.
-# See the README ("Setting your library folders") for full details.
+# ── IMPORTANT: where your database lives ─────────────────────────────────────
+# The database and extracted images live in the named volume `vault_data`.
+# Docker prefixes it with the Compose PROJECT name, which defaults to the name
+# of the folder holding this file, e.g. /volume1/docker/the-vault ->
+# `the-vault_vault_data`. If you move or rename the folder, or create the
+# Container Manager project under a different name, Docker will quietly create
+# a NEW, EMPTY volume. Find yours with:
+#     sudo docker volume ls | grep vault_data
+# and, if needed, set COMPOSE_PROJECT_NAME in .env to its prefix. update.sh
+# checks this for you and refuses to switch volumes.
 # ─────────────────────────────────────────────────────────────────────────────
 
 services:
   backend:
-    image: ghcr.io/caseyi/stlvault-backend:latest
+    image: ghcr.io/caseyi/stlvault-backend:${VAULT_TAG:-latest}
     # build: ./backend       # ← uncomment to build locally
     restart: unless-stopped
+    # Reap zombie processes (scan worker threads, unrar/zip helpers) and forward
+    # SIGTERM so `docker compose stop` shuts the server down cleanly.
     volumes:
       # ── Primary library (a folder on THIS machine / local NAS volume) ────────
       # Set LIBRARY_HOST_PATH and LIBRARY_NAME in .env. It is mounted read-only
@@ -35,42 +45,81 @@ services:
       # - ${LIBRARY2_HOST_PATH}:/library/${LIBRARY2_NAME:-More Prints}:ro
 
       # ── A folder on a REMOTE NAS over SMB / CIFS (optional) ──────────────────
-      # Set the SMB_* vars in .env, then uncomment BOTH this line and the
-      # `smb_library` volume definition at the bottom of this file.
+      # Preferred on Synology: mount the share in DSM (File Station → Tools →
+      # Mount Remote Folder → CIFS) and add it as a local folder above.
+      # Otherwise set the SMB_* vars in .env, then uncomment BOTH this line and
+      # the `smb_library` volume definition at the bottom of this file.
       # - smb_library:/library/${SMB_NAME:-remote}:ro
 
-      # Database and extracted images — never remove this line
+      # Database and extracted images - never remove this line
       - vault_data:/data
+
+      # Database snapshots (daily, before forced rescans, before updates).
+      # A plain folder next to this file, so it shows up in File Station and
+      # can be included in Hyper Backup.
+      - ./backups:/backups
 
     environment:
       - LIBRARY_PATH=/library
       - DB_PATH=/data/vault.db
       - IMAGES_DIR=/data/images
-      # Claude API key — loaded from .env file (never commit that file)
-      - CLAUDE_API_KEY=${CLAUDE_API_KEY}
-      # Optional: override the Claude model used for AI features (default: claude-haiku-4-5-20251001)
-      # - CLAUDE_MODEL=${CLAUDE_MODEL:-claude-haiku-4-5-20251001}
+      - BACKUP_DIR=/backups
+      - BACKUP_KEEP=${BACKUP_KEEP:-7}
+      # Listen on all interfaces inside the container (only the frontend
+      # container reaches it; port 3001 is not published to the host).
+      - HOST=0.0.0.0
+      - TZ=${TZ:-America/Los_Angeles}
+      # Lets Organize → "generate script" translate /library/<name>/... back to
+      # the real path on the NAS.
+      - LIBRARY_HOST_PATH=${LIBRARY_HOST_PATH:-/volume1/STL Archive}
+      - LIBRARY_NAME=${LIBRARY_NAME:-STL Archive}
+      - ORGANIZE_SSH_TARGET=${ORGANIZE_SSH_TARGET:-}
+      # Claude API key - loaded from .env (never commit that file)
+      - CLAUDE_API_KEY=${CLAUDE_API_KEY:-}
+      # Optional: Claude model for AI features (empty = built-in default)
+      - CLAUDE_MODEL=${CLAUDE_MODEL:-}
+      # Archives larger than this (MB) are never opened for render extraction
+      - ARCHIVE_MAX_MB=${ARCHIVE_MAX_MB:-500}
+      # 1 = let the web scraper fetch LAN/private addresses (off by default)
+      - SCRAPER_ALLOW_PRIVATE=${SCRAPER_ALLOW_PRIVATE:-0}
+      # Optional: extra browser origins allowed to call the API cross-origin
+      # (comma list; `*` disables the check). Same-origin use needs nothing.
+      # - ALLOWED_ORIGINS=${ALLOWED_ORIGINS}
+
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:3001/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 120s
 
   frontend:
-    image: ghcr.io/caseyi/stlvault-frontend:latest
+    image: ghcr.io/caseyi/stlvault-frontend:${VAULT_TAG:-latest}
     # build: ./frontend      # ← uncomment to build locally
     restart: unless-stopped
+    environment:
+      - TZ=${TZ:-America/Los_Angeles}
     ports:
       # Access the app at http://your-nas-ip:8484
       # Change the host port (left of the colon) with WEB_PORT in .env.
       - "${WEB_PORT:-8484}:80"
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
 
 volumes:
-  # vault_data is a named Docker volume — it persists across container
-  # restarts, image updates, and docker-compose down/up.
+  # vault_data is a named Docker volume - it persists across container
+  # restarts, image updates, and `docker compose down`/`up`.
   # Your database and images live here and are NEVER wiped by updates.
+  # (Never run `docker compose down -v`: -v deletes this volume.)
   vault_data:
 
   # ── Remote SMB / CIFS library (optional) ──────────────────────────────────
   # Uncomment this whole block AND the `- smb_library:...` line above to mount
   # a share from another NAS as a library root. Credentials come from .env.
+  # A password containing a comma cannot be used here (commas separate mount
+  # options); use DSM "Mount Remote Folder" instead. If it contains `$`,
+  # wrap the value in single quotes in .env: SMB_PASS='pa$word'.
   #
   #   //SMB_HOST/SMB_SHARE  →  /library/<SMB_NAME>
   #

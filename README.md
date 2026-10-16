@@ -11,7 +11,7 @@ organise your collection.
 - 🗂️ Browse by folder tree, creator, franchise, tags, or collections
 - 🖨️ Track print status (unprinted → sliced → printing → printed → painted) and a print queue
 - 🤖 Optional Claude AI: auto-tagging, online image finder, per-model chat
-- 📦 Runs entirely on your own hardware — your files never leave your network
+- 📦 Runs entirely on your own hardware - your files never leave your network
 
 <!-- Badges: update the links below to match your repo / donation pages. -->
 [![License: MIT](https://img.shields.io/badge/License-MIT-c17f3a.svg)](LICENSE)
@@ -25,17 +25,19 @@ organise your collection.
 - [Quick start](#quick-start-first-time)
 - [Step-by-step install (Windows / macOS / Synology)](#step-by-step-install)
 - [Setting your library folders](#setting-your-library-folders)
-  - [The easy way — add-library.sh](#the-easy-way--add-librarysh)
+  - [The easy way - add-library.sh](#the-easy-way--add-librarysh)
   - [A folder on this machine](#a-folder-on-this-machine)
   - [A second local folder](#a-second-local-folder)
   - [A folder on another NAS over SMB / CIFS](#a-folder-on-another-nas-over-smb--cifs)
 - [Folder structure expected](#folder-structure-expected)
-- [Updating](#updating)
+- [Updating, pinning and rolling back](#updating-pinning-and-rolling-back)
+- [Backups and restore](#backups-and-restore)
+- [Which version am I running?](#which-version-am-i-running)
 - [AI features (Claude API)](#ai-features-claude-api)
 - [Configuration reference](#configuration-reference)
 - [Troubleshooting](#troubleshooting)
 - [Development (local build)](#development-local-build)
-- [CI / CD](#cicd)
+- [CI / CD](#ci--cd)
 - [License](#license)
 - [Support the project](#support-the-project)
 
@@ -49,7 +51,7 @@ organise your collection.
 - Your 3D print files in a folder that machine can read.
 - *(Optional)* an Anthropic **Claude API key** if you want the AI features.
 
-No build tools, Node, or Python needed on the host — the app ships as pre-built
+No build tools, Node, or Python needed on the host - the app ships as pre-built
 Docker images.
 
 ---
@@ -68,7 +70,7 @@ cp .env.example .env
 nano .env            # (or open it in any text editor)
 
 # 4. Start
-docker-compose up -d
+docker compose up -d
 
 # 5. Open in a browser
 #    http://YOUR-NAS-IP:8484
@@ -76,8 +78,9 @@ docker-compose up -d
 
 Then click **⟳ SCAN LIBRARY** in the sidebar to index your files.
 
-Docker images are pulled automatically from GitHub Container Registry — no local
-build needed.
+Docker images are pulled automatically from GitHub Container Registry - no local
+build needed. On a Synology NAS, follow the Synology steps under
+[Step-by-step install](#step-by-step-install) instead: they don't need git.
 
 ---
 
@@ -95,7 +98,7 @@ The Vault running in your browser.
 ### 🪟 Windows
 
 1. **Install Docker Desktop.** Download it from the official guide and run the
-   installer — it will enable WSL 2 for you if needed:
+   installer - it will enable WSL 2 for you if needed:
    <https://docs.docker.com/desktop/setup/install/windows-install/>
    Reboot if prompted, then launch **Docker Desktop** and wait for it to say
    "Engine running".
@@ -118,11 +121,11 @@ The Vault running in your browser.
 6. Open **http://localhost:8484** and click **⟳ SCAN LIBRARY**.
 
 > The first time Docker accesses a new drive it may pop up a **"file sharing"**
-> permission prompt — click **Share it**.
+> permission prompt - click **Share it**.
 
 ### 🍎 macOS
 
-1. **Install Docker Desktop** — pick the build for your chip (Apple Silicon vs
+1. **Install Docker Desktop** - pick the build for your chip (Apple Silicon vs
    Intel): <https://docs.docker.com/desktop/setup/install/mac-install/>
    Open **Docker Desktop** from Applications and wait until the whale icon shows
    "Engine running".
@@ -147,32 +150,45 @@ The Vault running in your browser.
 
 ### 🗄️ Synology NAS
 
-Synology renamed its Docker package to **Container Manager** in DSM 7.2. (It's only
-available on x86_64 models — the "+" / "xs" series. ARM-based models can't run it.)
+This is the setup The Vault is developed on (DSM 7, Container Manager). You only
+need three files from this repo; no git on the NAS.
 
-1. **Install Container Manager.** In DSM, open **Package Center**, search for
-   **Container Manager**, and install it. Reference:
-   <https://www.synology.com/en-us/dsm/packages/ContainerManager>
-2. **Copy the project to your NAS.** Open **File Station** and create a folder such
-   as `docker/the-vault` on `volume1`, then copy the contents of this repo into it
-   (download the repo as a ZIP from GitHub and upload it, or `git clone` over SSH).
-3. **Create your `.env`.** Copy `.env.example` to `.env` in that folder (File
-   Station → right-click → Copy, then rename), and edit it (Text Editor) so
-   `LIBRARY_HOST_PATH` points at your prints share, e.g.
-   `LIBRARY_HOST_PATH=/volume1/STL Archive`.
-4. **Start it with the Project feature:**
-   - Open **Container Manager → Project → Create**.
-   - **Project name:** `the-vault`
-   - **Path:** browse to the `docker/the-vault` folder you created.
-   - **Source:** it will detect the existing `docker-compose.yml`. Click through
-     and **Build/Run**.
-5. Open **http://YOUR-NAS-IP:8484** and click **⟳ SCAN LIBRARY**.
+Synology renamed its Docker package to **Container Manager** in DSM 7.2 (x86_64
+"+"/"xs" models; ARM models can't run it).
 
-> **Prefer the command line?** Enable **SSH** (Control Panel → Terminal & SNMP),
-> then: `cd /volume1/docker/the-vault && sudo docker compose up -d`.
->
-> **Updating on Synology:** in Container Manager open the project and choose
-> **Action → Build** to re-pull, or run `./update.sh` over SSH.
+1. **Install Container Manager** from **Package Center**.
+2. **Create the app folder.** In **File Station**, create
+   `docker/the-vault` on `volume1` (i.e. `/volume1/docker/the-vault`).
+   > The folder name matters: Docker names your data volume after it
+   > (`the-vault_vault_data`). Pick it once and keep it. See
+   > [Backups and restore](#backups-and-restore).
+3. **Upload three files** into it (download them from GitHub → the file → *Download raw file*):
+   - `docker-compose.yml`
+   - `.env.example` - upload it, then rename it to **`.env`** in File Station
+     (if your computer won't save a file starting with a dot, upload it as
+     `env.txt` and rename it there)
+   - `update.sh`
+4. **Edit `.env`** (right-click → *Open with Text Editor*): set
+   `LIBRARY_HOST_PATH` to your prints share, e.g. `LIBRARY_HOST_PATH=/volume1/STL Archive`
+   (no quotes, spaces are fine), and optionally `CLAUDE_API_KEY`, `WEB_PORT`, `TZ`.
+5. **Start it**, either way:
+   - **Container Manager → Project → Create**: *Project name* `the-vault`
+     (same as the folder), *Path* `/volume1/docker/the-vault`, *Source*: use the
+     existing `docker-compose.yml`, then **Next → Done**. Or
+   - over SSH (Control Panel → Terminal & SNMP → enable SSH):
+     ```sh
+     cd /volume1/docker/the-vault
+     sudo docker compose up -d
+     ```
+6. Open **http://YOUR-NAS-IP:8484** and click **⟳ SCAN LIBRARY**.
+
+The folder now also contains a `backups/` folder (database snapshots, see
+below). Your library share is mounted **read-only**: The Vault never modifies
+your files.
+
+**Updating on Synology:** `sudo sh /volume1/docker/the-vault/update.sh`
+(details in [Updating](#updating-pinning-and-rolling-back)). Upload a newer
+`update.sh`/`docker-compose.yml` with File Station when the release notes say so.
 
 ---
 
@@ -182,7 +198,7 @@ All paths live in the **`.env`** file (copied from `.env.example`). You never
 have to edit `docker-compose.yml` by hand. After changing `.env`, apply it with:
 
 ```sh
-docker-compose up -d
+docker compose up -d        # on Synology: sudo docker compose up -d
 ```
 
 > **How paths work:** The container can only see folders you explicitly give it.
@@ -190,7 +206,7 @@ docker-compose up -d
 > container, and the app scans everything under `/library`. The Scan dialog shows
 > the folders it can currently see, so you can confirm a mount worked.
 
-### The easy way — `add-library.sh`
+### The easy way - `add-library.sh`
 
 To **add an extra** library folder (local or on another NAS over SMB) without
 editing config by hand, use the helper script. It writes a
@@ -198,21 +214,29 @@ editing config by hand, use the helper script. It writes a
 primary library, then restarts. Run it from your project folder:
 
 ```sh
-./add-library.sh            # interactive — pick local or SMB and answer the prompts
-./add-library.sh --list     # show the extra libraries you've added
+sh add-library.sh            # interactive - pick local or SMB and answer the prompts
+sh add-library.sh --list     # show the extra libraries you've added
 ```
 
 It asks for a label and either a local path or SMB details (server IP, share
-name, username/password). Re-run it any time to add more. SMB credentials are
-written to the gitignored override file (chmod 600). Prefer to do it by hand?
-The sections below show the manual `.env` route.
+name, username/password). Re-run it any time to add more. Its records
+(`.vault-libraries`) and the override file are created private (chmod 600)
+because they can hold SMB credentials. Prefer to do it by hand? The sections
+below show the manual `.env` route.
+
+> **Network shares on Synology - preferred way:** mount the other NAS's share in
+> DSM first (**File Station → Tools → Mount Remote Folder → CIFS Shared Folder**,
+> e.g. to `/volume1/remote/endor`), then add that mount point as a *local* folder
+> (choice 1). DSM stores the password and reconnects after reboots, and there
+> are no restrictions on password characters. The script's SMB option refuses
+> passwords containing a comma (Docker's CIFS options are comma-separated).
 
 > On a NAS without `git`, fetch just the script first:
-> `wget -O add-library.sh https://raw.githubusercontent.com/caseyi/The-Vault/main/add-library.sh && chmod +x add-library.sh`
+> `wget -O add-library.sh https://raw.githubusercontent.com/caseyi/The-Vault/main/add-library.sh`
 
 ### A folder on this machine
 
-This is the common case — your prints are on the same NAS/host that runs Docker.
+This is the common case - your prints are on the same NAS/host that runs Docker.
 Set these two values in `.env`:
 
 ```ini
@@ -220,7 +244,7 @@ LIBRARY_HOST_PATH=/volume1/STL Archive   # the real path on your NAS
 LIBRARY_NAME=STL Archive                 # the label shown in the app
 ```
 
-Spaces are fine — do **not** wrap the value in quotes.
+Spaces are fine - do **not** wrap the value in quotes.
 
 ### A second local folder
 
@@ -238,12 +262,14 @@ LIBRARY2_NAME=More Prints
       - ${LIBRARY2_HOST_PATH}:/library/${LIBRARY2_NAME:-More Prints}:ro
 ```
 
-Run `docker-compose up -d` again.
+Run `docker compose up -d` again.
 
 ### A folder on another NAS over SMB / CIFS
 
-If your prints live on a **different** NAS reached over the network, mount its
-SMB/CIFS share straight into the container. Fill in the `SMB_*` values in `.env`:
+If your prints live on a **different** NAS reached over the network, the most
+robust option on Synology is DSM's *Mount Remote Folder* (see the tip above) plus
+a local-folder entry. Alternatively, mount its SMB/CIFS share straight into the
+container. Fill in the `SMB_*` values in `.env`:
 
 ```ini
 SMB_HOST=192.168.1.50    # the other NAS hostname or IP (no slashes)
@@ -261,14 +287,16 @@ Then in `docker-compose.yml`, **uncomment** two things:
    ```
 2. The whole `smb_library:` block at the bottom of the file.
 
-Apply with `docker-compose up -d`. The share mounts at `/library/<SMB_NAME>` and
+Apply with `docker compose up -d`. The share mounts at `/library/<SMB_NAME>` and
 gets scanned like any local folder.
 
 > **Notes on SMB:** The default options request SMB protocol `vers=3.0`. Older
-> NAS devices may need `vers=2.1` or `vers=1.0` — change it in the `o:` line of
+> NAS devices may need `vers=2.1` or `vers=1.0` - change it in the `o:` line of
 > the `smb_library` block. `uid=1000,gid=1000` make the files readable inside the
 > container. Because `.env` holds the share password in plain text, keep that file
-> private (it is already gitignored).
+> private (it is already gitignored). A password containing a comma can't be used
+> this way; a password containing `$` must be wrapped in single quotes in `.env`
+> (`SMB_PASS='pa$word'`).
 
 ---
 
@@ -294,40 +322,123 @@ creators.
 
 ---
 
-## Updating
+## Updating, pinning and rolling back
 
-Whenever a new version is released, just run:
+Every push to `main` publishes new images tagged `latest` and `sha-<commit>`
+(7 characters, e.g. `sha-1a2b3c4`; builds from before September 2026 use the
+full 40-character commit). Update from the folder that holds
+`docker-compose.yml`:
 
 ```sh
-cd /path/to/the-vault
-./update.sh
+sudo sh update.sh                 # newest build (or whatever VAULT_TAG in .env says)
+sudo sh update.sh sha-1a2b3c4     # pin / roll back to one build
+sudo sh update.sh latest          # stop pinning, follow main again
+sudo sh update.sh pre-update      # undo the last update (previous images are kept locally)
 ```
 
-`update.sh` pulls the latest pre-built images, restarts the containers, and
-prints the URL when it's done. Your database and extracted images live in a named
-Docker volume (`vault_data`) and are **never** wiped by an update.
+`update.sh` (it re-runs itself with `sudo` if needed):
+
+1. notes which Docker volume holds your data and **refuses to continue if this
+   folder would use a different one** (renamed folder / different project name
+   would otherwise start an empty library);
+2. snapshots the database to `backups/vault-pre-update-<date>.db` (keeps 5);
+3. keeps the running images as `:pre-update`, pulls, restarts and waits until
+   healthy;
+4. checks the data volume again (and puts the previous version back if it
+   changed), prints the deployed version/commit, removes old unused images.
+
+A tag argument is saved as `VAULT_TAG=...` in `.env`, so a pinned version stays
+pinned across restarts and Container Manager rebuilds. Build tags are listed at
+<https://github.com/caseyi/The-Vault/pkgs/container/stlvault-backend>.
+
+> Coming from the old script: `./update.sh rollback` is gone (use `pre-update`
+> or a `sha-` tag). Old `:rollback` images can be removed with
+> `sudo docker rmi ghcr.io/caseyi/stlvault-backend:rollback ghcr.io/caseyi/stlvault-frontend:rollback`.
+
+**Container Manager instead of SSH:** *Project → the-vault → Action → Stop*,
+then *Action → Build* re-pulls and restarts; this skips the snapshot and volume
+checks, so prefer `update.sh`.
+
+**Optional weekly auto-update (DSM Task Scheduler):** *Control Panel → Task
+Scheduler → Create → Scheduled Task → User-defined script*. General: user
+**root**. Schedule: weekly, e.g. Sunday 04:00. Task Settings → Run command:
+
+```sh
+sh /volume1/docker/the-vault/update.sh >> /volume1/docker/the-vault/backups/update.log 2>&1
+```
+
+Tick *Send run details by email → only when the script terminates abnormally*
+to hear about failures. Pinned installs (a `sha-` `VAULT_TAG`) stay pinned.
+
+---
+
+## Backups and restore
+
+**What is where**
+
+- Database + extracted images: the Docker volume `<folder>_vault_data`
+  (e.g. `the-vault_vault_data`), stored under `/volume1/@docker/volumes/`,
+  which File Station doesn't show. Find it with
+  `sudo docker volume ls | grep vault_data`.
+- Snapshots: `backups/` next to `docker-compose.yml` (visible in File Station).
+  The backend writes `vault-YYYYMMDD.db` once a day (the newest `BACKUP_KEEP`,
+  default 7, are kept) and `vault-pre-forcescan-<time>.db` before every forced
+  rescan; `update.sh` adds `vault-pre-update-<time>.db`.
+- **Include `/volume1/docker/the-vault` (with `backups/`) in Hyper Backup.**
+  Snapshots hold the database (tags, statuses, collections, notes); extracted
+  images are regenerated by a rescan / re-extract.
+
+Never run `docker compose down -v`: `-v` deletes the data volume.
+
+**Restore a snapshot**
+
+```sh
+cd /volume1/docker/the-vault
+ls backups/                                  # pick one, e.g. vault-20260926.db
+sudo docker compose stop frontend backend
+sudo docker compose run --rm --no-deps --entrypoint sh backend -c '
+  set -e; cd /data
+  for f in vault.db vault.db-wal vault.db-shm; do if [ -f "$f" ]; then cp "$f" "$f.before-restore"; fi; done
+  rm -f vault.db-wal vault.db-shm
+  cp /backups/vault-20260926.db vault.db'
+sudo docker compose up -d
+```
+
+The current database is kept as `vault.db.before-restore` inside the volume.
+(`docker compose run` reuses the backend's volumes, so `/backups` is your
+`backups/` folder.)
+
+---
+
+## Which version am I running?
+
+- The sidebar footer shows the version and the commit it was built from.
+- `http://YOUR-NAS-IP:8484/api/health` returns `version`, `build`, `gitSha`,
+  `buildDate` and whether the library is writable.
+- `update.sh` prints the same after each update, and `VAULT_TAG` in `.env`
+  shows whether you are pinned.
 
 ---
 
 ## AI features (Claude API)
 
 The Vault integrates with the Claude API (Anthropic) for smart library
-management. These features are entirely optional — the app works without a key.
+management. These features are entirely optional - the app works without a key.
 
 Enter your API key in the **Scan** modal (it's stored in your browser's
 localStorage and never saved on the server), or set `CLAUDE_API_KEY` in `.env`.
 
-**Batch auto-tagging** — Generates up to 5 tags per model (creator, franchise,
+**Batch auto-tagging** - Generates up to 5 tags per model (creator, franchise,
 category, FDM/resin) by analysing folder names, file types, and slicer presence.
 Streams progress in real time. Models with resin slicer files (Chitubox, Lychee)
 are tagged "resin"; models with FDM slicer files are tagged "fdm".
 
-**Image finder** — Scores each model's "matchability" based on available metadata
+**Image finder** - Scores each model's "matchability" based on available metadata
 (source URL, creator name, folder naming patterns) and uses Claude with web search
 to find missing thumbnails. Trial mode processes the top 10 candidates first so
 you can check the hit rate before spending more credits.
 
-**Per-model assistant** — Chat with Claude about any model. Quick actions include
+**Per-model assistant** - Chat with Claude about any model. Quick actions include
 "Find Online" (web search across Printables, MMF, Thingiverse, Cults3D), tag
 suggestions, print notes, and organization advice.
 
@@ -335,26 +446,37 @@ suggestions, print notes, and organization advice.
 
 ## Configuration reference
 
-All set in `.env` (host side) — see `.env.example` for the annotated template.
+All set in `.env` (host side) - see `.env.example` for the annotated template.
 
 | Variable | Default | Description |
 |---|---|---|
 | `LIBRARY_HOST_PATH` | `/volume1/STL Archive` | Real path on the host to your primary print folder |
 | `LIBRARY_NAME` | `STL Archive` | Label that folder shows under in the app |
-| `LIBRARY2_HOST_PATH` / `LIBRARY2_NAME` | — | Optional second local folder (also uncomment its compose line) |
-| `SMB_HOST` / `SMB_SHARE` / `SMB_USER` / `SMB_PASS` / `SMB_NAME` | — | Remote NAS over SMB/CIFS (also uncomment the `smb_library` block) |
+| `LIBRARY2_HOST_PATH` / `LIBRARY2_NAME` | - | Optional second local folder (also uncomment its compose line) |
+| `SMB_HOST` / `SMB_SHARE` / `SMB_USER` / `SMB_PASS` / `SMB_NAME` | - | Remote NAS over SMB/CIFS (also uncomment the `smb_library` block) |
 | `WEB_PORT` | `8484` | Host port for the web UI |
-| `CLAUDE_API_KEY` | — | Anthropic API key for AI features (optional) |
+| `VAULT_TAG` | `latest` | Which image build to run (`sha-1a2b3c4` pins; written by `update.sh <tag>`) |
+| `TZ` | `America/Los_Angeles` | Time zone for logs and the daily snapshot |
+| `BACKUP_KEEP` | `7` | How many daily DB snapshots to keep in `backups/` |
+| `CLAUDE_API_KEY` | - | Anthropic API key for AI features (optional) |
 | `CLAUDE_MODEL` | `claude-haiku-4-5-20251001` | Override the Claude model used |
+| `ORGANIZE_SSH_TARGET` | - | e.g. `casey@dagobah`; shown in generated Organize scripts |
+| `ALLOWED_ORIGINS` | Tauri origins | Extra browser origins allowed to call the API (comma list, `*` = any); uncomment in compose |
+| `ARCHIVE_MAX_MB` | `500` | Archives larger than this are never opened for render extraction |
+| `SCRAPER_ALLOW_PRIVATE` | `0` | `1` lets the web scraper fetch LAN/private addresses |
+| `COMPOSE_PROJECT_NAME` | folder name | Only to keep using an existing `<name>_vault_data` volume after moving the folder |
 
-These are set **inside the container** and normally don't need changing:
+These are set **inside the container** (by the image or compose) and normally
+don't need changing:
 
 | Variable | Default | Description |
 |---|---|---|
 | `LIBRARY_PATH` | `/library` | Where all library folders are mounted in the container |
 | `DB_PATH` | `/data/vault.db` | SQLite database location (in the `vault_data` volume) |
 | `IMAGES_DIR` | `/data/images` | Where extracted images are stored |
-| `PORT` | `3001` | Backend port (internal) |
+| `BACKUP_DIR` | `/backups` | Snapshot folder (bind-mounted from `./backups`) |
+| `HOST` / `PORT` | `0.0.0.0` / `3001` | Backend bind address and port (internal) |
+| `GIT_SHA` / `BUILD_DATE` | baked in | Commit and build time of the image |
 
 ---
 
@@ -362,11 +484,42 @@ These are set **inside the container** and normally don't need changing:
 
 **"Path not found" when scanning / a folder is missing from the Scan dialog.**
 The container can't see that folder. Double-check the host path in `.env`, make
-sure you ran `docker-compose up -d` after editing it, and confirm the path exists
-on the host. View what the container sees: `docker exec the-vault-backend-1 ls /library`.
+sure you ran `docker compose up -d` after editing it, and confirm the path exists
+on the host. View what the container sees: `sudo docker compose exec backend ls /library`.
 
-**SMB share won't mount.** Run `docker-compose up -d` and check
-`docker-compose logs backend`. Common fixes: try a different `vers=` (2.1 or 1.0)
+**My library is empty after an update / moving the folder.** Your data is still
+in the old volume. Run `sudo docker volume ls | grep vault_data`; if the volume
+with your data is e.g. `thevault_vault_data`, add `COMPOSE_PROJECT_NAME=thevault`
+to `.env` and run `sudo sh update.sh`. (`update.sh` refuses to switch volumes
+for exactly this reason.)
+
+**Permission denied.** Run Docker commands with `sudo` on Synology (`update.sh`
+does this itself). `backups/` is created by Docker as root; File Station can
+still read and copy the snapshots. Edit `.env` as an administrator.
+
+**Port conflict ("port is already allocated").** DSM itself uses 5000/5001 and
+often 80/443. Set another `WEB_PORT` in `.env` and `sudo docker compose up -d`.
+
+**Behind a reverse proxy (DSM Login Portal → Reverse Proxy, Nginx Proxy
+Manager, …): scan progress only appears at the end, or long tasks stop.**
+Streams send `X-Accel-Buffering: no` and a heartbeat every 15 s, which nginx-based
+proxies honour. If yours still buffers, disable response buffering for the site
+and raise the proxy read timeout (DSM: *Reverse Proxy → Edit → Advanced
+Settings*, e.g. 3600 s). If the proxy rewrites the `Host` header and the app
+answers 403, add the public origin to `ALLOWED_ORIGINS`.
+
+**Large libraries.** The first scan reads every folder and can take a while on
+tens of thousands of models; it runs in the background (minimize the dialog and
+keep browsing). Later scans skip unchanged folders. A *force* rescan re-reads
+everything and takes a DB snapshot first.
+
+**Organize says the library is read-only / gives me a script.** In Docker the
+library is mounted read-only on purpose, so file moves/renames are generated as
+a shell script instead. Review it, then run it on the NAS over SSH (as the user
+that owns the files, e.g. `ORGANIZE_SSH_TARGET`), and rescan.
+
+**SMB share won't mount.** Run `sudo docker compose up -d` and check
+`sudo docker compose logs backend`. Common fixes: try a different `vers=` (2.1 or 1.0)
 in the `smb_library` block, verify the username/password, and make sure the host
 can reach the NAS (`ping SMB_HOST`).
 
@@ -389,43 +542,47 @@ To build images locally instead of pulling from GHCR, edit `docker-compose.yml`:
 ```yaml
 services:
   backend:
-    # image: ghcr.io/caseyi/stlvault-backend:latest  ← comment this out
-    build: ./backend                                   ← uncomment this
+    # image: ghcr.io/caseyi/stlvault-backend:${VAULT_TAG:-latest}  ← comment this out
+    build: ./backend                                                ← uncomment this
   frontend:
-    # image: ghcr.io/caseyi/stlvault-frontend:latest ← comment this out
-    build: ./frontend                                  ← uncomment this
+    # image: ghcr.io/caseyi/stlvault-frontend:${VAULT_TAG:-latest} ← comment this out
+    build: ./frontend                                               ← uncomment this
 ```
 
-Then: `docker-compose up -d --build`
+Then: `docker compose up -d --build`
 
-Run the test suites:
+Run the test suites (Node 22.13+; lockfiles are committed, so use `npm ci`):
 
 ```sh
-# Backend (Jest)
-cd backend && npm install && npm test
-
-# Frontend (React Testing Library)
-cd frontend && npm install && CI=true npm test
+cd backend && npm ci && npm test              # Jest
+cd frontend && npm ci && CI=true npm test      # React Testing Library
+node .github/scripts/smoke-scan.js             # boots the backend and scans a fixture
 ```
 
 ---
 
 ## CI / CD
 
-Pushing to `main` (or pushing a `v*` tag) triggers the GitHub Actions workflow
-at `.github/workflows/docker-publish.yml`, which:
+`.github/workflows/docker-publish.yml` runs on every pull request and every
+push to `main` or a `v*` tag:
 
-1. Builds `stlvault-backend` and `stlvault-frontend` Docker images
-2. Pushes them to `ghcr.io/caseyi/stlvault-{backend,frontend}:latest`
-3. Also tags each image with `sha-<commit>` for rollback
+1. **test** - backend Jest, frontend tests, and a real scan smoke test.
+2. **images** - builds both images, starts them together, waits for health,
+   scans a fixture library through the API, checks the frontend proxies `/api`
+   and doesn't log API keys. Only then, and only for `main`/tags, pushes
+   `ghcr.io/caseyi/stlvault-{backend,frontend}` as `latest` + `sha-<7 chars>`
+   (and `X.Y.Z` / `X.Y` for `vX.Y.Z` tags). Pull requests never push.
 
-The images are public and require no authentication to pull.
+`backend-smoke.yml` repeats the scan smoke test on Linux, macOS and Windows,
+`native-build.yml` builds the desktop app on `native-v*` tags, and Dependabot
+opens grouped monthly update PRs. The images are public and need no login to
+pull.
 
 ---
 
 ## License
 
-The Vault is open source under the [MIT License](LICENSE) — free to use, modify,
+The Vault is open source under the [MIT License](LICENSE) - free to use, modify,
 and share. It's offered as-is, with no warranty. If it's useful to you, a
 donation is appreciated but never required (see below).
 
@@ -436,9 +593,9 @@ donation is appreciated but never required (see below).
 The Vault is built and maintained in spare time and given away for free. If it
 saved you some headaches organising your print library, you can chip in:
 
-> **If you like The Vault, please feel free to donate with the Sponsors button — and if you have suggestions or hit a bug, [open a GitHub issue](https://github.com/caseyi/The-Vault/issues) on this repo!**
+> **If you like The Vault, please feel free to donate with the Sponsors button - and if you have suggestions or hit a bug, [open a GitHub issue](https://github.com/caseyi/The-Vault/issues) on this repo!**
 
-- **GitHub Sponsors** — use the **Sponsor ❤** button at the top of the repo
+- **GitHub Sponsors** - use the **Sponsor ❤** button at the top of the repo
   (one-time or recurring, no fees).
 
 Either way, ⭐ starring the repo and filing good bug reports helps just as much.

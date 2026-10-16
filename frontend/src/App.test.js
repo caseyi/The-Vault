@@ -80,4 +80,35 @@ describe('App', () => {
     // Library section should be gone when sidebar is collapsed
     expect(screen.queryByText('Library')).not.toBeInTheDocument();
   });
+
+  test('clicking the logo clears active filters and returns to the gallery', async () => {
+    render(<App />);
+    await waitFor(() => expect(screen.getByText('Printed')).toBeInTheDocument());
+    fireEvent.click(screen.getByText('Printed'));
+    const bar = await screen.findByLabelText('Active filters');
+    expect(bar).toHaveTextContent('printed');
+    fireEvent.click(screen.getByText('THE').closest('button'));
+    await waitFor(() => expect(screen.queryByLabelText('Active filters')).not.toBeInTheDocument());
+  });
+
+  test('shows the short git sha from /api/health next to the version', async () => {
+    const base = global.fetch;
+    global.fetch = jest.fn((url, o) => url.includes('/api/health')
+      ? Promise.resolve({ ok: true, json: () => Promise.resolve({ ok: true, version: '0.2.0', build: 88, gitSha: '1a2b3c4d5e6f', libraryWritable: false }) })
+      : base(url, o));
+    render(<App />);
+    const link = await screen.findByRole('link', { name: '1a2b3c4' });
+    expect(link).toHaveAttribute('href', 'https://github.com/caseyi/The-Vault/commit/1a2b3c4d5e6f');
+    expect(screen.getByText(/v0\.2\.0\.88/)).toBeInTheDocument();
+  });
+
+  test('hides the sha when the build reports gitSha "dev"', async () => {
+    const base = global.fetch;
+    global.fetch = jest.fn((url, o) => url.includes('/api/health')
+      ? Promise.resolve({ ok: true, json: () => Promise.resolve({ ok: true, version: '0.2.0', build: 88, gitSha: 'dev' }) })
+      : base(url, o));
+    render(<App />);
+    await screen.findByText(/v0\.2\.0\.88/);
+    expect(screen.queryByRole('link', { name: /^[0-9a-f]{7}$/ })).not.toBeInTheDocument();
+  });
 });

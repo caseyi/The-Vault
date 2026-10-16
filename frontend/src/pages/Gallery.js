@@ -1,31 +1,35 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useRef, useMemo, memo } from 'react';
+import { apiGet, apiSend, errorMessage, isAbortError } from '../api';
+import { useNotify } from '../components/Notices';
+import { activeFilterChips, EMPTY_FILTERS } from '../filters';
 
 const STATUS_ICONS = {
   unprinted: '○', sliced: '◑', printing: '◕', printed: '●', painted: '★', failed: '✗'
 };
 
 const STATUS_OPTIONS = ['unprinted', 'sliced', 'printing', 'printed', 'painted', 'failed'];
-const STATUS_COLORS = {
-  unprinted: '#4a4a5a', sliced: '#5b9bd5', printing: '#d4aa4c',
-  printed: '#4caf7d', painted: '#9b72cf', failed: '#cf7272'
-};
 
-function ModelCard({ model, onClick, bulkMode, selected, onToggle, onHide, onFavorite }) {
+export const SEARCH_DEBOUNCE_MS = 250;
+const PAGE_SIZE = 48;
+
+const ModelCard = memo(function ModelCard({ model, onClick, bulkMode, selected, onToggle, onHide, onFavorite }) {
   const imgs = model.images || [];
   const [imgIdx, setImgIdx] = useState(0);
-  const [hovered, setHovered] = useState(false);
   const [imgLoaded, setImgLoaded] = useState(false);
+  const [imgFailed, setImgFailed] = useState(false);
   const currentImg = imgs[imgIdx] || model.thumbnail_path || imgs[0];
   const isHidden = model.hidden === 1 || model.hidden === true;
   const isFav = model.is_favorite === 1 || model.is_favorite === true;
+  const showImg = currentImg && !imgFailed;
 
-  const handleClick = (e) => {
+  const handleClick = () => {
     if (bulkMode) { onToggle(model.id); return; }
     onClick(model);
   };
 
   const cycleImg = (e, dir) => {
     e.stopPropagation();
+    setImgFailed(false);
     setImgIdx(prev => {
       const next = prev + dir;
       if (next < 0) return imgs.length - 1;
@@ -34,99 +38,54 @@ function ModelCard({ model, onClick, bulkMode, selected, onToggle, onHide, onFav
     });
   };
 
-  const handleHide = (e) => {
-    e.stopPropagation();
-    onHide(model.id, !isHidden);
-  };
+  const handleHide = (e) => { e.stopPropagation(); onHide(model.id, !isHidden); };
+  const handleFav = (e) => { e.stopPropagation(); onFavorite(model.id, !isFav); };
 
-  const handleFav = (e) => {
-    e.stopPropagation();
-    onFavorite(model.id, !isFav);
-  };
+  const cls = ['model-card'];
+  if (selected) cls.push('selected');
+  if (isHidden) cls.push('is-hidden');
 
   return (
-    <div className="model-card" onClick={handleClick}
-      onMouseEnter={() => setHovered(true)} onMouseLeave={() => setHovered(false)}
-      style={{
-        ...(selected ? { borderColor: '#c17f3a', boxShadow: '0 0 0 2px rgba(193,127,58,0.4)' } : {}),
-        ...(isHidden ? { opacity: 0.45 } : {}),
-      }}>
+    <div className={cls.join(' ')} onClick={handleClick}>
+      {/* Full-card button: makes the card focusable and opens it on Enter/Space.
+          Clicks bubble to the card's onClick. */}
+      <button type="button" className="model-card-open"
+        aria-label={bulkMode ? `${selected ? 'Deselect' : 'Select'} ${model.name}` : `Open ${model.name}`}
+        aria-pressed={bulkMode ? selected : undefined} />
       {bulkMode && (
-        <div style={{
-          position: 'absolute', top: 8, left: 8, zIndex: 2,
-          width: 20, height: 20, borderRadius: 4,
-          border: `2px solid ${selected ? '#c17f3a' : '#3f3f4d'}`,
-          background: selected ? '#c17f3a' : 'rgba(13,13,15,0.8)',
-          display: 'flex', alignItems: 'center', justifyContent: 'center',
-          fontSize: 12, color: '#0d0d0f', fontWeight: 'bold'
-        }}>
+        <div className={`card-check ${selected ? 'on' : ''}`} aria-hidden="true">
           {selected ? '✓' : ''}
         </div>
       )}
-      {/* Hidden badge */}
-      {isHidden && (
-        <div style={{
-          position: 'absolute', top: 8, left: 8, zIndex: 2,
-          background: 'rgba(13,13,15,0.85)', borderRadius: 4,
-          padding: '2px 6px', fontSize: 10, color: '#7a7a8c',
-          fontFamily: 'var(--font-mono)', letterSpacing: 0.5,
-          border: '1px solid #3f3f4d', backdropFilter: 'blur(4px)',
-        }}>HIDDEN</div>
-      )}
-      {/* Favorite star — always visible when favorited, else on hover */}
-      {(isFav || hovered) && !bulkMode && (
+      {isHidden && <div className="card-hidden-badge">HIDDEN</div>}
+      {!bulkMode && (
         <button onClick={handleFav} title={isFav ? 'Remove from favorites' : 'Add to favorites'}
-          style={{
-            position: 'absolute', top: 8, right: 8, zIndex: 4,
-            background: 'rgba(13,13,15,0.85)', border: `1px solid ${isFav ? '#d4aa4c' : '#3f3f4d'}`,
-            borderRadius: 4, color: isFav ? '#f0c050' : '#7a7a8c',
-            cursor: 'pointer', fontSize: 13, padding: '3px 6px',
-            lineHeight: 1, backdropFilter: 'blur(4px)',
-          }}>
+          aria-label={isFav ? `Remove ${model.name} from favorites` : `Add ${model.name} to favorites`}
+          aria-pressed={isFav}
+          className={`card-action card-fav ${isFav ? 'on' : 'card-hover-only'}`}>
           {isFav ? '★' : '☆'}
         </button>
       )}
-      {/* Hide/unhide button on hover */}
-      {hovered && !bulkMode && (
+      {!bulkMode && (
         <button onClick={handleHide} title={isHidden ? 'Unhide model' : 'Hide model'}
-          style={{
-            position: 'absolute', top: 8, right: 38, zIndex: 4,
-            background: 'rgba(13,13,15,0.85)', border: '1px solid #3f3f4d',
-            borderRadius: 4, color: isHidden ? '#c17f3a' : '#7a7a8c',
-            cursor: 'pointer', fontSize: 13, padding: '3px 6px',
-            lineHeight: 1, backdropFilter: 'blur(4px)',
-          }}>
+          aria-label={isHidden ? `Unhide ${model.name}` : `Hide ${model.name}`}
+          className={`card-action card-hide card-hover-only ${isHidden ? 'on' : ''}`}>
           {isHidden ? '👁' : '🙈'}
         </button>
       )}
-      {currentImg ? (
+      {showImg ? (
         <img className="model-card-img" src={currentImg} alt={model.name} loading="lazy" decoding="async"
           style={{ opacity: imgLoaded ? 1 : 0 }}
           onLoad={() => setImgLoaded(true)}
-          onError={e => { e.target.style.display = 'none'; e.target.nextSibling.style.display = 'flex'; }} />
-      ) : null}
-      <div className="model-card-no-img" style={{ display: currentImg ? 'none' : 'flex' }}>🧩</div>
-      {/* Image cycle arrows */}
-      {hovered && imgs.length > 1 && !bulkMode && (
+          onError={() => setImgFailed(true)} />
+      ) : (
+        <div className="model-card-no-img">🧩</div>
+      )}
+      {imgs.length > 1 && !bulkMode && (
         <>
-          <button onClick={e => cycleImg(e, -1)} style={{
-            position: 'absolute', top: '30%', left: 4, transform: 'translateY(-50%)',
-            background: 'rgba(13,13,15,0.75)', border: 'none', borderRadius: 4,
-            color: '#e8e8f0', cursor: 'pointer', fontSize: 14, padding: '4px 6px',
-            zIndex: 3, lineHeight: 1, backdropFilter: 'blur(4px)'
-          }}>‹</button>
-          <button onClick={e => cycleImg(e, 1)} style={{
-            position: 'absolute', top: '30%', right: 4, transform: 'translateY(-50%)',
-            background: 'rgba(13,13,15,0.75)', border: 'none', borderRadius: 4,
-            color: '#e8e8f0', cursor: 'pointer', fontSize: 14, padding: '4px 6px',
-            zIndex: 3, lineHeight: 1, backdropFilter: 'blur(4px)'
-          }}>›</button>
-          <div style={{
-            position: 'absolute', top: 8, right: 8, zIndex: 3,
-            background: 'rgba(13,13,15,0.7)', borderRadius: 10,
-            padding: '2px 7px', fontSize: 10, color: '#8899aa',
-            fontFamily: 'var(--font-mono)', backdropFilter: 'blur(4px)'
-          }}>{imgIdx + 1}/{imgs.length}</div>
+          <button onClick={e => cycleImg(e, -1)} className="card-nav prev card-hover-only" aria-label="Previous image">‹</button>
+          <button onClick={e => cycleImg(e, 1)} className="card-nav next card-hover-only" aria-label="Next image">›</button>
+          <div className="card-img-count card-hover-only" aria-hidden="true">{imgIdx + 1}/{imgs.length}</div>
         </>
       )}
       <div className="model-card-body">
@@ -145,9 +104,10 @@ function ModelCard({ model, onClick, bulkMode, selected, onToggle, onHide, onFav
       </div>
     </div>
   );
-}
+});
 
 function BulkActionBar({ selectedIds, onClearSelection, onBulkStatus, onBulkTag, onBulkHide, onSelectAll, totalVisible, collections, onRefreshCollections }) {
+  const notify = useNotify();
   const [showStatusMenu, setShowStatusMenu] = useState(false);
   const [showTagMenu, setShowTagMenu] = useState(false);
   const [showCollectionMenu, setShowCollectionMenu] = useState(false);
@@ -156,80 +116,76 @@ function BulkActionBar({ selectedIds, onClearSelection, onBulkStatus, onBulkTag,
   const [allTags, setAllTags] = useState([]);
   const [saving, setSaving] = useState(false);
 
-  const handleAddToCollection = async (colId) => {
-    setSaving(true); setShowCollectionMenu(false);
-    await fetch(`/api/collections/${colId}/models`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ modelIds: selectedIds }),
-    });
-    setSaving(false);
-    if (onRefreshCollections) onRefreshCollections();
+  const loadCommonTags = async () => {
+    try {
+      const d = await apiGet(`/api/models/common-tags?ids=${selectedIds.join(',')}`);
+      setCommonTags((d && d.commonTags) || []);
+      setAllTags((d && d.allTags) || []);
+    } catch (e) {
+      notify(`Couldn't load tags for the selection: ${errorMessage(e)}`);
+    }
   };
 
-  const handleBulkStatus = async (status) => {
-    setSaving(true); setShowStatusMenu(false);
-    await onBulkStatus(status);
+  const run = async (fn, what) => {
+    setSaving(true);
+    try { await fn(); } catch (e) { notify(`${what} failed: ${errorMessage(e)}`); }
     setSaving(false);
+  };
+
+  const handleAddToCollection = (colId) => {
+    setShowCollectionMenu(false);
+    return run(async () => {
+      await apiSend(`/api/collections/${colId}/models`, 'POST', { modelIds: selectedIds });
+      if (onRefreshCollections) onRefreshCollections();
+    }, 'Add to collection');
+  };
+
+  const handleBulkStatus = (status) => {
+    setShowStatusMenu(false);
+    return run(() => onBulkStatus(status), 'Set status');
   };
 
   const openTagMenu = async () => {
     const open = !showTagMenu;
     setShowTagMenu(open);
     setShowStatusMenu(false);
-    if (open && selectedIds.length) {
-      try {
-        const r = await fetch(`/api/models/common-tags?ids=${selectedIds.join(',')}`);
-        const d = await r.json();
-        setCommonTags(d.commonTags || []);
-        setAllTags(d.allTags || []);
-      } catch {}
-    }
+    setShowCollectionMenu(false);
+    if (open && selectedIds.length) await loadCommonTags();
   };
 
-  const handleAddTag = async () => {
-    if (!tagInput.trim()) return;
-    setSaving(true);
-    await onBulkTag([tagInput.trim().toLowerCase()], []);
-    setTagInput('');
-    // Refresh tag list
-    const r = await fetch(`/api/models/common-tags?ids=${selectedIds.join(',')}`);
-    const d = await r.json();
-    setCommonTags(d.commonTags || []); setAllTags(d.allTags || []);
-    setSaving(false);
+  const handleAddTag = () => {
+    const t = tagInput.trim().toLowerCase();
+    if (!t) return undefined;
+    return run(async () => {
+      await onBulkTag([t], []);
+      setTagInput('');
+      await loadCommonTags();
+    }, 'Add tag');
   };
 
-  const handleRemoveTag = async (tag) => {
-    setSaving(true);
+  const handleRemoveTag = (tag) => run(async () => {
     await onBulkTag([], [tag]);
-    setAllTags(t => t.filter(x => x !== tag));
-    setCommonTags(t => t.filter(x => x !== tag));
-    setSaving(false);
-  };
+    setAllTags(ts => ts.filter(x => x !== tag));
+    setCommonTags(ts => ts.filter(x => x !== tag));
+  }, 'Remove tag');
 
   return (
-    <div style={{
-      background: '#1c1c21', borderTop: '2px solid #c17f3a',
-      padding: '10px 20px', display: 'flex', alignItems: 'center', gap: 12,
-      flexShrink: 0, boxShadow: '0 -8px 24px rgba(0,0,0,0.5)'
-    }}>
-      <div style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: '#c17f3a', whiteSpace: 'nowrap' }}>
-        {selectedIds.length} selected
-      </div>
-      <button onClick={onSelectAll} style={{ background: 'none', border: '1px solid #3f3f4d', borderRadius: 4, color: '#7a7a8c', padding: '4px 10px', cursor: 'pointer', fontSize: 12 }}>
+    <div className="bulk-bar" role="toolbar" aria-label="Bulk actions">
+      <div className="bulk-count">{selectedIds.length} selected</div>
+      <button onClick={onSelectAll} className="bulk-btn bulk-btn-ghost">
         Select all {totalVisible}
       </button>
 
-      <div style={{ position: 'relative' }}>
-        <button onClick={() => { setShowStatusMenu(s => !s); setShowTagMenu(false); }}
-          style={{ background: '#242429', border: '1px solid #3f3f4d', borderRadius: 4, color: '#e8e8f0', padding: '6px 12px', cursor: 'pointer', fontSize: 12 }}>
+      <div className="bulk-menu-wrap">
+        <button onClick={() => { setShowStatusMenu(s => !s); setShowTagMenu(false); setShowCollectionMenu(false); }}
+          aria-expanded={showStatusMenu} aria-haspopup="menu" className="bulk-btn">
           Set Status ▾
         </button>
         {showStatusMenu && (
-          <div style={{ position: 'absolute', bottom: '110%', left: 0, background: '#1c1c21', border: '1px solid #3f3f4d', borderRadius: 6, overflow: 'hidden', minWidth: 140, boxShadow: '0 8px 24px rgba(0,0,0,0.5)', zIndex: 30 }}>
+          <div className="bulk-menu" role="menu">
             {STATUS_OPTIONS.map(s => (
-              <button key={s} onClick={() => handleBulkStatus(s)}
-                style={{ display: 'flex', alignItems: 'center', gap: 8, width: '100%', padding: '7px 12px', background: 'none', border: 'none', color: '#e8e8f0', cursor: 'pointer', fontSize: 12, textAlign: 'left' }}>
-                <span style={{ width: 7, height: 7, borderRadius: '50%', background: STATUS_COLORS[s], flexShrink: 0 }} />
+              <button key={s} role="menuitem" onClick={() => handleBulkStatus(s)} className="bulk-menu-item">
+                <span className={`status-dot dot-${s}`} />
                 {s.charAt(0).toUpperCase() + s.slice(1)}
               </button>
             ))}
@@ -237,41 +193,35 @@ function BulkActionBar({ selectedIds, onClearSelection, onBulkStatus, onBulkTag,
         )}
       </div>
 
-      <div style={{ position: 'relative' }}>
-        <button onClick={openTagMenu}
-          style={{ background: showTagMenu ? 'rgba(193,127,58,0.15)' : '#242429', border: `1px solid ${showTagMenu ? '#c17f3a' : '#3f3f4d'}`, borderRadius: 4, color: '#e8e8f0', padding: '6px 12px', cursor: 'pointer', fontSize: 12 }}>
+      <div className="bulk-menu-wrap">
+        <button onClick={openTagMenu} aria-expanded={showTagMenu} className={`bulk-btn ${showTagMenu ? 'active' : ''}`}>
           🏷 Tags ▾
         </button>
         {showTagMenu && (
-          <div style={{ position: 'absolute', bottom: '110%', left: 0, background: '#1c1c21', border: '1px solid #3f3f4d', borderRadius: 6, padding: 10, minWidth: 240, boxShadow: '0 8px 24px rgba(0,0,0,0.5)', zIndex: 30 }}>
-            {/* Add new tag */}
-            <div style={{ fontSize: 10, fontFamily: 'var(--font-mono)', color: 'var(--text-faint)', marginBottom: 5, letterSpacing: 1 }}>ADD TAG</div>
+          <div className="bulk-menu bulk-tag-menu">
+            <label htmlFor="bulk-tag-input" className="bulk-menu-label">ADD TAG</label>
             <div style={{ display: 'flex', gap: 6, marginBottom: 10 }}>
-              <input value={tagInput} onChange={e => setTagInput(e.target.value)}
+              <input id="bulk-tag-input" value={tagInput} onChange={e => setTagInput(e.target.value)}
                 onKeyDown={e => { if (e.key === 'Enter') handleAddTag(); }}
-                placeholder="tag name" autoFocus
-                style={{ flex: 1, background: '#242429', border: '1px solid #3f3f4d', borderRadius: 4, color: '#e8e8f0', padding: '5px 8px', fontSize: 12, outline: 'none', fontFamily: 'var(--font-body)' }} />
-              <button onClick={handleAddTag} disabled={saving} style={{ background: '#c17f3a', border: 'none', borderRadius: 4, color: '#0d0d0f', padding: '5px 10px', cursor: 'pointer', fontSize: 11, fontFamily: 'var(--font-display)', letterSpacing: 0.5 }}>ADD</button>
+                placeholder="tag name" autoFocus className="bulk-input" />
+              <button onClick={handleAddTag} disabled={saving} className="bulk-add-btn">ADD</button>
             </div>
-            {/* Existing tags to remove */}
             {allTags.length > 0 && (
               <>
-                <div style={{ fontSize: 10, fontFamily: 'var(--font-mono)', color: 'var(--text-faint)', marginBottom: 5, letterSpacing: 1 }}>
-                  REMOVE TAG <span style={{ color: '#4a4a5a' }}>(★ = on all selected)</span>
+                <div className="bulk-menu-label">
+                  REMOVE TAG <span className="bulk-menu-hint">(★ = on all selected)</span>
                 </div>
                 <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
-                  {allTags.map(t => (
-                    <button key={t} onClick={() => handleRemoveTag(t)} disabled={saving}
-                      style={{
-                        display: 'inline-flex', alignItems: 'center', gap: 3,
-                        background: commonTags.includes(t) ? 'rgba(193,127,58,0.15)' : '#242429',
-                        border: `1px solid ${commonTags.includes(t) ? '#c17f3a' : '#3f3f4d'}`,
-                        borderRadius: 3, color: commonTags.includes(t) ? '#c17f3a' : '#7a7a8c',
-                        padding: '3px 7px', cursor: 'pointer', fontSize: 11, fontFamily: 'var(--font-body)'
-                      }}>
-                      {commonTags.includes(t) ? '★ ' : ''}{t} ×
-                    </button>
-                  ))}
+                  {allTags.map(t => {
+                    const common = commonTags.includes(t);
+                    return (
+                      <button key={t} onClick={() => handleRemoveTag(t)} disabled={saving}
+                        aria-label={`Remove tag ${t} from selected models`}
+                        className={`bulk-tag ${common ? 'common' : ''}`}>
+                        {common ? '★ ' : ''}{t} ×
+                      </button>
+                    );
+                  })}
                 </div>
               </>
             )}
@@ -279,19 +229,17 @@ function BulkActionBar({ selectedIds, onClearSelection, onBulkStatus, onBulkTag,
         )}
       </div>
 
-      {/* Add to Collection */}
       {collections && collections.length > 0 && (
-        <div style={{ position: 'relative' }}>
+        <div className="bulk-menu-wrap">
           <button onClick={() => { setShowCollectionMenu(s => !s); setShowStatusMenu(false); setShowTagMenu(false); }}
-            style={{ background: '#242429', border: '1px solid #3f3f4d', borderRadius: 4, color: '#e8e8f0', padding: '6px 12px', cursor: 'pointer', fontSize: 12 }}>
+            aria-expanded={showCollectionMenu} aria-haspopup="menu" className="bulk-btn">
             📁 Collection ▾
           </button>
           {showCollectionMenu && (
-            <div style={{ position: 'absolute', bottom: '110%', left: 0, background: '#1c1c21', border: '1px solid #3f3f4d', borderRadius: 6, overflow: 'hidden', minWidth: 160, boxShadow: '0 8px 24px rgba(0,0,0,0.5)', zIndex: 30 }}>
+            <div className="bulk-menu" role="menu">
               {collections.map(c => (
-                <button key={c.id} onClick={() => handleAddToCollection(c.id)} disabled={saving}
-                  style={{ display: 'flex', alignItems: 'center', gap: 8, width: '100%', padding: '7px 12px', background: 'none', border: 'none', color: '#e8e8f0', cursor: 'pointer', fontSize: 12, textAlign: 'left' }}>
-                  <span style={{ width: 8, height: 8, borderRadius: '50%', background: c.color, flexShrink: 0 }} />
+                <button key={c.id} role="menuitem" onClick={() => handleAddToCollection(c.id)} disabled={saving} className="bulk-menu-item">
+                  <span className="status-dot" style={{ background: c.color }} />
                   {c.name}
                 </button>
               ))}
@@ -300,20 +248,30 @@ function BulkActionBar({ selectedIds, onClearSelection, onBulkStatus, onBulkTag,
         </div>
       )}
 
-      {/* Bulk hide button */}
-      <button onClick={() => onBulkHide(true)}
-        style={{ background: '#242429', border: '1px solid #3f3f4d', borderRadius: 4, color: '#7a7a8c', padding: '6px 12px', cursor: 'pointer', fontSize: 12 }}>
-        🙈 Hide
-      </button>
-      <button onClick={() => onBulkHide(false)}
-        style={{ background: '#242429', border: '1px solid #3f3f4d', borderRadius: 4, color: '#7a7a8c', padding: '6px 12px', cursor: 'pointer', fontSize: 12 }}>
-        👁 Unhide
-      </button>
+      <button onClick={() => run(() => onBulkHide(true), 'Hide')} className="bulk-btn bulk-btn-muted">🙈 Hide</button>
+      <button onClick={() => run(() => onBulkHide(false), 'Unhide')} className="bulk-btn bulk-btn-muted">👁 Unhide</button>
 
-      <div style={{ marginLeft: 'auto', display: 'flex', gap: 8, alignItems: 'center' }}>
-        {saving && <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: '#c17f3a' }}>Saving...</span>}
-        <button onClick={onClearSelection} style={{ background: 'none', border: '1px solid #3f3f4d', borderRadius: 4, color: '#7a7a8c', padding: '5px 12px', cursor: 'pointer', fontSize: 12 }}>Cancel</button>
+      <div className="bulk-right">
+        {saving && <span className="bulk-saving">Saving...</span>}
+        <button onClick={onClearSelection} className="bulk-btn bulk-btn-ghost">Cancel</button>
       </div>
+    </div>
+  );
+}
+
+function FilterChips({ chips, onRemove, onClearAll }) {
+  if (!chips.length) return null;
+  return (
+    <div className="filter-chips" aria-label="Active filters">
+      <span className="filter-chips-label">FILTERS:</span>
+      {chips.map(c => (
+        <span key={c.key} className="filter-chip" title={c.title}>
+          <span className="filter-chip-label">{c.label}</span>
+          {c.value && <span className="filter-chip-value">{c.value}</span>}
+          <button className="filter-chip-x" onClick={() => onRemove(c)} aria-label={`Remove filter ${c.label}${c.value ? ` ${c.value}` : ''}`}>✕</button>
+        </span>
+      ))}
+      <button className="filter-clear-all" onClick={onClearAll}>Clear all</button>
     </div>
   );
 }
@@ -326,96 +284,127 @@ const SORT_OPTIONS = [
   { value: 'status', label: 'Print Status' },
 ];
 
-export default function Gallery({ filters, onFilterChange, onModelClick, showHidden, onRefreshStats, refreshKey, collections, onRefreshCollections }) {
+const CARD_MIN = { small: 150, medium: 200, large: 290 };
+
+function buildParams(filters, showHidden) {
+  return {
+    ...(filters.search && { search: filters.search }),
+    ...(filters.creator && { creator: filters.creator }),
+    ...(filters.status && { status: filters.status }),
+    ...(filters.tags && { tags: filters.tags }),
+    ...(filters.has_thumbnail && { has_thumbnail: '1' }),
+    ...(filters.recently_added && { recently_added: '1' }),
+    ...(filters.franchise && { franchise: filters.franchise }),
+    ...(filters.collection && { collection: filters.collection }),
+    ...(filters.folder && { folder: filters.folder }),
+    ...(filters.favorite && { favorite: '1' }),
+    ...(showHidden && { show_hidden: '1' }),
+  };
+}
+
+export default function Gallery({ filters, onFilterChange, onModelClick, showHidden, onToggleHidden, onRefreshStats, refreshKey, collections, onRefreshCollections, onScanClick }) {
+  const notify = useNotify();
   const [models, setModels] = useState([]);
   const [total, setTotal] = useState(0);
   const [hasMore, setHasMore] = useState(true);
   const [page, setPage] = useState(1);
   const [loading, setLoading] = useState(false);
+  const [loadedOnce, setLoadedOnce] = useState(false);
   const [bulkMode, setBulkMode] = useState(false);
-  const [selectedIds, setSelectedIds] = useState([]);
+  const [selectedIds, setSelectedIds] = useState(() => new Set());
   const [sort, setSort] = useState('creator');
   const [cardSize, setCardSize] = useState(() => {
     try { return localStorage.getItem('vault_card_size') || 'medium'; } catch { return 'medium'; }
   });
   const setSize = (s) => { setCardSize(s); try { localStorage.setItem('vault_card_size', s); } catch {} };
-  const CARD_MIN = { small: 150, medium: 200, large: 290 };
   const sentinelRef = useRef(null);
-  const loadingRef = useRef(false); // avoid double-fires
+  const loadingRef = useRef(false);  // a request (reset or append) is in flight
+  const requestIdRef = useRef(0);    // latest request id; older responses are ignored
+  const abortRef = useRef(null);
 
-  const buildExportUrl = () => {
-    const params = new URLSearchParams({
-      ...(filters.search && { search: filters.search }),
-      ...(filters.creator && { creator: filters.creator }),
-      ...(filters.status && { status: filters.status }),
-      ...(filters.tags && { tags: filters.tags }),
-      ...(filters.has_thumbnail && { has_thumbnail: '1' }),
-      ...(filters.franchise && { franchise: filters.franchise }),
-      ...(filters.collection && { collection: filters.collection }),
-      ...(filters.folder && { folder: filters.folder }),
-      ...(filters.favorite && { favorite: '1' }),
-      ...(showHidden && { show_hidden: '1' }),
-    });
-    return `/api/export?${params}`;
+  // ── Search box: local state, debounced into filters.search ────────────────
+  const [searchText, setSearchText] = useState(filters.search || '');
+  const searchTimer = useRef(null);
+  const lastSentSearch = useRef(filters.search || '');
+  const filtersRef = useRef(filters);
+  filtersRef.current = filters;
+
+  useEffect(() => {
+    // External change (chip ✕, Clear all, logo click) → reflect it in the box
+    if ((filters.search || '') !== lastSentSearch.current) {
+      clearTimeout(searchTimer.current);
+      lastSentSearch.current = filters.search || '';
+      setSearchText(filters.search || '');
+    }
+  }, [filters.search]);
+
+  useEffect(() => () => clearTimeout(searchTimer.current), []);
+
+  const onSearchChange = (value) => {
+    setSearchText(value);
+    clearTimeout(searchTimer.current);
+    searchTimer.current = setTimeout(() => {
+      lastSentSearch.current = value;
+      onFilterChange({ ...filtersRef.current, search: value });
+    }, SEARCH_DEBOUNCE_MS);
   };
 
+  const params = useMemo(() => buildParams(filters, showHidden), [filters, showHidden]);
+
+  const buildExportUrl = () => `/api/export?${new URLSearchParams(params)}`;
+
   const fetchModels = useCallback(async (pageNum, append = false) => {
-    if (loadingRef.current) return;
+    if (append && loadingRef.current) return; // don't stack "load more" on top of a pending request
+    if (abortRef.current) abortRef.current.abort();
+    const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    abortRef.current = controller;
+    const id = ++requestIdRef.current;
     loadingRef.current = true;
     setLoading(true);
     try {
-      const params = new URLSearchParams({
-        page: pageNum, limit: 48,
-        ...(filters.search && { search: filters.search }),
-        ...(filters.creator && { creator: filters.creator }),
-        ...(filters.status && { status: filters.status }),
-        ...(filters.tags && { tags: filters.tags }),
-        ...(filters.has_thumbnail && { has_thumbnail: '1' }),
-        ...(filters.recently_added && { recently_added: '1' }),
-        ...(filters.franchise && { franchise: filters.franchise }),
-        ...(filters.collection && { collection: filters.collection }),
-        ...(filters.folder && { folder: filters.folder }),
-        ...(filters.favorite && { favorite: '1' }),
-        ...(showHidden && { show_hidden: '1' }),
-        sort,
-      });
-      const r = await fetch(`/api/models?${params}`);
-      const data = await r.json();
-      const incoming = data.models || [];
-      if (append) {
-        setModels(prev => [...prev, ...incoming]);
-      } else {
-        setModels(incoming);
+      const qs = new URLSearchParams({ page: pageNum, limit: PAGE_SIZE, ...params, sort });
+      const data = await apiGet(`/api/models?${qs}`, { signal: controller?.signal });
+      if (id !== requestIdRef.current) return; // superseded by a newer request
+      const incoming = (data && data.models) || [];
+      if (append) setModels(prev => [...prev, ...incoming]);
+      else setModels(incoming);
+      setTotal((data && data.total) || 0);
+      setHasMore(!!data && data.page < data.pages);
+    } catch (e) {
+      if (isAbortError(e) || id !== requestIdRef.current) return;
+      notify(`Couldn't load models: ${errorMessage(e)}`);
+      setHasMore(false);
+    } finally {
+      if (id === requestIdRef.current) {
+        loadingRef.current = false;
+        setLoading(false);
+        setLoadedOnce(true);
       }
-      setTotal(data.total || 0);
-      setHasMore(data.page < data.pages);
-    } catch {}
-    setLoading(false);
-    loadingRef.current = false;
-  }, [filters, showHidden, refreshKey, sort]);
+    }
+  }, [params, sort, notify]);
 
   // Reset and reload when filters/sort/showHidden/refreshKey change
   useEffect(() => {
     setPage(1);
     setHasMore(true);
     fetchModels(1, false);
-  }, [filters, sort, showHidden, refreshKey]); // eslint-disable-line
+  }, [params, sort, refreshKey]); // eslint-disable-line
+
+  useEffect(() => () => { if (abortRef.current) abortRef.current.abort(); }, []);
 
   // Load more when page increments (triggered by sentinel)
   useEffect(() => {
-    if (page === 1) return; // handled by filter effect above
+    if (page === 1) return;
     fetchModels(page, true);
   }, [page]); // eslint-disable-line
 
   // IntersectionObserver — fires when sentinel scrolls into view
   useEffect(() => {
     const sentinel = sentinelRef.current;
-    if (!sentinel) return;
+    if (!sentinel) return undefined;
     const observer = new IntersectionObserver(
       ([entry]) => {
-        if (entry.isIntersecting && !loadingRef.current && hasMore) {
-          setPage(p => p + 1);
-        }
+        if (entry.isIntersecting && !loadingRef.current && hasMore) setPage(p => p + 1);
       },
       { rootMargin: '200px' }
     );
@@ -423,184 +412,150 @@ export default function Gallery({ filters, onFilterChange, onModelClick, showHid
     return () => observer.disconnect();
   }, [hasMore]);
 
-  const toggleSelect = (id) => setSelectedIds(prev => prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]);
-  const clearSelection = () => { setSelectedIds([]); setBulkMode(false); };
+  const toggleSelect = useCallback((id) => setSelectedIds(prev => {
+    const next = new Set(prev);
+    if (next.has(id)) next.delete(id); else next.add(id);
+    return next;
+  }), []);
+  const clearSelection = () => { setSelectedIds(new Set()); setBulkMode(false); };
+  const selectedList = useMemo(() => [...selectedIds], [selectedIds]);
 
   const reload = () => { setPage(1); setHasMore(true); fetchModels(1, false); };
 
   const handleBulkStatus = async (status) => {
-    await fetch('/api/models/bulk', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ids: selectedIds, print_status: status })
-    });
+    await apiSend('/api/models/bulk', 'POST', { ids: selectedList, print_status: status });
     reload();
+    if (onRefreshStats) onRefreshStats();
   };
 
   const handleBulkTag = async (tagsAdd, tagsRemove) => {
-    await fetch('/api/models/bulk', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ids: selectedIds, tags_add: tagsAdd, tags_remove: tagsRemove })
-    });
+    await apiSend('/api/models/bulk', 'POST', { ids: selectedList, tags_add: tagsAdd, tags_remove: tagsRemove });
     reload();
   };
 
   const handleBulkHide = async (hide) => {
-    await fetch('/api/models/bulk', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ids: selectedIds, hidden: hide })
-    });
+    await apiSend('/api/models/bulk', 'POST', { ids: selectedList, hidden: hide });
     clearSelection();
     reload();
     if (onRefreshStats) onRefreshStats();
   };
 
-  const handleHideModel = async (id, hide) => {
-    await fetch(`/api/models/${id}`, {
-      method: 'PATCH', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ hidden: hide })
-    });
-    reload();
-    if (onRefreshStats) onRefreshStats();
-  };
+  const handleHideModel = useCallback(async (id, hide) => {
+    try {
+      await apiSend(`/api/models/${id}`, 'PATCH', { hidden: hide });
+      reload();
+      if (onRefreshStats) onRefreshStats();
+    } catch (e) { notify(`Couldn't ${hide ? 'hide' : 'unhide'} model: ${errorMessage(e)}`); }
+  }, [fetchModels, onRefreshStats, notify]); // eslint-disable-line
 
-  const handleFavorite = async (id, fav) => {
-    // Optimistic update so the star flips instantly
+  const handleFavorite = useCallback(async (id, fav) => {
     setModels(prev => prev.map(m => m.id === id ? { ...m, is_favorite: fav ? 1 : 0 } : m));
-    await fetch(`/api/models/${id}`, {
-      method: 'PATCH', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ is_favorite: fav })
-    });
-    if (onRefreshStats) onRefreshStats();
-    // If we're currently viewing only favorites, drop unfavorited items
-    if (filters.favorite && !fav) reload();
+    try {
+      await apiSend(`/api/models/${id}`, 'PATCH', { is_favorite: fav });
+      if (onRefreshStats) onRefreshStats();
+      if (filtersRef.current.favorite && !fav) reload();
+    } catch (e) {
+      setModels(prev => prev.map(m => m.id === id ? { ...m, is_favorite: fav ? 0 : 1 } : m));
+      notify(`Couldn't update favorite: ${errorMessage(e)}`);
+    }
+  }, [fetchModels, onRefreshStats, notify]); // eslint-disable-line
+
+  const chips = activeFilterChips(filters, { collections });
+  if (showHidden && onToggleHidden) {
+    chips.push({ key: 'show_hidden', label: 'Showing hidden', value: '', clearHidden: true });
+  }
+  const filtered = chips.length > 0;
+  const removeChip = (c) => {
+    if (c.clearHidden) { onToggleHidden(); return; }
+    onFilterChange(c.clear(filtersRef.current));
+  };
+  const clearAll = () => {
+    clearTimeout(searchTimer.current);
+    if (showHidden && onToggleHidden) onToggleHidden();
+    onFilterChange({ ...EMPTY_FILTERS });
   };
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
+    <div className="gallery-page">
       <div className="gallery-header">
         <div className="gallery-title">MODELS</div>
-        <input className="search-input" placeholder="Search models, creators, tags..."
-          value={filters.search} onChange={e => onFilterChange({ ...filters, search: e.target.value })} />
+        <input className="search-input" placeholder="Search models, creators, tags..." aria-label="Search models"
+          type="search" value={searchText} onChange={e => onSearchChange(e.target.value)} />
 
-        {/* Sort dropdown */}
-        <select
-          value={sort}
-          onChange={e => setSort(e.target.value)}
-          style={{
-            background: 'var(--bg3)', border: '1px solid var(--border)',
-            borderRadius: 'var(--radius)', color: 'var(--text-muted)',
-            padding: '6px 8px', cursor: 'pointer', fontSize: 12,
-            fontFamily: 'var(--font-mono)', outline: 'none', flexShrink: 0,
-          }}>
-          {SORT_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
-        </select>
+        <div className="gallery-controls">
+          <select value={sort} onChange={e => setSort(e.target.value)} aria-label="Sort models" className="gallery-select">
+            {SORT_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+          </select>
 
-        {/* Thumbnail size control */}
-        <div style={{ display: 'flex', flexShrink: 0, border: '1px solid var(--border)', borderRadius: 'var(--radius)', overflow: 'hidden' }}
-          title="Thumbnail size">
-          {[['small', 'S'], ['medium', 'M'], ['large', 'L']].map(([val, label]) => (
-            <button key={val} onClick={() => setSize(val)}
-              style={{
-                background: cardSize === val ? 'rgba(193,127,58,0.15)' : 'var(--bg3)',
-                border: 'none', borderRight: val !== 'large' ? '1px solid var(--border)' : 'none',
-                color: cardSize === val ? '#c17f3a' : 'var(--text-muted)',
-                padding: '6px 9px', cursor: 'pointer', fontSize: 11, fontFamily: 'var(--font-mono)',
-              }}>
-              {label}
-            </button>
-          ))}
+          <div className="size-toggle" role="group" aria-label="Thumbnail size" title="Thumbnail size">
+            {[['small', 'S', 'Small'], ['medium', 'M', 'Medium'], ['large', 'L', 'Large']].map(([val, label, full]) => (
+              <button key={val} onClick={() => setSize(val)} aria-label={`${full} thumbnails`} aria-pressed={cardSize === val}
+                className={cardSize === val ? 'active' : ''}>
+                {label}
+              </button>
+            ))}
+          </div>
+
+          <button onClick={() => { setBulkMode(b => !b); setSelectedIds(new Set()); }}
+            aria-pressed={bulkMode} className={`chip-btn ${bulkMode ? 'active' : ''}`}>
+            {bulkMode ? '✕ Cancel' : '⊡ Select'}
+          </button>
+
+          <a href={buildExportUrl()} download className="chip-btn" title="Export current view to CSV">
+            ⬇ CSV
+          </a>
         </div>
-
-        <button onClick={() => { setBulkMode(b => !b); setSelectedIds([]); }}
-          style={{
-            background: bulkMode ? 'rgba(193,127,58,0.15)' : 'var(--bg3)',
-            border: `1px solid ${bulkMode ? '#c17f3a' : 'var(--border)'}`,
-            borderRadius: 'var(--radius)', color: bulkMode ? '#c17f3a' : 'var(--text-muted)',
-            padding: '6px 12px', cursor: 'pointer', fontSize: 12, whiteSpace: 'nowrap', fontFamily: 'var(--font-mono)'
-          }}>
-          {bulkMode ? '✕ Cancel' : '⊡ Select'}
-        </button>
-
-        {/* CSV export */}
-        <a href={buildExportUrl()} download
-          style={{
-            background: 'var(--bg3)', border: '1px solid var(--border)',
-            borderRadius: 'var(--radius)', color: 'var(--text-muted)',
-            padding: '6px 10px', fontSize: 12, fontFamily: 'var(--font-mono)',
-            textDecoration: 'none', whiteSpace: 'nowrap', flexShrink: 0,
-            display: 'flex', alignItems: 'center', gap: 4,
-          }}
-          title="Export current view to CSV">
-          ⬇ CSV
-        </a>
 
         <div className="result-count">{total.toLocaleString()} models</div>
       </div>
 
-      {/* Active tag filters */}
-      {filters.tags && (
-        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, padding: '4px 16px 0', alignItems: 'center' }}>
-          <span style={{ fontSize: 10, fontFamily: 'var(--font-mono)', color: 'var(--text-faint)', letterSpacing: 1, marginRight: 4 }}>TAGS:</span>
-          {filters.tags.split(',').filter(Boolean).map(tag => (
-            <button key={tag} onClick={() => {
-              const remaining = filters.tags.split(',').filter(t => t && t !== tag).join(',');
-              onFilterChange({ ...filters, tags: remaining });
-            }} style={{
-              background: 'rgba(193,127,58,0.15)', border: '1px solid rgba(193,127,58,0.3)',
-              borderRadius: 12, padding: '2px 8px 2px 10px', cursor: 'pointer',
-              fontSize: 11, fontFamily: 'var(--font-mono)', color: 'var(--accent)',
-              display: 'flex', alignItems: 'center', gap: 4,
-            }}>
-              {tag} <span style={{ fontSize: 13, opacity: 0.7 }}>×</span>
-            </button>
-          ))}
-          <button onClick={() => onFilterChange({ ...filters, tags: '' })}
-            style={{ background: 'none', border: 'none', color: 'var(--text-faint)', cursor: 'pointer', fontSize: 9, fontFamily: 'var(--font-mono)', letterSpacing: 1 }}>
-            CLEAR ALL
-          </button>
-        </div>
-      )}
+      <FilterChips chips={chips} onRemove={removeChip} onClearAll={clearAll} />
 
       <div className="gallery-scroll">
-        {models.length === 0 && !loading && (
-          <div className="empty-state">
-            <div className="empty-icon">🗄️</div>
-            <div className="empty-title">VAULT IS EMPTY</div>
-            <div className="empty-msg">
-              {total === 0 ? 'Click "Scan Library" in the sidebar to index your NAS folder.' : 'No models match your current filters.'}
+        {models.length === 0 && !loading && loadedOnce && (
+          filtered ? (
+            <div className="empty-state">
+              <div className="empty-icon">🔍</div>
+              <div className="empty-title">NO MATCHES</div>
+              <div className="empty-msg">No models match these filters.</div>
+              <button className="btn-primary" onClick={clearAll}>Clear filters</button>
             </div>
-          </div>
+          ) : (
+            <div className="empty-state">
+              <div className="empty-icon">🗄️</div>
+              <div className="empty-title">VAULT IS EMPTY</div>
+              <div className="empty-msg">Scan your library folder to index your models and pull preview images.</div>
+              {onScanClick && <button className="btn-primary" onClick={onScanClick}>⟳ Scan library</button>}
+            </div>
+          )
         )}
 
         {models.length > 0 && (
-          <div className="model-grid" style={{ gridTemplateColumns: `repeat(auto-fill, minmax(${CARD_MIN[cardSize]}px, 1fr))` }}>
+          <div className={`model-grid card-${cardSize}`} style={{ gridTemplateColumns: `repeat(auto-fill, minmax(min(${CARD_MIN[cardSize]}px, 100%), 1fr))` }}>
             {models.map(m => (
               <ModelCard key={m.id} model={m} onClick={onModelClick}
-                bulkMode={bulkMode} selected={selectedIds.includes(m.id)}
+                bulkMode={bulkMode} selected={selectedIds.has(m.id)}
                 onToggle={toggleSelect} onHide={handleHideModel} onFavorite={handleFavorite} />
             ))}
           </div>
         )}
 
-        {/* Infinite scroll sentinel */}
         <div ref={sentinelRef} style={{ height: 1 }} />
 
         {loading && (
-          <div style={{ display: 'flex', justifyContent: 'center', padding: '20px 0', gap: 8, alignItems: 'center', color: 'var(--text-faint)', fontFamily: 'var(--font-mono)', fontSize: 11 }}>
+          <div className="gallery-loading">
             <div className="spinner" /> Loading...
           </div>
         )}
         {!loading && !hasMore && models.length > 0 && (
-          <div style={{ textAlign: 'center', padding: '16px 0', fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--text-faint)', letterSpacing: 1 }}>
-            — {total.toLocaleString()} models —
-          </div>
+          <div className="gallery-end">— {total.toLocaleString()} models —</div>
         )}
       </div>
 
-      {bulkMode && selectedIds.length > 0 && (
-        <BulkActionBar selectedIds={selectedIds} onClearSelection={clearSelection}
+      {bulkMode && selectedIds.size > 0 && (
+        <BulkActionBar selectedIds={selectedList} onClearSelection={clearSelection}
           onBulkStatus={handleBulkStatus} onBulkTag={handleBulkTag} onBulkHide={handleBulkHide}
-          onSelectAll={() => setSelectedIds(models.map(m => m.id))} totalVisible={models.length}
+          onSelectAll={() => setSelectedIds(new Set(models.map(m => m.id)))} totalVisible={models.length}
           collections={collections} onRefreshCollections={onRefreshCollections} />
       )}
     </div>

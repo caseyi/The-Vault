@@ -2,6 +2,9 @@ import React, { useState } from 'react';
 import RenderHintPanel from './RenderHintPanel';
 import FolderTree from './FolderTree';
 import TagManager from './TagManager';
+import { useConfirm } from './ConfirmDialog';
+import { useNotify } from './Notices';
+import { apiSend, errorMessage } from '../api';
 
 const COLLAPSED_HEIGHT = 200; // px — show ~6 items before "Show more"
 
@@ -19,8 +22,7 @@ function CollapsibleList({ label, onClear, items, renderItem, activeKey, getKey,
         <div style={{ display: 'flex', gap: 4 }}>
           {extraControls}
           {onClear && (
-            <button onClick={onClear}
-              style={{ background: 'none', border: 'none', color: 'var(--accent)', cursor: 'pointer', fontSize: 9, fontFamily: 'var(--font-mono)', letterSpacing: 1 }}>
+            <button onClick={onClear} className="sec-clear-btn" aria-label={`Clear ${label} filter`}>
               CLEAR
             </button>
           )}
@@ -30,8 +32,8 @@ function CollapsibleList({ label, onClear, items, renderItem, activeKey, getKey,
         {items.map(item => renderItem(item))}
       </div>
       {items.length > 6 && (
-        <button onClick={() => setExpanded(e => !e)}
-          style={{ background: 'none', border: 'none', color: 'var(--text-faint)', cursor: 'pointer', fontSize: 10, fontFamily: 'var(--font-mono)', padding: '3px 0', width: '100%', textAlign: 'left' }}>
+        <button onClick={() => setExpanded(e => !e)} aria-expanded={shouldExpand}
+          className="sec-more-btn">
           {shouldExpand ? '▲ Show less' : `▼ Show all ${items.length}`}
         </button>
       )}
@@ -55,16 +57,44 @@ function useCollapsed(key, defaultOpen = true) {
 }
 
 const STATUS_OPTIONS = [
-  { value: '', label: 'All Models', dot: '#4a4a5a' },
-  { value: 'unprinted', label: 'Unprinted', dot: '#4a4a5a' },
-  { value: 'sliced', label: 'Sliced', dot: '#5b9bd5' },
-  { value: 'printing', label: 'Printing', dot: '#d4aa4c' },
-  { value: 'printed', label: 'Printed', dot: '#4caf7d' },
-  { value: 'painted', label: 'Painted', dot: '#9b72cf' },
-  { value: 'failed', label: 'Failed', dot: '#cf7272' },
+  { value: '', label: 'All Models', dot: 'all' },
+  { value: 'unprinted', label: 'Unprinted', dot: 'unprinted' },
+  { value: 'sliced', label: 'Sliced', dot: 'sliced' },
+  { value: 'printing', label: 'Printing', dot: 'printing' },
+  { value: 'printed', label: 'Printed', dot: 'printed' },
+  { value: 'painted', label: 'Painted', dot: 'painted' },
+  { value: 'failed', label: 'Failed', dot: 'failed' },
 ];
 
-export default function Sidebar({ open, onToggle, stats, creators, tags, filters, onFilterChange, onScanClick, onOrganizeClick, onHomeClick, showHidden, onToggleHidden, appVersion, onRescanCreator, franchises, collections, queueCount, onQueueClick, onWishlistClick, wishlistCount, onCollectionClick, onCollectionsChange, recentlyViewed, onRecentClick, folderTree, onFolderSelect, density, onToggleDensity, theme, onToggleTheme, onTagsChange, scanRunning, scanCount, scanLast }) {
+/** Section header whose title toggles the section open/closed. */
+function SectionToggle({ open, onToggle, children, controls }) {
+  return (
+    <button type="button" className="sec-toggle" onClick={onToggle} aria-expanded={open}>
+      <span className="sec-chevron" aria-hidden="true">{open ? '▾' : '▸'}</span> {children}
+    </button>
+  );
+}
+
+function VersionTag({ appVersion, gitSha }) {
+  if (!appVersion) return null;
+  const sha = gitSha && gitSha !== 'dev' && gitSha !== 'unknown' ? String(gitSha).slice(0, 7) : null;
+  return (
+    <div className="sidebar-version">
+      v{appVersion}
+      {sha && (
+        <>
+          {' · '}
+          <a href={`https://github.com/caseyi/The-Vault/commit/${gitSha}`} target="_blank" rel="noreferrer"
+            title={`Build commit ${gitSha}`}>{sha}</a>
+        </>
+      )}
+    </div>
+  );
+}
+
+export default function Sidebar({ open, onToggle, stats, creators, tags, filters, onFilterChange, onScanClick, onOrganizeClick, onHomeClick, showHidden, onToggleHidden, appVersion, gitSha, isMobile, onRescanCreator, franchises, collections, queueCount, onQueueClick, onWishlistClick, wishlistCount, onCollectionClick, onCollectionsChange, recentlyViewed, onRecentClick, folderTree, onFolderSelect, density, onToggleDensity, theme, onToggleTheme, onTagsChange, scanRunning, scanCount, scanLast }) {
+  const [confirmUi, askConfirm] = useConfirm();
+  const notify = useNotify();
   const [showTagManager, setShowTagManager] = useState(false);
   const [hintCreator, setHintCreator] = useState(null); // { id, name, render_zip_hint }
   const [showAllTags, setShowAllTags] = useState(false);
@@ -82,35 +112,39 @@ export default function Sidebar({ open, onToggle, stats, creators, tags, filters
 
   const handleCreateCollection = async () => {
     if (!newCollectionName.trim()) return;
-    await fetch('/api/collections', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: newCollectionName.trim() }),
-    });
-    setNewCollectionName(''); setShowNewCollection(false);
-    if (onCollectionsChange) onCollectionsChange();
+    try {
+      await apiSend('/api/collections', 'POST', { name: newCollectionName.trim() });
+      setNewCollectionName(''); setShowNewCollection(false);
+      if (onCollectionsChange) onCollectionsChange();
+    } catch (e) { notify(`Couldn't create collection: ${errorMessage(e)}`); }
   };
 
-  const handleDeleteCollection = async (e, id) => {
-    e.stopPropagation();
-    if (!window.confirm('Delete this collection?')) return;
-    await fetch(`/api/collections/${id}`, { method: 'DELETE' });
-    if (onCollectionsChange) onCollectionsChange();
-    if (filters.collection === String(id)) onFilterChange({ ...filters, collection: '' });
+  const handleDeleteCollection = async (c) => {
+    const n = c.model_count || 0;
+    const ok = await askConfirm({
+      title: `Delete collection "${c.name}"?`,
+      message: <p>The collection is removed; its {n} model{n !== 1 ? 's' : ''} stay in your library.</p>,
+      confirmLabel: 'Delete collection',
+      danger: true,
+    });
+    if (!ok) return;
+    try {
+      await apiSend(`/api/collections/${c.id}`, 'DELETE');
+      if (onCollectionsChange) onCollectionsChange();
+      if (filters.collection === String(c.id)) onFilterChange({ ...filters, collection: '' });
+    } catch (e) { notify(`Couldn't delete collection: ${errorMessage(e)}`); }
   };
 
   const COLLECTION_COLORS = ['#5b9bd5', '#4caf7d', '#c17f3a', '#a78bd4', '#cf7272', '#d4aa4c'];
 
-  const handleTogglePin = async (e, c) => {
-    e.stopPropagation();
-    await fetch(`/api/collections/${c.id}`, {
-      method: 'PATCH', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ pinned: !c.pinned }),
-    });
-    if (onCollectionsChange) onCollectionsChange();
+  const handleTogglePin = async (c) => {
+    try {
+      await apiSend(`/api/collections/${c.id}`, 'PATCH', { pinned: !c.pinned });
+      if (onCollectionsChange) onCollectionsChange();
+    } catch (e) { notify(`Couldn't update collection: ${errorMessage(e)}`); }
   };
 
-  const startEditCollection = (e, c) => {
-    e.stopPropagation();
+  const startEditCollection = (c) => {
     setEditingCollectionId(c.id);
     setEditCollectionName(c.name);
   };
@@ -120,11 +154,10 @@ export default function Sidebar({ open, onToggle, stats, creators, tags, filters
     if (editCollectionName.trim() && editCollectionName.trim() !== c.name) body.name = editCollectionName.trim();
     if (color) body.color = color;
     if (Object.keys(body).length) {
-      await fetch(`/api/collections/${c.id}`, {
-        method: 'PATCH', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      });
-      if (onCollectionsChange) onCollectionsChange();
+      try {
+        await apiSend(`/api/collections/${c.id}`, 'PATCH', body);
+        if (onCollectionsChange) onCollectionsChange();
+      } catch (e) { notify(`Couldn't update collection: ${errorMessage(e)}`); }
     }
     setEditingCollectionId(null);
   };
@@ -153,15 +186,20 @@ export default function Sidebar({ open, onToggle, stats, creators, tags, filters
 
   return (
     <>
-      <aside className="sidebar">
+      {confirmUi}
+      <aside className="sidebar" id="app-sidebar" aria-label="Library navigation and filters">
         <div className="sidebar-header">
           {open && (
-            <button className="sidebar-logo" onClick={onHomeClick} style={{ background: 'none', border: 'none', cursor: 'pointer', padding: 0 }}>
+            <button className="sidebar-logo" onClick={onHomeClick} title="Back to all models (clears filters)"
+              style={{ background: 'none', border: 'none', cursor: 'pointer', padding: 0 }}>
               THE <span>VAULT</span>
             </button>
           )}
-          <button className="sidebar-toggle" onClick={onToggle} title={open ? 'Collapse' : 'Expand'}>
-            {open ? '◀' : '▶'}
+          <button className="sidebar-toggle" onClick={onToggle}
+            title={isMobile ? 'Close menu' : open ? 'Collapse' : 'Expand'}
+            aria-label={isMobile ? 'Close menu' : open ? 'Collapse sidebar' : 'Expand sidebar'}
+            aria-expanded={isMobile ? undefined : open} aria-controls="app-sidebar">
+            {isMobile ? '✕' : open ? '◀' : '▶'}
           </button>
         </div>
 
@@ -178,8 +216,7 @@ export default function Sidebar({ open, onToggle, stats, creators, tags, filters
                   </>
                 ) : '⟳ SCAN LIBRARY'}
               </button>
-              <button className="scan-btn" onClick={onOrganizeClick} title="Organize Library"
-                style={{ margin: 0, flex: '0 0 auto', background: 'rgba(193,127,58,0.12)', color: 'var(--accent)', padding: '10px 12px' }}>🗂</button>
+              <button className="scan-btn scan-btn-secondary" onClick={onOrganizeClick} title="Organize Library" aria-label="Organize Library">🗂</button>
             </div>
             {scanRunning && scanLast && (
               <div title={scanLast}
@@ -200,17 +237,14 @@ export default function Sidebar({ open, onToggle, stats, creators, tags, filters
                   <span className="sidebar-stat-val" style={{ color: 'var(--text-faint)' }}>{stats.totalHidden}</span>
                 </div>
               )}
-              <button
-                onClick={onQueueClick}
-                style={{ marginTop: 8, width: '100%', background: queueCount > 0 ? 'rgba(193,127,58,0.12)' : 'var(--bg3)', border: `1px solid ${queueCount > 0 ? 'rgba(193,127,58,0.4)' : 'var(--border)'}`, borderRadius: 4, color: queueCount > 0 ? '#c17f3a' : 'var(--text-muted)', padding: '5px 10px', cursor: 'pointer', fontSize: 12, fontFamily: 'var(--font-body)', display: 'flex', alignItems: 'center', gap: 6 }}>
+              <div className="sidebar-pad">
+              <button onClick={onQueueClick} className={`side-nav-btn ${queueCount > 0 ? 'accent' : ''}`} style={{ marginTop: 8 }}>
                 🖨 Print Queue
-                <span style={{ marginLeft: 'auto', fontFamily: 'var(--font-mono)', fontSize: 10 }}>{queueCount > 0 ? queueCount : ''}</span>
+                <span className="side-nav-count">{queueCount > 0 ? queueCount : ''}</span>
               </button>
-              <button
-                onClick={onWishlistClick}
-                style={{ marginTop: 4, width: '100%', background: wishlistCount > 0 ? 'rgba(91,155,213,0.1)' : 'var(--bg3)', border: `1px solid ${wishlistCount > 0 ? 'rgba(91,155,213,0.4)' : 'var(--border)'}`, borderRadius: 4, color: wishlistCount > 0 ? '#5b9bd5' : 'var(--text-muted)', padding: '5px 10px', cursor: 'pointer', fontSize: 12, fontFamily: 'var(--font-body)', display: 'flex', alignItems: 'center', gap: 6 }}>
+              <button onClick={onWishlistClick} className={`side-nav-btn ${wishlistCount > 0 ? 'blue' : ''}`} style={{ marginTop: 4 }}>
                 ☆ Wishlist
-                <span style={{ marginLeft: 'auto', fontFamily: 'var(--font-mono)', fontSize: 10 }}>{wishlistCount > 0 ? wishlistCount : ''}</span>
+                <span className="side-nav-count">{wishlistCount > 0 ? wishlistCount : ''}</span>
               </button>
               <div style={{ display: 'flex', gap: 4, marginTop: 4 }}>
                 <button
@@ -226,14 +260,16 @@ export default function Sidebar({ open, onToggle, stats, creators, tags, filters
                   {theme === 'light' ? '🌙 Dark' : '☀ Light'}
                 </button>
               </div>
+              </div>
             </div>
 
             <div className="sidebar-section">
               <div className="sidebar-section-label">Filter by Status</div>
               {STATUS_OPTIONS.map(s => (
                 <button key={s.value} className={`status-filter-btn ${filters.status === s.value ? 'active' : ''}`}
+                  aria-pressed={filters.status === s.value}
                   onClick={() => onFilterChange({ ...filters, status: s.value })}>
-                  <span className="dot" style={{ background: s.dot }} />
+                  <span className={`dot dot-${s.dot}`} />
                   {s.label}
                   {s.value && <span style={{ marginLeft: 'auto', fontFamily: 'var(--font-mono)', fontSize: '10px', color: 'var(--text-faint)' }}>{getCount(s.value)}</span>}
                 </button>
@@ -249,7 +285,7 @@ export default function Sidebar({ open, onToggle, stats, creators, tags, filters
                   style={{ color: showHidden ? 'var(--accent)' : 'var(--text-muted)' }}
                   title={showHidden ? 'Hide hidden models' : 'Show hidden models'}
                 >
-                  <span className="dot" style={{ background: showHidden ? '#c17f3a' : '#2a2a35' }} />
+                  <span className={`dot ${showHidden ? 'dot-accent' : 'dot-off'}`} />
                   Show Hidden
                   <span style={{ marginLeft: 'auto', fontFamily: 'var(--font-mono)', fontSize: '10px', color: 'var(--text-faint)' }}>
                     {stats?.totalHidden ?? 0}
@@ -263,9 +299,10 @@ export default function Sidebar({ open, onToggle, stats, creators, tags, filters
               <button
                 className={`status-filter-btn ${filters.favorite ? 'active' : ''}`}
                 onClick={() => onFilterChange({ ...filters, favorite: !filters.favorite })}
-                style={{ color: filters.favorite ? '#f0c050' : 'var(--text-muted)', marginBottom: 2 }}
+                aria-pressed={!!filters.favorite}
+                style={{ color: filters.favorite ? 'var(--yellow-text)' : 'var(--text-muted)', marginBottom: 2 }}
               >
-                <span className="dot" style={{ background: filters.favorite ? '#f0c050' : '#2a2a35' }} />
+                <span className={`dot ${filters.favorite ? 'dot-fav' : 'dot-off'}`} />
                 ★ Favorites
                 <span style={{ marginLeft: 'auto', fontFamily: 'var(--font-mono)', fontSize: '10px', color: 'var(--text-faint)' }}>
                   {stats?.favorites ?? 0}
@@ -275,9 +312,10 @@ export default function Sidebar({ open, onToggle, stats, creators, tags, filters
                 <button
                   className={`status-filter-btn ${filters.recently_added ? 'active' : ''}`}
                   onClick={() => onFilterChange({ ...filters, recently_added: !filters.recently_added })}
-                  style={{ color: filters.recently_added ? '#4caf7d' : 'var(--text-muted)', marginBottom: 2 }}
+                  aria-pressed={!!filters.recently_added}
+                  style={{ color: filters.recently_added ? 'var(--green-text)' : 'var(--text-muted)', marginBottom: 2 }}
                 >
-                  <span className="dot" style={{ background: filters.recently_added ? '#4caf7d' : '#2a2a35' }} />
+                  <span className={`dot ${filters.recently_added ? 'dot-printed' : 'dot-off'}`} />
                   New This Scan
                   <span style={{ marginLeft: 'auto', fontFamily: 'var(--font-mono)', fontSize: '10px', color: 'var(--text-faint)' }}>
                     {stats?.recentlyAdded ?? 0}
@@ -287,9 +325,10 @@ export default function Sidebar({ open, onToggle, stats, creators, tags, filters
               <button
                 className={`status-filter-btn ${filters.has_thumbnail ? 'active' : ''}`}
                 onClick={() => onFilterChange({ ...filters, has_thumbnail: !filters.has_thumbnail })}
-                style={{ color: filters.has_thumbnail ? 'var(--accent)' : 'var(--text-muted)' }}
+                aria-pressed={!!filters.has_thumbnail}
+                style={{ color: filters.has_thumbnail ? 'var(--accent-text)' : 'var(--text-muted)' }}
               >
-                <span className="dot" style={{ background: filters.has_thumbnail ? 'var(--accent)' : '#2a2a35' }} />
+                <span className={`dot ${filters.has_thumbnail ? 'dot-accent' : 'dot-off'}`} />
                 Has Thumbnail
                 <span style={{ marginLeft: 'auto', fontFamily: 'var(--font-mono)', fontSize: '10px', color: 'var(--text-faint)' }}>
                   {stats?.withImages ?? 0}
@@ -320,28 +359,24 @@ export default function Sidebar({ open, onToggle, stats, creators, tags, filters
             {/* Collections */}
             <div className="sidebar-section">
               <div className="sidebar-section-label" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                <span onClick={toggleCollections} style={{ cursor: 'pointer', userSelect: 'none', flex: 1 }}>
-                  <span className="sec-chevron">{collectionsOpen ? '▾' : '▸'}</span> Collections
-                </span>
+                <SectionToggle open={collectionsOpen} onToggle={toggleCollections}>Collections</SectionToggle>
                 <div style={{ display: 'flex', gap: 4 }}>
                   {filters.collection && (
-                    <button onClick={() => onFilterChange({ ...filters, collection: '' })}
-                      style={{ background: 'none', border: 'none', color: 'var(--accent)', cursor: 'pointer', fontSize: 9, fontFamily: 'var(--font-mono)', letterSpacing: 1 }}>
+                    <button onClick={() => onFilterChange({ ...filters, collection: '' })} className="sec-clear-btn" aria-label="Clear collection filter">
                       CLEAR
                     </button>
                   )}
-                  <button onClick={() => { setShowNewCollection(s => !s); }}
-                    style={{ background: 'none', border: 'none', color: 'var(--text-faint)', cursor: 'pointer', fontSize: 13, lineHeight: 1 }}
-                    title="New collection">+</button>
+                  <button onClick={() => { setShowNewCollection(s => !s); }} className="sec-icon-btn"
+                    title="New collection" aria-label="New collection">+</button>
                 </div>
               </div>
               {collectionsOpen && (<>
               {showNewCollection && (
-                <div style={{ display: 'flex', gap: 4, marginBottom: 6 }}>
+                <div style={{ display: 'flex', gap: 4, margin: '0 16px 6px' }}>
                   <input value={newCollectionName} onChange={e => setNewCollectionName(e.target.value)}
                     onKeyDown={e => { if (e.key === 'Enter') handleCreateCollection(); if (e.key === 'Escape') setShowNewCollection(false); }}
-                    placeholder="Collection name" autoFocus
-                    style={{ flex: 1, background: 'var(--bg3)', border: '1px solid var(--border)', borderRadius: 4, color: 'var(--text)', padding: '4px 7px', fontSize: 11, outline: 'none', fontFamily: 'var(--font-body)' }} />
+                    placeholder="Collection name" autoFocus aria-label="New collection name"
+                    style={{ flex: 1, minWidth: 0, background: 'var(--bg3)', border: '1px solid var(--border)', borderRadius: 4, color: 'var(--text)', padding: '4px 7px', fontSize: 11, fontFamily: 'var(--font-body)' }} />
                   <button onClick={handleCreateCollection}
                     style={{ background: 'var(--accent)', border: 'none', borderRadius: 4, color: '#0d0d0f', padding: '4px 8px', cursor: 'pointer', fontSize: 10, fontFamily: 'var(--font-display)' }}>
                     ADD
@@ -352,47 +387,49 @@ export default function Sidebar({ open, onToggle, stats, creators, tags, filters
                 <div className="creator-list" style={{ maxHeight: 220, overflowY: 'auto' }}>
                   {collections.map(c => (
                     editingCollectionId === c.id ? (
-                      <div key={c.id} style={{ padding: '6px 8px', background: 'var(--bg3)', borderRadius: 4, margin: '2px 0' }}>
-                        <input value={editCollectionName} autoFocus
+                      <div key={c.id} style={{ padding: '6px 8px', background: 'var(--bg3)', borderRadius: 4, margin: '2px 16px' }}>
+                        <input value={editCollectionName} autoFocus aria-label={`Rename collection ${c.name}`}
                           onChange={e => setEditCollectionName(e.target.value)}
                           onKeyDown={e => { if (e.key === 'Enter') saveEditCollection(c); if (e.key === 'Escape') setEditingCollectionId(null); }}
-                          style={{ width: '100%', boxSizing: 'border-box', background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 4, color: 'var(--text)', padding: '4px 7px', fontSize: 11, outline: 'none', fontFamily: 'var(--font-body)' }} />
+                          style={{ width: '100%', boxSizing: 'border-box', background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 4, color: 'var(--text)', padding: '4px 7px', fontSize: 11, fontFamily: 'var(--font-body)' }} />
                         <div style={{ display: 'flex', gap: 5, marginTop: 6, alignItems: 'center' }}>
                           {COLLECTION_COLORS.map(col => (
-                            <span key={col} onClick={() => saveEditCollection(c, col)} title="Set color"
-                              style={{ width: 15, height: 15, borderRadius: '50%', background: col, cursor: 'pointer', border: c.color === col ? '2px solid var(--text)' : '2px solid transparent' }} />
+                            <button key={col} type="button" onClick={() => saveEditCollection(c, col)} title="Set color"
+                              aria-label={`Set collection color ${col}`} aria-pressed={c.color === col}
+                              className="color-swatch" style={{ background: col, borderColor: c.color === col ? 'var(--text)' : 'transparent' }} />
                           ))}
                           <button onClick={() => saveEditCollection(c)}
                             style={{ marginLeft: 'auto', background: 'var(--accent)', border: 'none', borderRadius: 4, color: '#0d0d0f', padding: '3px 8px', cursor: 'pointer', fontSize: 10, fontFamily: 'var(--font-display)' }}>SAVE</button>
                         </div>
                       </div>
                     ) : (
-                    <button key={c.id}
-                      className={`creator-btn ${filters.collection === String(c.id) ? 'active' : ''}`}
-                      onClick={() => { onFilterChange({ ...filters, collection: filters.collection === String(c.id) ? '' : String(c.id) }); }}>
-                      {c.cover ? (
-                        <img src={`/images/${c.cover.split('/images/').pop()}`} alt=""
-                          style={{ width: 18, height: 18, borderRadius: 3, objectFit: 'cover', flexShrink: 0, border: `1px solid ${c.color}` }} />
-                      ) : (
-                        <span style={{ width: 8, height: 8, borderRadius: '50%', background: c.color, flexShrink: 0 }} />
-                      )}
-                      <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', flex: 1 }}>{c.name}</span>
-                      <span className="count">{c.model_count}</span>
-                      <span onClick={e => handleTogglePin(e, c)}
-                        style={{ color: c.pinned ? 'var(--accent)' : 'var(--text-faint)', fontSize: 10, padding: '0 2px', opacity: c.pinned ? 1 : 0.6 }}
-                        title={c.pinned ? 'Unpin' : 'Pin to top'}>📌</span>
-                      <span onClick={e => startEditCollection(e, c)}
-                        style={{ color: 'var(--text-faint)', fontSize: 10, padding: '0 2px', opacity: 0.6 }}
-                        title="Rename / recolor">✎</span>
-                      <span onClick={e => handleDeleteCollection(e, c.id)}
-                        style={{ color: 'var(--text-faint)', fontSize: 10, padding: '0 2px', opacity: 0.6 }}
-                        title="Delete collection">✕</span>
-                    </button>
+                    <div key={c.id} className={`collection-row ${filters.collection === String(c.id) ? 'active' : ''}`}>
+                      <button
+                        className={`creator-btn ${filters.collection === String(c.id) ? 'active' : ''}`}
+                        aria-pressed={filters.collection === String(c.id)}
+                        onClick={() => { onFilterChange({ ...filters, collection: filters.collection === String(c.id) ? '' : String(c.id) }); }}>
+                        {c.cover ? (
+                          <img src={`/images/${c.cover.split('/images/').pop()}`} alt=""
+                            style={{ width: 18, height: 18, borderRadius: 3, objectFit: 'cover', flexShrink: 0, border: `1px solid ${c.color}` }} />
+                        ) : (
+                          <span style={{ width: 8, height: 8, borderRadius: '50%', background: c.color, flexShrink: 0 }} />
+                        )}
+                        <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', flex: 1 }}>{c.name}</span>
+                        <span className="count">{c.model_count}</span>
+                      </button>
+                      <button type="button" onClick={() => handleTogglePin(c)} className={`row-icon-btn ${c.pinned ? 'on' : ''}`}
+                        title={c.pinned ? 'Unpin' : 'Pin to top'} aria-label={c.pinned ? `Unpin collection ${c.name}` : `Pin collection ${c.name} to top`}
+                        aria-pressed={!!c.pinned}>📌</button>
+                      <button type="button" onClick={() => startEditCollection(c)} className="row-icon-btn"
+                        title="Rename / recolor" aria-label={`Rename or recolor collection ${c.name}`}>✎</button>
+                      <button type="button" onClick={() => handleDeleteCollection(c)} className="row-icon-btn"
+                        title="Delete collection" aria-label={`Delete collection ${c.name}`}>✕</button>
+                    </div>
                     )
                   ))}
                 </div>
               ) : (
-                <div style={{ fontSize: 11, color: 'var(--text-faint)', padding: '4px 0' }}>
+                <div style={{ fontSize: 11, color: 'var(--text-faint)', padding: '4px 16px' }}>
                   No collections yet. Press + to create one.
                 </div>
               )}
@@ -403,24 +440,21 @@ export default function Sidebar({ open, onToggle, stats, creators, tags, filters
             {tags && tags.length > 0 && (
               <div className="sidebar-section">
                 <div className="sidebar-section-label" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                  <span onClick={toggleTags} style={{ cursor: 'pointer', userSelect: 'none', flex: 1 }}>
-                    <span className="sec-chevron">{tagsOpen ? '▾' : '▸'}</span> Tags
-                  </span>
+                  <SectionToggle open={tagsOpen} onToggle={toggleTags}>Tags</SectionToggle>
                   <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
                     {activeTags.length > 0 && (
-                      <button onClick={() => onFilterChange({ ...filters, tags: '' })}
-                        style={{ background: 'none', border: 'none', color: 'var(--accent)', cursor: 'pointer', fontSize: 9, fontFamily: 'var(--font-mono)', letterSpacing: 1 }}>
+                      <button onClick={() => onFilterChange({ ...filters, tags: '' })} className="sec-clear-btn" aria-label="Clear tag filters">
                         CLEAR
                       </button>
                     )}
                     <button onClick={() => setShowTagManager(true)} title="Manage tags (rename / merge / delete)"
-                      style={{ background: 'none', border: 'none', color: 'var(--text-faint)', cursor: 'pointer', fontSize: 11, lineHeight: 1 }}>
+                      aria-label="Manage tags" className="sec-icon-btn" style={{ fontSize: 11 }}>
                       ⚙
                     </button>
                   </div>
                 </div>
                 {tagsOpen && (
-                <div style={{ maxHeight: showAllTags ? 400 : 200, overflowY: 'auto', padding: '2px 0' }}>
+                <div style={{ maxHeight: showAllTags ? 400 : 200, overflowY: 'auto', padding: '2px 16px' }}>
                   {(() => {
                     const list = showAllTags ? tags : tags.slice(0, 30);
                     const groups = {}; const order = [];
@@ -437,15 +471,8 @@ export default function Sidebar({ open, onToggle, stats, creators, tags, filters
                       const label = m ? m[2] : t.tag;
                       return (
                         <button key={t.tag} onClick={() => toggleTag(t.tag)}
-                          title={t.tag}
-                          style={{
-                            background: isActive ? 'rgba(193,127,58,0.2)' : 'rgba(255,255,255,0.04)',
-                            border: `1px solid ${isActive ? 'var(--accent)' : 'rgba(255,255,255,0.08)'}`,
-                            borderRadius: 12, padding: '3px 10px', cursor: 'pointer',
-                            fontSize: 11, fontFamily: 'var(--font-mono)',
-                            color: isActive ? 'var(--accent)' : 'var(--text-muted)',
-                            whiteSpace: 'nowrap', lineHeight: '18px', transition: 'all 0.15s ease',
-                          }}>
+                          title={t.tag} aria-pressed={isActive}
+                          className={`tag-cloud-chip ${isActive ? 'active' : ''}`}>
                           {label}
                           <span style={{ marginLeft: 4, fontSize: 9, opacity: 0.6 }}>{t.count}</span>
                         </button>
@@ -466,7 +493,7 @@ export default function Sidebar({ open, onToggle, stats, creators, tags, filters
                     <button
                       onClick={() => setShowAllTags(true)}
                       style={{
-                        background: 'none', border: '1px dashed rgba(255,255,255,0.1)',
+                        background: 'none', border: '1px dashed var(--border-bright)',
                         borderRadius: 12, padding: '3px 10px', cursor: 'pointer',
                         fontSize: 10, fontFamily: 'var(--font-mono)', color: 'var(--text-faint)',
                       }}
@@ -483,12 +510,9 @@ export default function Sidebar({ open, onToggle, stats, creators, tags, filters
             {folderTree && folderTree.children && folderTree.children.length > 0 && (
               <div className="sidebar-section">
                 <div className="sidebar-section-label" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                  <span onClick={toggleFolders} style={{ cursor: 'pointer', userSelect: 'none', flex: 1 }}>
-                    <span className="sec-chevron">{foldersOpen ? '▾' : '▸'}</span> Folders
-                  </span>
+                  <SectionToggle open={foldersOpen} onToggle={toggleFolders}>Folders</SectionToggle>
                   {filters.folder && (
-                    <button onClick={() => onFolderSelect && onFolderSelect('')}
-                      style={{ background: 'none', border: 'none', color: 'var(--accent)', cursor: 'pointer', fontSize: 9, fontFamily: 'var(--font-mono)', letterSpacing: 1 }}>
+                    <button onClick={() => onFolderSelect && onFolderSelect('')} className="sec-clear-btn" aria-label="Clear folder filter">
                       CLEAR
                     </button>
                   )}
@@ -496,7 +520,7 @@ export default function Sidebar({ open, onToggle, stats, creators, tags, filters
                 {foldersOpen && (<>
                 {filters.folder && (
                   <div title={filters.folder}
-                    style={{ fontSize: 10, fontFamily: 'var(--font-mono)', color: 'var(--accent)', padding: '0 2px 5px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    style={{ fontSize: 10, fontFamily: 'var(--font-mono)', color: 'var(--accent-text)', padding: '0 16px 5px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                     ▸ {filters.folder.split('/').filter(Boolean).slice(-1)[0]}
                   </div>
                 )}
@@ -511,21 +535,25 @@ export default function Sidebar({ open, onToggle, stats, creators, tags, filters
 
             {/* Creators */}
             <div className="sidebar-section" style={{ overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
-              <div className="sidebar-section-label" onClick={toggleCreators} style={{ cursor: 'pointer', userSelect: 'none' }}>
-                <span className="sec-chevron">{creatorsOpen ? '▾' : '▸'}</span> Creators <span style={{ fontFamily: 'var(--font-mono)', fontSize: 9, color: 'var(--text-faint)' }}>{creators.length}</span>
+              <div className="sidebar-section-label" style={{ display: 'flex', alignItems: 'center' }}>
+                <SectionToggle open={creatorsOpen} onToggle={toggleCreators}>
+                  Creators <span style={{ fontFamily: 'var(--font-mono)', fontSize: 9, color: 'var(--text-faint)' }}>{creators.length}</span>
+                </SectionToggle>
               </div>
               {creatorsOpen && (
               <div className="creator-list" style={{ maxHeight: 260, overflowY: 'auto' }}>
                 <button className={`creator-btn ${filters.creator === '' ? 'active' : ''}`}
+                  aria-pressed={filters.creator === ''}
                   onClick={() => onFilterChange({ ...filters, creator: '' })}>
                   <span>All Creators</span>
                   <span className="count">{stats?.creators ?? ''}</span>
                 </button>
                 {creators.map(c => (
-                  <div key={c.id} style={{ display: 'flex', alignItems: 'center', gap: 2 }}>
+                  <div key={c.id} style={{ display: 'flex', alignItems: 'center', gap: 2, paddingRight: 12 }}>
                     <button
                       className={`creator-btn ${filters.creator === c.name ? 'active' : ''}`}
-                      style={{ flex: 1 }}
+                      aria-pressed={filters.creator === c.name}
+                      style={{ flex: 1, minWidth: 0 }}
                       onClick={() => onFilterChange({ ...filters, creator: c.name })}>
                       <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', flex: 1 }}>{c.name}</span>
                       {c.render_zip_hint && (
@@ -536,6 +564,7 @@ export default function Sidebar({ open, onToggle, stats, creators, tags, filters
                     </button>
                     <button
                       title="Rescan this creator's folder"
+                      aria-label={`Rescan ${c.name}`}
                       onClick={e => handleRescanCreator(e, c)}
                       style={{
                         background: 'none', border: '1px solid transparent',
@@ -547,6 +576,8 @@ export default function Sidebar({ open, onToggle, stats, creators, tags, filters
                     </button>
                     <button
                       title="Configure render ZIP hint / notes"
+                      aria-label={`Render ZIP hint and notes for ${c.name}`}
+                      aria-expanded={hintCreator?.id === c.id}
                       onClick={e => { e.stopPropagation(); setHintCreator(hintCreator?.id === c.id ? null : c); }}
                       style={{
                         background: hintCreator?.id === c.id ? 'rgba(193,127,58,0.15)' : 'none',
@@ -569,19 +600,12 @@ export default function Sidebar({ open, onToggle, stats, creators, tags, filters
                   Recently Viewed
                   <span style={{ fontFamily: 'var(--font-mono)', fontSize: 9, color: 'var(--text-faint)' }}>{recentlyViewed.length}</span>
                 </div>
-                <div style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 3, padding: '0 12px' }}>
                   {recentlyViewed.map(m => (
                     <button
                       key={m.id}
                       onClick={() => onRecentClick && onRecentClick(m)}
-                      style={{
-                        display: 'flex', alignItems: 'center', gap: 7,
-                        background: 'none', border: 'none', borderRadius: 4,
-                        padding: '3px 4px', cursor: 'pointer', textAlign: 'left',
-                        width: '100%',
-                      }}
-                      onMouseEnter={e => e.currentTarget.style.background = 'var(--bg3)'}
-                      onMouseLeave={e => e.currentTarget.style.background = 'none'}
+                      className="recent-btn"
                     >
                       {m.thumbnail_path ? (
                         <img src={m.thumbnail_path} alt="" style={{ width: 28, height: 28, borderRadius: 3, objectFit: 'cover', flexShrink: 0, background: 'var(--bg3)' }} />
@@ -598,11 +622,7 @@ export default function Sidebar({ open, onToggle, stats, creators, tags, filters
               </div>
             )}
 
-            {appVersion && (
-              <div style={{ padding: '8px 16px', fontFamily: 'var(--font-mono)', fontSize: 9, color: 'var(--text-faint)', letterSpacing: 1, textAlign: 'center' }}>
-                v{appVersion}
-              </div>
-            )}
+            <VersionTag appVersion={appVersion} gitSha={gitSha} />
             </div>{/* /.sidebar-scroll */}
           </>
         )}
@@ -610,18 +630,19 @@ export default function Sidebar({ open, onToggle, stats, creators, tags, filters
         {!open && (
           <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '16px', padding: '16px 0' }}>
             <button onClick={onScanClick} title={scanRunning ? 'Scan running — click to view' : 'Scan Library'}
+              aria-label={scanRunning ? 'Scan running — view progress' : 'Scan library'}
               style={{ background: 'none', border: 'none', color: 'var(--accent)', cursor: 'pointer', fontSize: '18px', animation: scanRunning ? 'spin 0.8s linear infinite' : 'none' }}>⟳</button>
-            <button onClick={onOrganizeClick} title="Organize Library" style={{ background: 'none', border: 'none', color: 'var(--accent)', cursor: 'pointer', fontSize: '18px' }}>🗂</button>
-            <button onClick={onHomeClick} title="Gallery" style={{ background: 'none', border: 'none', color: 'var(--text-muted)', cursor: 'pointer', fontSize: '16px' }}>⊞</button>
+            <button onClick={onOrganizeClick} title="Organize Library" aria-label="Organize Library" style={{ background: 'none', border: 'none', color: 'var(--accent)', cursor: 'pointer', fontSize: '18px' }}>🗂</button>
+            <button onClick={onHomeClick} title="Gallery" aria-label="Gallery (all models)" style={{ background: 'none', border: 'none', color: 'var(--text-muted)', cursor: 'pointer', fontSize: '16px' }}>⊞</button>
           </div>
         )}
       </aside>
 
       {/* Render hint flyout — appears as an overlay panel next to sidebar */}
       {hintCreator && open && (
-        <div style={{
-          position: 'fixed', left: 220, top: 0, bottom: 0,
-          width: 360, zIndex: 200, background: 'var(--bg)',
+        <div className="hint-flyout" style={{
+          position: 'fixed', left: 'var(--sidebar-w)', top: 0, bottom: 0,
+          width: 360, maxWidth: '100vw', zIndex: 200, background: 'var(--bg)',
           borderRight: '1px solid var(--border-bright)',
           boxShadow: '4px 0 24px rgba(0,0,0,0.5)',
           overflowY: 'auto', padding: 16,

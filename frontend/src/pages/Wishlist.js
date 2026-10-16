@@ -36,7 +36,7 @@ function WishlistItem({ item, onDelete, onUpdate }) {
 
   return (
     <div style={{
-      background: '#1c1c21', border: '1px solid #2a2a35', borderRadius: 8,
+      background: 'var(--bg3)', border: '1px solid var(--border)', borderRadius: 8,
       padding: '12px 14px', display: 'flex', flexDirection: 'column', gap: 8,
       opacity: item.status === 'got' ? 0.6 : 1,
     }}>
@@ -60,23 +60,23 @@ function WishlistItem({ item, onDelete, onUpdate }) {
               value={name}
               onChange={e => setName(e.target.value)}
               placeholder="Model name (optional)"
-              style={{ width: '100%', background: '#242429', border: '1px solid #3f3f4d', borderRadius: 4, color: '#e8e8f0', padding: '4px 8px', fontSize: 13, outline: 'none', fontFamily: 'var(--font-body)', boxSizing: 'border-box' }}
+              style={{ width: '100%', background: 'var(--bg4)', border: '1px solid var(--border-bright)', borderRadius: 4, color: 'var(--text)', padding: '4px 8px', fontSize: 13, fontFamily: 'var(--font-body)', boxSizing: 'border-box' }}
               autoFocus
             />
           ) : (
-            <div style={{ fontSize: 13, color: item.name ? '#e8e8f0' : '#5a5a6a', fontWeight: item.name ? 500 : 400, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            <div style={{ fontSize: 13, color: item.name ? 'var(--text)' : 'var(--text-faint)', fontWeight: item.name ? 500 : 400, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
               {item.name || '(unnamed)'}
             </div>
           )}
 
           <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 3, flexWrap: 'wrap' }}>
             {item.source_site && (
-              <span style={{ fontSize: 9, fontFamily: 'var(--font-mono)', letterSpacing: 1, color: '#c17f3a', background: 'rgba(193,127,58,0.1)', padding: '1px 5px', borderRadius: 3, border: '1px solid rgba(193,127,58,0.2)', textTransform: 'uppercase' }}>
+              <span style={{ fontSize: 9, fontFamily: 'var(--font-mono)', letterSpacing: 1, color: 'var(--accent-text)', background: 'rgba(193,127,58,0.1)', padding: '1px 5px', borderRadius: 3, border: '1px solid rgba(193,127,58,0.2)', textTransform: 'uppercase' }}>
                 {SITE_LABELS[item.source_site] || item.source_site}
               </span>
             )}
             <a href={item.url} target="_blank" rel="noopener noreferrer"
-              style={{ fontSize: 10, fontFamily: 'var(--font-mono)', color: '#5b9bd5', textDecoration: 'none', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 260 }}
+              style={{ fontSize: 10, fontFamily: 'var(--font-mono)', color: 'var(--blue-text)', textDecoration: 'none', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 260 }}
               title={item.url}>
               {item.url}
             </a>
@@ -88,22 +88,22 @@ function WishlistItem({ item, onDelete, onUpdate }) {
           {editing ? (
             <>
               <button onClick={saveEdit}
-                style={{ background: '#c17f3a', border: 'none', borderRadius: 4, color: '#0d0d0f', padding: '4px 10px', cursor: 'pointer', fontSize: 11, fontFamily: 'var(--font-display)' }}>
+                style={{ background: 'var(--accent)', border: 'none', borderRadius: 4, color: 'var(--on-accent)', padding: '4px 10px', cursor: 'pointer', fontSize: 11, fontFamily: 'var(--font-display)' }}>
                 Save
               </button>
               <button onClick={() => { setEditing(false); setName(item.name || ''); setNotes(item.notes || ''); }}
-                style={{ background: 'none', border: '1px solid #3f3f4d', borderRadius: 4, color: '#7a7a8c', padding: '4px 8px', cursor: 'pointer', fontSize: 11 }}>
+                style={{ background: 'none', border: '1px solid var(--border-bright)', borderRadius: 4, color: 'var(--text-muted)', padding: '4px 8px', cursor: 'pointer', fontSize: 11 }}>
                 ✕
               </button>
             </>
           ) : (
             <>
               <button onClick={() => setEditing(true)} title="Edit"
-                style={{ background: 'none', border: '1px solid #3f3f4d', borderRadius: 4, color: '#7a7a8c', padding: '4px 8px', cursor: 'pointer', fontSize: 11 }}>
+                style={{ background: 'none', border: '1px solid var(--border-bright)', borderRadius: 4, color: 'var(--text-muted)', padding: '4px 8px', cursor: 'pointer', fontSize: 11 }}>
                 ✎
               </button>
               <button onClick={() => onDelete(item.id)} title="Remove from wishlist"
-                style={{ background: 'none', border: '1px solid #3f3f4d', borderRadius: 4, color: '#7a7a8c', padding: '4px 8px', cursor: 'pointer', fontSize: 11 }}>
+                style={{ background: 'none', border: '1px solid var(--border-bright)', borderRadius: 4, color: 'var(--text-muted)', padding: '4px 8px', cursor: 'pointer', fontSize: 11 }}>
                 ✕
               </button>
             </>
@@ -118,10 +118,10 @@ function WishlistItem({ item, onDelete, onUpdate }) {
           onChange={e => setNotes(e.target.value)}
           placeholder="Notes (optional)..."
           rows={2}
-          style={{ width: '100%', background: '#242429', border: '1px solid #3f3f4d', borderRadius: 4, color: '#e8e8f0', padding: '5px 8px', fontSize: 12, outline: 'none', fontFamily: 'var(--font-body)', resize: 'vertical', boxSizing: 'border-box' }}
+          style={{ width: '100%', background: 'var(--bg4)', border: '1px solid var(--border-bright)', borderRadius: 4, color: 'var(--text)', padding: '5px 8px', fontSize: 12, fontFamily: 'var(--font-body)', resize: 'vertical', boxSizing: 'border-box' }}
         />
       ) : item.notes ? (
-        <div style={{ fontSize: 11, color: '#7a7a8c', paddingLeft: 38 }}>{item.notes}</div>
+        <div style={{ fontSize: 11, color: 'var(--text-muted)', paddingLeft: 38 }}>{item.notes}</div>
       ) : null}
     </div>
   );
@@ -187,7 +187,7 @@ export default function Wishlist({ onBack }) {
 
       <div style={{ overflowY: 'auto', flex: 1, padding: '16px 20px', display: 'flex', flexDirection: 'column', gap: 16, maxWidth: 780 }}>
         {/* Add form */}
-        <div style={{ background: '#1c1c21', border: '1px solid #2a2a35', borderRadius: 8, padding: 14, display: 'flex', flexDirection: 'column', gap: 8 }}>
+        <div style={{ background: 'var(--bg3)', border: '1px solid var(--border)', borderRadius: 8, padding: 14, display: 'flex', flexDirection: 'column', gap: 8 }}>
           <div style={{ fontSize: 10, fontFamily: 'var(--font-mono)', color: 'var(--text-faint)', letterSpacing: 1 }}>ADD TO WISHLIST</div>
           <div style={{ display: 'flex', gap: 8 }}>
             <input
@@ -195,18 +195,18 @@ export default function Wishlist({ onBack }) {
               onChange={e => setUrl(e.target.value)}
               onKeyDown={e => { if (e.key === 'Enter') handleAdd(); }}
               placeholder="Paste URL (Printables, Thingiverse, MMF, Cults3D…)"
-              style={{ flex: 2, background: '#242429', border: '1px solid #3f3f4d', borderRadius: 4, color: '#e8e8f0', padding: '7px 10px', fontSize: 13, outline: 'none', fontFamily: 'var(--font-body)' }}
+              style={{ flex: 2, background: 'var(--bg4)', border: '1px solid var(--border-bright)', borderRadius: 4, color: 'var(--text)', padding: '7px 10px', fontSize: 13, fontFamily: 'var(--font-body)' }}
             />
             <input
               value={name}
               onChange={e => setName(e.target.value)}
               onKeyDown={e => { if (e.key === 'Enter') handleAdd(); }}
               placeholder="Name (optional)"
-              style={{ flex: 1, background: '#242429', border: '1px solid #3f3f4d', borderRadius: 4, color: '#e8e8f0', padding: '7px 10px', fontSize: 13, outline: 'none', fontFamily: 'var(--font-body)' }}
+              style={{ flex: 1, background: 'var(--bg4)', border: '1px solid var(--border-bright)', borderRadius: 4, color: 'var(--text)', padding: '7px 10px', fontSize: 13, fontFamily: 'var(--font-body)' }}
             />
             <button onClick={handleAdd} disabled={adding || !url.trim()}
               style={{
-                background: '#c17f3a', border: 'none', borderRadius: 4, color: '#0d0d0f',
+                background: 'var(--accent)', border: 'none', borderRadius: 4, color: 'var(--on-accent)',
                 padding: '7px 18px', cursor: adding || !url.trim() ? 'not-allowed' : 'pointer',
                 fontSize: 12, fontFamily: 'var(--font-display)', letterSpacing: 1,
                 opacity: adding || !url.trim() ? 0.5 : 1,
@@ -223,8 +223,8 @@ export default function Wishlist({ onBack }) {
               <button key={f} onClick={() => setFilter(f)}
                 style={{
                   background: filter === f ? 'rgba(193,127,58,0.15)' : 'var(--bg3)',
-                  border: `1px solid ${filter === f ? '#c17f3a' : 'var(--border)'}`,
-                  borderRadius: 4, color: filter === f ? '#c17f3a' : 'var(--text-muted)',
+                  border: `1px solid ${filter === f ? 'var(--accent)' : 'var(--border)'}`,
+                  borderRadius: 4, color: filter === f ? 'var(--accent-text)' : 'var(--text-muted)',
                   padding: '4px 12px', cursor: 'pointer', fontSize: 11,
                   fontFamily: 'var(--font-mono)', letterSpacing: 0.5,
                 }}>

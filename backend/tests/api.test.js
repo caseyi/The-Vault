@@ -98,7 +98,8 @@ jest.mock('../scanner', () => ({
   }),
   LIBRARY_PATH: '/test/library',
   matchesHint: jest.fn(),
-  pickRenderZips: jest.fn(),
+  pickRenderArchives: jest.fn(),
+  extractImagesFromArchive: jest.fn(),
   analyzeFolder: jest.fn(),
   inferReleaseName: jest.fn(),
 }));
@@ -125,6 +126,11 @@ describe('GET /api/health', () => {
     expect(res.status).toBe(200);
     expect(res.body.ok).toBe(true);
     expect(res.body.libraryPath).toBe('/test/library');
+    // contract fields
+    expect(res.body).toHaveProperty('gitSha');
+    expect(res.body).toHaveProperty('buildDate');
+    expect(typeof res.body.libraryWritable).toBe('boolean');
+    expect(res.body).toHaveProperty('version');
   });
 });
 

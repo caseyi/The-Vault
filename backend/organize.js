@@ -14,13 +14,19 @@
 'use strict';
 
 const express  = require('express');
-const https    = require('https');
 const fs       = require('fs');
 const path     = require('path');
 const db       = require('./db');
 const { pickRenderArchives, analyzeFolder, extractImagesFromArchive } = require('./scanner');
+const { callClaudeAPI, claudeStream } = require('./lib/claude');
+const { confinePath, tryConfine, sendPathError, isSafeSegment } = require('./lib/paths');
+const { openSSE } = require('./lib/sse');
+const { acquireOr409 } = require('./lib/jobs');
+const { shellQuote, toHostPath } = require('./lib/shell');
+const { findSimilarNames, isVariantOnlyName } = require('./lib/similar');
+const { wrapAsyncRoutes } = require('./lib/middleware');
 
-const router = express.Router();
+const router = wrapAsyncRoutes(express.Router());
 
 const LIBRARY_PATH  = process.env.LIBRARY_PATH || '/library';
 const CLAUDE_MODEL  = process.env.CLAUDE_MODEL  || 'claude-haiku-4-5-20251001';
@@ -76,55 +82,26 @@ function similarity(a, b) {
   return maxLen ? 1 - levenshtein(na, nb) / maxLen : 1;
 }
 
-/** Build an https request to the Claude API, return { body, status } */
-function claudeRequest(apiKey, payload) {
-  return new Promise((resolve, reject) => {
-    const body = JSON.stringify(payload);
-    const options = {
-      hostname: 'api.anthropic.com',
-      path: '/v1/messages',
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': apiKey,
-        'anthropic-version': '2023-06-01',
-        'Content-Length': Buffer.byteLength(body),
-      },
-    };
-    const req = https.request(options, (res) => {
-      let data = '';
-      res.on('data', c => { data += c; });
-      res.on('end', () => resolve({ status: res.statusCode, body: data }));
-    });
-    req.on('error', reject);
-    req.write(body);
-    req.end();
-  });
+/** Escape LIKE wildcards (use with ESCAPE '\\'). */
+const likeEscape = (v) => String(v).replace(/[\\%_]/g, '\\$&');
+
+/** Confine a request path or answer 400/403. Returns the path, or null if a response was sent. */
+function confinedOr4xx(res, p) {
+  try { return confinePath(p); } catch (e) { if (sendPathError(res, e)) return null; throw e; }
 }
 
-/** Build a streaming https request; calls onChunk(chunk) for each data chunk */
-function claudeStream(apiKey, payload, onChunk) {
-  return new Promise((resolve, reject) => {
-    const body = JSON.stringify({ ...payload, stream: true });
-    const options = {
-      hostname: 'api.anthropic.com',
-      path: '/v1/messages',
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': apiKey,
-        'anthropic-version': '2023-06-01',
-        'Content-Length': Buffer.byteLength(body),
-      },
-    };
-    const req = https.request(options, (res) => {
-      res.on('data', chunk => onChunk(chunk.toString()));
-      res.on('end', resolve);
-    });
-    req.on('error', reject);
-    req.write(body);
-    req.end();
-  });
+/**
+ * Find ONE model by name for an AI directive: exact (case-insensitive) match
+ * first; otherwise a LIKE match only when it is unambiguous. Never guesses.
+ */
+function findModelByName(name, cols = 'id, name') {
+  const n = String(name || '').trim();
+  if (!n) return null;
+  const exact = db.prepare(`SELECT ${cols} FROM models WHERE name = ? COLLATE NOCASE AND (hidden IS NULL OR hidden = 0) LIMIT 2`).all(n);
+  if (exact.length === 1) return exact[0];
+  if (exact.length > 1) return null; // ambiguous
+  const fuzzy = db.prepare(`SELECT ${cols} FROM models WHERE name LIKE ? ESCAPE '\\' AND (hidden IS NULL OR hidden = 0) LIMIT 2`).all(`%${likeEscape(n)}%`);
+  return fuzzy.length === 1 ? fuzzy[0] : null;
 }
 
 // ── snapshot ──────────────────────────────────────────────────────────────────
@@ -149,12 +126,12 @@ router.get('/snapshot', (req, res) => {
   const params = [];
 
   if (creator) {
-    query += ' AND c.name LIKE ?';
-    params.push(`%${creator}%`);
+    query += " AND c.name LIKE ? ESCAPE '\\'";
+    params.push(`%${likeEscape(creator)}%`);
   }
   if (pathFilter) {
-    query += ' AND m.folder_path LIKE ?';
-    params.push(`%${pathFilter}%`);
+    query += " AND m.folder_path LIKE ? ESCAPE '\\'";
+    params.push(`%${likeEscape(pathFilter)}%`);
   }
 
   query += ' ORDER BY c.name, m.name';
@@ -215,8 +192,8 @@ router.post('/auto-annotate', async (req, res) => {
       WHERE (m.hidden IS NULL OR m.hidden = 0)
     `;
     const params = [];
-    if (creator) { query += ' AND c.name LIKE ?'; params.push(`%${creator}%`); }
-    if (pathFilter) { query += ' AND m.folder_path LIKE ?'; params.push(`%${pathFilter}%`); }
+    if (creator) { query += " AND c.name LIKE ? ESCAPE '\\'"; params.push(`%${likeEscape(creator)}%`); }
+    if (pathFilter) { query += " AND m.folder_path LIKE ? ESCAPE '\\'"; params.push(`%${likeEscape(pathFilter)}%`); }
     if (Array.isArray(modelIds) && modelIds.length) {
       query += ` AND m.id IN (${modelIds.map(() => '?').join(',')})`;
       params.push(...modelIds);
@@ -275,13 +252,12 @@ Rules:
 
   const userContent = `Here is my 3D print library snapshot. Generate organisational directives — focusing on franchise assignment for unassigned models and adding missing tags:\n\n${snapshot}`;
 
-  // Set up SSE
-  res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('Connection', 'keep-alive');
-  res.flushHeaders();
-
-  const send = (data) => res.write(`data: ${JSON.stringify(data)}\n\n`);
+  // One AI batch job at a time; stop (and stop paying) when the client leaves
+  const release = acquireOr409(res, 'auto-annotate');
+  if (!release) return;
+  const sse = openSSE(req, res);
+  sse.onAbort(release);
+  const send = (data) => sse.send(data);
 
   try {
     let buffer = '';
@@ -318,16 +294,18 @@ Rules:
           }
         } catch {}
       }
-    });
+    }, { signal: sse.signal });
 
     // Flush any remaining
     if (buffer.trim()) send({ type: 'directive', text: buffer.trim() });
     send({ type: 'done' });
   } catch (e) {
     send({ type: 'error', message: e.message });
+  } finally {
+    release();
   }
 
-  res.end();
+  sse.end();
 });
 
 // ── annotate preview / apply ──────────────────────────────────────────────────
@@ -353,9 +331,8 @@ router.post('/annotate/preview', (req, res) => {
     let m = line.match(/^FRANCHISE:\s*(.+?)\s*(?:→|->|>)\s*(.+)$/i);
     if (m) {
       const modelName = m[1].trim(), franchise = m[2].trim();
-      const model = db.prepare(`SELECT id, name, franchise FROM models WHERE name = ? OR name LIKE ? LIMIT 1`)
-        .get(modelName, `%${modelName}%`);
-      changes.push({ type: 'FRANCHISE', directive: line, modelName, franchise, modelId: model?.id, current: model?.franchise || null, found: !!model });
+      const model = findModelByName(modelName, 'id, name, franchise');
+      changes.push({ type: 'FRANCHISE', directive: line, modelName, franchise, id: model?.id, modelId: model?.id, matchedName: model?.name || null, current: model?.franchise || null, found: !!model });
       continue;
     }
 
@@ -363,9 +340,8 @@ router.post('/annotate/preview', (req, res) => {
     m = line.match(/^RENAME:\s*(.+?)\s*(?:→|->|>)\s*(.+)$/i);
     if (m) {
       const oldName = m[1].trim(), newName = m[2].trim();
-      const model = db.prepare(`SELECT id, name FROM models WHERE name = ? OR name LIKE ? LIMIT 1`)
-        .get(oldName, `%${oldName}%`);
-      changes.push({ type: 'RENAME', directive: line, oldName, newName, modelId: model?.id, current: model?.name || null, found: !!model });
+      const model = findModelByName(oldName);
+      changes.push({ type: 'RENAME', directive: line, oldName, newName, id: model?.id, modelId: model?.id, matchedName: model?.name || null, current: model?.name || null, found: !!model });
       continue;
     }
 
@@ -373,9 +349,9 @@ router.post('/annotate/preview', (req, res) => {
     m = line.match(/^MERGE:\s*(.+?)\s*(?:→|->|>)\s*(.+)$/i);
     if (m) {
       const srcName = m[1].trim(), targetName = m[2].trim();
-      const src = db.prepare(`SELECT id, name FROM models WHERE name = ? OR name LIKE ? LIMIT 1`).get(srcName, `%${srcName}%`);
-      const target = db.prepare(`SELECT id, name FROM models WHERE name = ? OR name LIKE ? LIMIT 1`).get(targetName, `%${targetName}%`);
-      changes.push({ type: 'MERGE', directive: line, srcName, targetName, srcId: src?.id, targetId: target?.id, found: !!(src && target) });
+      const src = findModelByName(srcName);
+      const target = findModelByName(targetName);
+      changes.push({ type: 'MERGE', directive: line, srcName, targetName, id: src?.id, srcId: src?.id, targetId: target?.id, found: !!(src && target) });
       continue;
     }
 
@@ -384,10 +360,9 @@ router.post('/annotate/preview', (req, res) => {
     if (m) {
       const modelName = m[1].trim(), tagsRaw = m[2].trim();
       const tags = tagsRaw.split(',').map(t => t.trim()).filter(Boolean);
-      const model = db.prepare(`SELECT id, name, tags FROM models WHERE name = ? OR name LIKE ? LIMIT 1`)
-        .get(modelName, `%${modelName}%`);
+      const model = findModelByName(modelName, 'id, name, tags');
       const currentTags = (() => { try { return JSON.parse(model?.tags || '[]'); } catch { return []; } })();
-      changes.push({ type: 'TAG', directive: line, modelName, tags, modelId: model?.id, current: currentTags, found: !!model });
+      changes.push({ type: 'TAG', directive: line, modelName, tags, id: model?.id, modelId: model?.id, matchedName: model?.name || null, current: currentTags, found: !!model });
       continue;
     }
   }
@@ -405,73 +380,79 @@ router.post('/annotate/preview', (req, res) => {
 
 /**
  * POST /api/organize/annotate/apply
- * Body: { directives: string[], types?: string[] }   (types filters which directive types to apply)
+ * Body: { changes?: previewChange[], directives?: string[], types?: string[] }
  *
- * Applies the directives to the DB. RENAME only updates the `name` column.
+ * Preferred: pass `changes` straight from /annotate/preview — each item is
+ * applied to the model ID the preview resolved (id / modelId), so what you
+ * reviewed is exactly what gets written. Legacy: `directives` are re-parsed and
+ * matched by name (exact, or an unambiguous partial match — never a guess).
+ * RENAME only updates the `name` column (and locks it against rescans).
  * MERGE is advisory only (flagged, not applied). Returns a summary.
  */
 router.post('/annotate/apply', (req, res) => {
-  const { directives = [], types = ['FRANCHISE', 'RENAME', 'TAG'] } = req.body || {};
+  const { directives = [], changes, types = ['FRANCHISE', 'RENAME', 'TAG'] } = req.body || {};
+  if (changes !== undefined && !Array.isArray(changes)) return res.status(400).json({ error: 'changes must be an array' });
   if (!Array.isArray(directives)) return res.status(400).json({ error: 'directives must be an array' });
+  if (!Array.isArray(types)) return res.status(400).json({ error: 'types must be an array' });
 
   const results = { applied: 0, skipped: 0, errors: [], details: [] };
+  const getById = db.prepare('SELECT id, name, tags FROM models WHERE id = ?');
+  const setFranchise = db.prepare(`UPDATE models SET franchise = ?, updated_at = datetime('now') WHERE id = ?`);
+  const setName = db.prepare(`UPDATE models SET name = ?, name_locked = 1, updated_at = datetime('now') WHERE id = ?`);
+  const setTags = db.prepare(`UPDATE models SET tags = ?, updated_at = datetime('now') WHERE id = ?`);
+
+  // Normalise both input styles to { type, model, value }
+  const ops = [];
+  if (Array.isArray(changes)) {
+    for (const c of changes) {
+      const type = String(c?.type || '').toUpperCase();
+      const id = c?.id ?? c?.modelId ?? c?.srcId;
+      if (type === 'MERGE') { ops.push({ type, advisory: true, text: c.directive || '' }); continue; }
+      const model = id != null ? getById.get(id) : null;
+      if (type === 'FRANCHISE') ops.push({ type, model, label: c.modelName, value: String(c.franchise || '').trim() });
+      else if (type === 'RENAME') ops.push({ type, model, label: c.oldName, value: String(c.newName || '').trim() });
+      else if (type === 'TAG') ops.push({ type, model, label: c.modelName, value: (Array.isArray(c.tags) ? c.tags : []).map(t => String(t).trim()).filter(Boolean) });
+      else ops.push({ type: 'OTHER' });
+    }
+  } else {
+    for (const raw of directives) {
+      const line = String(raw || '').trim();
+      if (!line || line.startsWith('#')) continue;
+      let m = line.match(/^(FRANCHISE|RENAME|TAG|MERGE):\s*(.+?)\s*(?:→|->|>)\s*(.+)$/i);
+      if (!m) { ops.push({ type: 'OTHER' }); continue; }
+      const type = m[1].toUpperCase(), left = m[2].trim(), right = m[3].trim();
+      if (type === 'MERGE') { ops.push({ type, advisory: true, text: line }); continue; }
+      const found = findModelByName(left);
+      const model = found ? getById.get(found.id) : null;
+      if (type === 'TAG') ops.push({ type, model, label: left, value: right.split(',').map(t => t.trim()).filter(Boolean) });
+      else ops.push({ type, model, label: left, value: right });
+    }
+  }
 
   const applyInTx = db.transaction(() => {
-    for (const raw of directives) {
-      const line = raw.trim();
-      if (!line || line.startsWith('#')) continue;
-
-      // FRANCHISE
-      let m = line.match(/^FRANCHISE:\s*(.+?)\s*(?:→|->|>)\s*(.+)$/i);
-      if (m && types.includes('FRANCHISE')) {
-        const modelName = m[1].trim(), franchise = m[2].trim();
-        const model = db.prepare(`SELECT id FROM models WHERE name = ? OR name LIKE ? LIMIT 1`).get(modelName, `%${modelName}%`);
-        if (model) {
-          db.prepare(`UPDATE models SET franchise = ?, updated_at = datetime('now') WHERE id = ?`).run(franchise, model.id);
-          results.applied++;
-          results.details.push({ type: 'FRANCHISE', name: modelName, value: franchise });
-        } else { results.skipped++; }
-        continue;
-      }
-
-      // RENAME
-      m = line.match(/^RENAME:\s*(.+?)\s*(?:→|->|>)\s*(.+)$/i);
-      if (m && types.includes('RENAME')) {
-        const oldName = m[1].trim(), newName = m[2].trim();
-        const model = db.prepare(`SELECT id FROM models WHERE name = ? OR name LIKE ? LIMIT 1`).get(oldName, `%${oldName}%`);
-        if (model) {
-          db.prepare(`UPDATE models SET name = ?, updated_at = datetime('now') WHERE id = ?`).run(newName, model.id);
-          results.applied++;
-          results.details.push({ type: 'RENAME', old: oldName, new: newName });
-        } else { results.skipped++; }
-        continue;
-      }
-
-      // TAG
-      m = line.match(/^TAG:\s*(.+?)\s*(?:→|->|>)\s*(.+)$/i);
-      if (m && types.includes('TAG')) {
-        const modelName = m[1].trim(), tagsRaw = m[2].trim();
-        const newTags = tagsRaw.split(',').map(t => t.trim()).filter(Boolean);
-        const model = db.prepare(`SELECT id, tags FROM models WHERE name = ? OR name LIKE ? LIMIT 1`).get(modelName, `%${modelName}%`);
-        if (model) {
-          const existing = (() => { try { return JSON.parse(model.tags || '[]'); } catch { return []; } })();
-          const merged = [...new Set([...existing, ...newTags])];
-          db.prepare(`UPDATE models SET tags = ?, updated_at = datetime('now') WHERE id = ?`).run(JSON.stringify(merged), model.id);
-          results.applied++;
-          results.details.push({ type: 'TAG', name: modelName, tags: merged });
-        } else { results.skipped++; }
-        continue;
-      }
-
-      // MERGE — advisory only
-      m = line.match(/^MERGE:\s*(.+?)\s*(?:→|->|>)\s*(.+)$/i);
-      if (m) {
+    for (const op of ops) {
+      if (op.type === 'MERGE') {
         results.skipped++;
-        results.details.push({ type: 'MERGE', advisory: true, text: line });
+        results.details.push({ type: 'MERGE', advisory: true, text: op.text });
         continue;
       }
-
-      results.skipped++;
+      if (op.type === 'OTHER' || !types.includes(op.type) || !op.model) { results.skipped++; continue; }
+      const { model } = op;
+      if (op.type === 'FRANCHISE') {
+        if (!op.value) { results.skipped++; continue; }
+        setFranchise.run(op.value, model.id);
+        results.details.push({ type: 'FRANCHISE', id: model.id, name: model.name, value: op.value });
+      } else if (op.type === 'RENAME') {
+        if (!op.value) { results.skipped++; continue; }
+        setName.run(op.value, model.id);
+        results.details.push({ type: 'RENAME', id: model.id, old: model.name, new: op.value });
+      } else if (op.type === 'TAG') {
+        const existing = (() => { try { return JSON.parse(model.tags || '[]'); } catch { return []; } })();
+        const merged = [...new Set([...existing, ...op.value])];
+        setTags.run(JSON.stringify(merged), model.id);
+        results.details.push({ type: 'TAG', id: model.id, name: model.name, tags: merged });
+      }
+      results.applied++;
     }
   });
 
@@ -496,7 +477,7 @@ router.post('/annotate/apply', (req, res) => {
  *   noTags         – models with empty tags array
  *   noFranchise    – models with no franchise assigned
  */
-router.get('/health', (req, res) => {
+router.get('/health', async (req, res) => {
   const models = db.prepare(`
     SELECT m.id, m.name, m.folder_path, m.file_count, m.thumbnail_path,
            m.source_url, m.tags, m.franchise, m.creator_id, c.name AS creator_name
@@ -506,31 +487,8 @@ router.get('/health', (req, res) => {
     ORDER BY m.name
   `).all();
 
-  // Similar-name duplicates. Full O(n²) Levenshtein blocks the event loop on
-  // large libraries, so bucket models by a cheap normalized-name prefix and only
-  // compare within a bucket (near-duplicates almost always share a prefix).
-  const simBuckets = new Map();
-  for (const m of models) {
-    const key = normName(m.name).slice(0, 6);
-    if (!key) continue;
-    if (!simBuckets.has(key)) simBuckets.set(key, []);
-    simBuckets.get(key).push(m);
-  }
-  const duplicates = [];
-  let comparisons = 0;
-  const MAX_COMPARISONS = 1_500_000; // hard safety cap
-  for (const group of simBuckets.values()) {
-    for (let i = 0; i < group.length && comparisons < MAX_COMPARISONS; i++) {
-      for (let j = i + 1; j < group.length && comparisons < MAX_COMPARISONS; j++) {
-        comparisons++;
-        const score = similarity(group[i].name, group[j].name);
-        if (score >= 0.85) {
-          duplicates.push({ score: Math.round(score * 100) / 100, a: group[i], b: group[j] });
-        }
-      }
-    }
-  }
-  duplicates.sort((a, b) => b.score - a.score);
+  // Similar-name duplicates — normalised, bucketed, capped and yielding (see lib/similar.js)
+  const duplicates = await findSimilarNames(models);
 
   const emptyFolders  = models.filter(m => !m.file_count || m.file_count === 0);
   const noThumbnail   = models.filter(m => !m.thumbnail_path);
@@ -541,8 +499,11 @@ router.get('/health', (req, res) => {
   // Cross-creator duplicates: same deep-normalized name, different creators
   const byDeepKey = new Map();
   for (const m of models) {
+    // Names that are only variant/role words ("Supported", "FDM", "Renders")
+    // say nothing about WHICH model it is — never group those across creators.
+    if (isVariantOnlyName(m.name)) continue;
     const key = deepNorm(m.name);
-    if (!key || key.length < 4) continue; // skip too-short keys
+    if (!key || key.length < 4 || isVariantOnlyName(key)) continue; // skip too-short keys
     if (!byDeepKey.has(key)) byDeepKey.set(key, []);
     byDeepKey.get(key).push(m);
   }
@@ -578,15 +539,32 @@ router.get('/health', (req, res) => {
 
 // ── apply-franchise ───────────────────────────────────────────────────────────
 
+/** Turn a franchise label into ONE safe folder name (no separators, no dots-only, no control chars). */
+function franchiseFolderName(franchise) {
+  const clean = String(franchise || '')
+    .replace(/[\/\\\x00-\x1f\x7f]+/g, ' ')
+    .replace(/^[.\s]+/, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 120);
+  return isSafeSegment(clean) ? clean : null;
+}
+
+function isReadOnlyError(e) {
+  return e && (e.code === 'EROFS' || e.code === 'EACCES' || e.code === 'EPERM');
+}
+
 /**
  * POST /api/organize/apply-franchise
  * Body: { dryRun?: boolean }  (default dryRun=true for safety)
  *
  * For every model that has a `franchise` value, moves the model folder into
- * `<parent>/<franchise>/<model-name>` and updates folder_path in the DB.
+ * `<parent>/<franchise>/<model-folder>` and updates models.folder_path and
+ * model_files.filepath (for it and any nested models) in one transaction.
  *
- * Only moves folders that are direct children of a creator root (i.e., not
- * already inside a franchise subfolder).
+ * Refuses to overwrite an existing destination, confines every path to the
+ * library, and stops with a clear error when the library is read-only (the
+ * default Docker mount is :ro).
  */
 router.post('/apply-franchise', (req, res) => {
   const dryRun = req.body?.dryRun !== false; // safe default: dry run
@@ -596,35 +574,95 @@ router.post('/apply-franchise', (req, res) => {
     FROM models
     WHERE franchise IS NOT NULL AND franchise != ''
       AND (hidden IS NULL OR hidden = 0)
+    ORDER BY length(folder_path) DESC
   `).all();
 
-  const moves = [];
-  const errors = [];
-
-  for (const m of models) {
+  if (!dryRun) {
     try {
-      const parent  = path.dirname(m.folder_path);
-      const base    = path.basename(m.folder_path);
-
-      // Skip if already inside a franchise folder (parent basename === franchise)
-      if (path.basename(parent) === m.franchise) continue;
-
-      const newParent = path.join(parent, m.franchise);
-      const newPath   = path.join(newParent, base);
-
-      moves.push({ id: m.id, name: m.name, franchise: m.franchise, from: m.folder_path, to: newPath });
-
-      if (!dryRun) {
-        if (!fs.existsSync(newParent)) fs.mkdirSync(newParent, { recursive: true });
-        fs.renameSync(m.folder_path, newPath);
-        db.prepare(`UPDATE models SET folder_path = ?, updated_at = datetime('now') WHERE id = ?`).run(newPath, m.id);
-      }
+      fs.accessSync(LIBRARY_PATH, fs.constants.W_OK);
     } catch (e) {
-      errors.push({ id: m.id, name: m.name, error: e.message });
+      return res.status(409).json({
+        error: `The library is read-only (${e.code || e.message}). Folder moves need a writable library mount — remove ":ro" from the library volume in docker-compose.yml, or use the dry run and move folders yourself.`,
+        code: e.code || 'EROFS', readOnly: true,
+      });
     }
   }
 
-  res.json({ dryRun, moves, errors, summary: { planned: moves.length, errors: errors.length } });
+  const getPath = db.prepare('SELECT folder_path FROM models WHERE id = ?');
+  const [sepLo, sepHi] = [path.sep, String.fromCharCode(path.sep.charCodeAt(0) + 1)];
+  const rehomeModels = db.prepare(`
+    UPDATE models SET folder_path = ? || substr(folder_path, ?), updated_at = datetime('now')
+    WHERE folder_path = ? OR (folder_path > ? AND folder_path < ?)
+  `);
+  const rehomeFiles = db.prepare(`
+    UPDATE model_files SET filepath = ? || substr(filepath, ?)
+    WHERE filepath > ? AND filepath < ?
+  `);
+  const moveInDb = db.transaction((from, to) => {
+    const cut = from.length + 1; // substr is 1-based: keep everything after `from`
+    rehomeModels.run(to, cut, from, from + sepLo, from + sepHi);
+    rehomeFiles.run(to, cut, from + sepLo, from + sepHi);
+  });
+
+  const moves = [];
+  const errors = [];
+  let executed = 0;
+  let stoppedReadOnly = null;
+
+  for (const m of models) {
+    const current = getPath.get(m.id)?.folder_path || m.folder_path; // may have moved with a parent
+    const folder = franchiseFolderName(m.franchise);
+    if (!folder) { errors.push({ id: m.id, name: m.name, error: `Franchise "${m.franchise}" is not a usable folder name` }); continue; }
+
+    const parent = path.dirname(current);
+    const base = path.basename(current);
+    // Skip if the model already sits inside a folder with that name anywhere
+    // below the library root (e.g. franchise "Marvel" derived from
+    // creator/Marvel/Avengers/X must not become .../Avengers/Marvel/X).
+    const ancestors = path.relative(LIBRARY_PATH, parent).split(path.sep).map(p => p.toLowerCase());
+    if (ancestors.includes(folder.toLowerCase())) continue;
+
+    const newParent = path.join(parent, folder);
+    const newPath = path.join(newParent, base);
+    if (!tryConfine(current) || !tryConfine(newPath)) {
+      errors.push({ id: m.id, name: m.name, error: 'Path is outside the library' });
+      continue;
+    }
+    const move = { id: m.id, name: m.name, franchise: m.franchise, folder, from: current, to: newPath };
+
+    if (fs.existsSync(newPath)) {
+      errors.push({ id: m.id, name: m.name, error: `Destination already exists: ${newPath}` });
+      continue;
+    }
+    moves.push(move);
+    if (dryRun) continue;
+
+    if (!fs.existsSync(current)) { errors.push({ id: m.id, name: m.name, error: 'Source folder no longer exists' }); continue; }
+    try {
+      fs.mkdirSync(newParent, { recursive: true });
+      fs.renameSync(current, newPath);
+    } catch (e) {
+      errors.push({ id: m.id, name: m.name, error: e.message, code: e.code });
+      if (isReadOnlyError(e)) { stoppedReadOnly = e; break; }
+      continue;
+    }
+    try {
+      moveInDb(current, newPath);
+      executed++;
+    } catch (e) {
+      // Keep disk and DB consistent: undo the move if the DB update failed
+      try { fs.renameSync(newPath, current); } catch {}
+      errors.push({ id: m.id, name: m.name, error: `Database update failed, move undone: ${e.message}` });
+    }
+  }
+
+  const body = { dryRun, moves, errors, summary: { planned: moves.length, executed, errors: errors.length } };
+  if (stoppedReadOnly) {
+    body.error = `Stopped: the library is not writable (${stoppedReadOnly.code}). ${executed} folder(s) were moved before this.`;
+    body.readOnly = true;
+    return res.status(409).json(body);
+  }
+  res.json(body);
 });
 
 // ── gap analysis ──────────────────────────────────────────────────────────────
@@ -802,7 +840,7 @@ router.get('/thumbnail-stats', (req, res) => {
  * POST /api/organize/fix-thumbnails
  * For every model that has images[] in DB but no thumbnail, set the first image.
  */
-router.post('/fix-thumbnails', (req, res) => {
+router.post('/fix-thumbnails', async (req, res) => {
   // Pass 1: models that already have images[] in DB but no thumbnail_path
   const withImages = db.prepare(`
     SELECT id, images FROM models
@@ -838,13 +876,13 @@ router.post('/fix-thumbnails', (req, res) => {
   let extracted = 0;
   for (const m of noImages) {
     try {
-      if (!fs.existsSync(m.folder_path)) continue;
+      if (!tryConfine(m.folder_path) || !fs.existsSync(m.folder_path)) continue;
       const hint = m.render_zip_hint || m.creator_hint || null;
       const analysis = analyzeFolder(m.folder_path, null);
       const archives = pickRenderArchives(analysis, hint);
       const imgs = [];
       for (const archPath of archives) {
-        imgs.push(...extractImagesFromArchive(archPath, m.uuid));
+        imgs.push(...await extractImagesFromArchive(archPath, m.uuid));
         if (imgs.length) break;
       }
       if (imgs.length) {
@@ -969,8 +1007,9 @@ function groupFilesByName(files) {
  * Returns: { path, groups, existingFolders, looseFileCount, unmatched }
  */
 router.get('/loose-files', (req, res) => {
-  const folderPath = req.query.path;
-  if (!folderPath) return res.status(400).json({ error: 'path query param required' });
+  if (!req.query.path) return res.status(400).json({ error: 'path query param required' });
+  const folderPath = confinedOr4xx(res, String(req.query.path));
+  if (!folderPath) return;
 
   let entries;
   try {
@@ -1012,6 +1051,18 @@ router.get('/loose-files', (req, res) => {
   });
 });
 
+/** rename, falling back to copy+unlink across devices; never overwrites. */
+function moveFileNoClobber(from, to) {
+  if (fs.existsSync(to)) { const e = new Error(`Destination already exists: ${path.basename(to)}`); e.code = 'EEXIST'; throw e; }
+  try {
+    fs.renameSync(from, to);
+  } catch (e) {
+    if (e.code !== 'EXDEV') throw e;
+    fs.copyFileSync(from, to, fs.constants.COPYFILE_EXCL);
+    fs.unlinkSync(from);
+  }
+}
+
 /**
  * POST /api/organize/group-files
  * Body: { path, groups: [{name, files}], dryRun? }
@@ -1019,27 +1070,52 @@ router.get('/loose-files', (req, res) => {
  * Creates subfolders and moves loose files into them.
  * dryRun=true (default) only returns the plan + bash script without touching the filesystem.
  * Always returns a bash script the user can run on the NAS directly.
+ * Group and file names must be plain names (no "/", "\\", "..", NUL); existing
+ * files are never overwritten.
  */
 router.post('/group-files', (req, res) => {
-  const { path: folderPath, groups, dryRun = true } = req.body || {};
-  if (!folderPath) return res.status(400).json({ error: 'path required' });
+  const { path: rawPath, groups, dryRun = true } = req.body || {};
+  if (!rawPath) return res.status(400).json({ error: 'path required' });
   if (!Array.isArray(groups) || !groups.length) return res.status(400).json({ error: 'groups array required' });
+  const folderPath = confinedOr4xx(res, String(rawPath));
+  if (!folderPath) return;
 
   const moves = [];
   const errors = [];
   const foldersCreated = [];
+  const validGroups = [];
 
   for (const group of groups) {
-    const { name, files } = group;
-    if (!name || !Array.isArray(files) || !files.length) continue;
+    const name = typeof group?.name === 'string' ? group.name.trim() : group?.name;
+    const files = group?.files;
+    if (!name && (!Array.isArray(files) || !files.length)) continue;
+    if (!isSafeSegment(name)) { errors.push({ type: 'invalid', name: String(name ?? ''), error: 'Invalid group name (no slashes, "..", or control characters)' }); continue; }
+    if (!Array.isArray(files) || !files.length) continue;
+    const okFiles = [];
+    for (const f of files) {
+      if (!isSafeSegment(f)) errors.push({ type: 'invalid', file: String(f ?? ''), group: name, error: 'Invalid file name' });
+      else okFiles.push(f);
+    }
+    if (!okFiles.length) continue;
+    validGroups.push({ name, files: okFiles });
+  }
 
+  if (!dryRun) {
+    try { fs.accessSync(folderPath, fs.constants.W_OK); } catch (e) {
+      return res.status(409).json({ error: `Folder is not writable (${e.code || e.message}). Use the generated script instead.`, code: e.code, readOnly: true });
+    }
+  }
+
+  for (const { name, files } of validGroups) {
     const targetDir = path.join(folderPath, name);
-
     if (!dryRun) {
       try {
         if (!fs.existsSync(targetDir)) {
-          fs.mkdirSync(targetDir, { recursive: true });
+          fs.mkdirSync(targetDir);
           foldersCreated.push(name);
+        } else if (!fs.statSync(targetDir).isDirectory()) {
+          errors.push({ type: 'mkdir', name, error: 'A file with that name already exists' });
+          continue;
         }
       } catch (e) {
         errors.push({ type: 'mkdir', name, error: e.message });
@@ -1054,30 +1130,31 @@ router.post('/group-files', (req, res) => {
       const to   = path.join(targetDir, filename);
       moves.push({ file: filename, group: name, from, to });
       if (!dryRun) {
-        try { fs.renameSync(from, to); }
+        try { moveFileNoClobber(from, to); }
         catch (e) { errors.push({ type: 'move', file: filename, group: name, error: e.message }); }
       }
     }
   }
 
-  // Build bash script (uses the NAS-side path: /library/... → /volume1/...)
-  const nasPath = folderPath.replace(/^\/library\//, '/volume1/');
+  // Build a bash script for the machine that hosts the library. Every name is
+  // single-quoted, so file names like "$(touch x).stl" stay inert.
+  const hostPath = toHostPath(folderPath);
+  const sshTarget = process.env.ORGANIZE_SSH_TARGET;
   const scriptLines = [
     '#!/bin/bash',
     `# STL Vault — Loose File Organizer`,
-    `# Run this on your NAS via SSH: ssh casey@dagobah`,
+    sshTarget ? `# Run this on your NAS via SSH: ssh ${sshTarget.replace(/[^\w@.\-:]/g, '')}` : '# Run this in a shell on the machine that stores the library.',
     `# Generated: ${new Date().toISOString()}`,
     '',
-    `cd "${nasPath}" || { echo "Folder not found: ${nasPath}"; exit 1; }`,
+    `cd -- ${shellQuote(hostPath)} || { echo ${shellQuote('Folder not found: ' + hostPath)}; exit 1; }`,
     '',
   ];
 
-  for (const group of groups) {
-    if (!group.name || !group.files?.length) continue;
+  for (const group of validGroups) {
     scriptLines.push(`# ── ${group.name} (${group.files.length} file${group.files.length !== 1 ? 's' : ''}) ──`);
-    scriptLines.push(`mkdir -p "${group.name}"`);
+    scriptLines.push(`mkdir -p -- ${shellQuote(group.name)}`);
     for (const filename of group.files) {
-      scriptLines.push(`mv "${filename}" "${group.name}/"`);
+      scriptLines.push(`mv -n -- ${shellQuote(filename)} ${shellQuote(group.name + '/')}`);
     }
     scriptLines.push('');
   }
@@ -1091,7 +1168,7 @@ router.post('/group-files', (req, res) => {
     errors,
     script,
     summary: {
-      groups: groups.length,
+      groups: validGroups.length,
       files: moves.length,
       executed: dryRun ? 0 : moves.length - errors.filter(e => e.type === 'move').length,
       errors: errors.length,
@@ -1108,13 +1185,15 @@ router.get('/folder-overrides', (req, res) => {
 });
 
 router.post('/folder-overrides', (req, res) => {
-  const p = req.body?.path;
   const role = req.body?.role;
-  if (!p) return res.status(400).json({ error: 'path required' });
+  if (!req.body?.path) return res.status(400).json({ error: 'path required' });
   if (!role) {
-    db.prepare('DELETE FROM folder_overrides WHERE path = ?').run(p);
+    // Clearing is always allowed (even for a stale path outside the library)
+    db.prepare('DELETE FROM folder_overrides WHERE path = ?').run(String(req.body.path));
     return res.json({ ok: true, cleared: true });
   }
+  const p = confinedOr4xx(res, String(req.body.path));
+  if (!p) return;
   if (!['creator', 'passthrough', 'ignore'].includes(role)) return res.status(400).json({ error: 'invalid role' });
   db.prepare('INSERT INTO folder_overrides (path, role) VALUES (?, ?) ON CONFLICT(path) DO UPDATE SET role = excluded.role').run(p, role);
   res.json({ ok: true });
@@ -1123,7 +1202,8 @@ router.post('/folder-overrides', (req, res) => {
 // Raw filesystem tree (bounded) for the folder-roles UI — shows the ACTUAL
 // directory structure (not the indexed grouping) so misclassifications are fixable.
 router.get('/fs-tree', (req, res) => {
-  const base = req.query.path || LIBRARY_PATH;
+  const base = confinedOr4xx(res, String(req.query.path || LIBRARY_PATH));
+  if (!base) return;
   const maxDepth = Math.min(parseInt(req.query.depth, 10) || 3, 5);
   const MAX_CHILDREN = 300;
   let overrides;
@@ -1160,7 +1240,8 @@ router.get('/fs-tree', (req, res) => {
 router.post('/classify-folders', async (req, res) => {
   const apiKey = req.headers['x-claude-key'] || process.env.CLAUDE_API_KEY || '';
   if (!apiKey) return res.status(401).json({ error: 'API key required' });
-  const base = req.body?.path || LIBRARY_PATH;
+  const base = confinedOr4xx(res, String(req.body?.path || LIBRARY_PATH));
+  if (!base) return;
   const maxDepth = 3;
 
   const lines = [];
@@ -1184,12 +1265,15 @@ Use folder NAMES as the main signal (e.g. "...Studios"/"...3D Models" = creator;
   const user = `Folder tree (indentation = depth; each line ends with " :: <full path>"):\n\n${treeText}`;
 
   try {
-    const r = await claudeRequest(apiKey, {
-      model: CLAUDE_MODEL, max_tokens: 2000, system,
-      messages: [{ role: 'user', content: user }],
-    });
-    if (r.status !== 200) return res.status(502).json({ error: `Claude API ${r.status}` });
-    const parsed = JSON.parse(r.body);
+    let parsed;
+    try {
+      parsed = await callClaudeAPI(apiKey, {
+        model: CLAUDE_MODEL, max_tokens: 2000, system,
+        messages: [{ role: 'user', content: user }],
+      }, { timeoutMs: 90000 });
+    } catch (e) {
+      return res.status(502).json({ error: e.message });
+    }
     const text = (parsed.content || []).filter(b => b.type === 'text').map(b => b.text).join('\n');
     const m = text.match(/\[[\s\S]*\]/);
     const suggestions = (m ? JSON.parse(m[0]) : [])

@@ -108,94 +108,138 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_creators_name      ON creators(name);
 `);
 
-// Migrations for existing databases
-try { db.exec(`ALTER TABLE models ADD COLUMN folder_hash TEXT`); } catch {}
-try { db.exec(`ALTER TABLE model_files ADD COLUMN release_name TEXT`); } catch {}
-try { db.exec(`CREATE INDEX IF NOT EXISTS idx_files_release ON model_files(release_name)`); } catch {}
-try { db.exec(`ALTER TABLE models ADD COLUMN render_zip_hint TEXT`); } catch {}
-try { db.exec(`ALTER TABLE creators ADD COLUMN render_zip_hint TEXT`); } catch {}
-try { db.exec(`ALTER TABLE scan_log ADD COLUMN models_skipped INTEGER DEFAULT 0`); } catch {}
-try { db.exec(`ALTER TABLE model_files ADD COLUMN filepath TEXT NOT NULL DEFAULT ''`); } catch {}
-try { db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_models_folder_path_unique ON models(folder_path)`); } catch {}
-try { db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_files_filepath_unique ON model_files(filepath)`); } catch {}
-try { db.exec(`ALTER TABLE models ADD COLUMN hidden INTEGER DEFAULT 0`); } catch {}
-try { db.exec(`ALTER TABLE models ADD COLUMN franchise TEXT`); } catch {}
-try { db.exec(`CREATE INDEX IF NOT EXISTS idx_models_franchise ON models(franchise)`); } catch {}
-try { db.exec(`ALTER TABLE models ADD COLUMN team TEXT`); } catch {}
-try { db.exec(`CREATE INDEX IF NOT EXISTS idx_models_team ON models(team)`); } catch {}
-try { db.exec(`ALTER TABLE models ADD COLUMN is_favorite INTEGER DEFAULT 0`); } catch {}
-try { db.exec(`CREATE INDEX IF NOT EXISTS idx_models_favorite ON models(is_favorite)`); } catch {}
-try { db.exec(`ALTER TABLE model_files ADD COLUMN printed_at TEXT`); } catch {}
+// ── Migrations ────────────────────────────────────────────────────────────────
+// Only "duplicate column name" is expected (the column already exists) — any
+// other error is real and must surface instead of being silently swallowed.
+function addColumn(table, columnDef) {
+  try {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${columnDef}`);
+  } catch (e) {
+    if (!/duplicate column name/i.test(e.message)) throw e;
+  }
+}
+// Unique indexes can fail on an old DB that already holds duplicates; that must
+// not stop the app from starting, so log it and carry on (as before, but loudly).
+function tolerantIndex(sql) {
+  try {
+    db.exec(sql);
+  } catch (e) {
+    if (!/UNIQUE constraint failed|not unique/i.test(e.message)) throw e;
+    console.warn(`[db] could not create index (existing duplicates): ${e.message}`);
+  }
+}
 
-// Per-folder role overrides for the scanner (creator | passthrough | ignore)
-try { db.exec(`
-  CREATE TABLE IF NOT EXISTS folder_overrides (
-    path TEXT PRIMARY KEY,
-    role TEXT NOT NULL CHECK(role IN ('creator','passthrough','ignore')),
-    created_at TEXT DEFAULT (datetime('now'))
-  )
-`); } catch {}
+// PRAGMA user_version tracks which steps ran. Existing databases report 0 and
+// already have most columns, so every step must stay idempotent (IF NOT EXISTS
+// / addColumn). Append new steps; never reorder or edit shipped ones.
+const MIGRATIONS = [
+  // 1 — everything that existed before versioning (the old try/catch ALTER list)
+  () => {
+    addColumn('models', 'folder_hash TEXT');
+    addColumn('model_files', 'release_name TEXT');
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_files_release ON model_files(release_name)`);
+    addColumn('models', 'render_zip_hint TEXT');
+    addColumn('creators', 'render_zip_hint TEXT');
+    addColumn('scan_log', 'models_skipped INTEGER DEFAULT 0');
+    addColumn('model_files', `filepath TEXT NOT NULL DEFAULT ''`);
+    tolerantIndex(`CREATE UNIQUE INDEX IF NOT EXISTS idx_models_folder_path_unique ON models(folder_path)`);
+    tolerantIndex(`CREATE UNIQUE INDEX IF NOT EXISTS idx_files_filepath_unique ON model_files(filepath)`);
+    addColumn('models', 'hidden INTEGER DEFAULT 0');
+    addColumn('models', 'franchise TEXT');
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_models_franchise ON models(franchise)`);
+    addColumn('models', 'team TEXT');
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_models_team ON models(team)`);
+    addColumn('models', 'is_favorite INTEGER DEFAULT 0');
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_models_favorite ON models(is_favorite)`);
+    addColumn('model_files', 'printed_at TEXT');
 
-// Print queue
-try { db.exec(`
-  CREATE TABLE IF NOT EXISTS print_queue (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    model_id INTEGER NOT NULL UNIQUE REFERENCES models(id) ON DELETE CASCADE,
-    position REAL NOT NULL DEFAULT 0,
-    added_at TEXT DEFAULT (datetime('now'))
-  )
-`); } catch {}
-try { db.exec(`CREATE INDEX IF NOT EXISTS idx_queue_position ON print_queue(position)`); } catch {}
-try { db.exec(`ALTER TABLE print_queue ADD COLUMN note TEXT`); } catch {}
+    // Per-folder role overrides for the scanner (creator | passthrough | ignore)
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS folder_overrides (
+        path TEXT PRIMARY KEY,
+        role TEXT NOT NULL CHECK(role IN ('creator','passthrough','ignore')),
+        created_at TEXT DEFAULT (datetime('now'))
+      )
+    `);
 
-// Collections
-try { db.exec(`
-  CREATE TABLE IF NOT EXISTS collections (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL UNIQUE,
-    color TEXT DEFAULT '#5b9bd5',
-    created_at TEXT DEFAULT (datetime('now'))
-  )
-`); } catch {}
-try { db.exec(`
-  CREATE TABLE IF NOT EXISTS collection_models (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    collection_id INTEGER NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
-    model_id INTEGER NOT NULL REFERENCES models(id) ON DELETE CASCADE,
-    sort_order INTEGER DEFAULT 0,
-    added_at TEXT DEFAULT (datetime('now')),
-    UNIQUE(collection_id, model_id)
-  )
-`); } catch {}
-try { db.exec(`ALTER TABLE collections ADD COLUMN pinned INTEGER DEFAULT 0`); } catch {}
-try { db.exec(`CREATE INDEX IF NOT EXISTS idx_coll_models_coll ON collection_models(collection_id)`); } catch {}
-try { db.exec(`CREATE INDEX IF NOT EXISTS idx_coll_models_model ON collection_models(model_id)`); } catch {}
+    // Print queue
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS print_queue (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        model_id INTEGER NOT NULL UNIQUE REFERENCES models(id) ON DELETE CASCADE,
+        position REAL NOT NULL DEFAULT 0,
+        added_at TEXT DEFAULT (datetime('now'))
+      )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_queue_position ON print_queue(position)`);
+    addColumn('print_queue', 'note TEXT');
 
-// Status history log
-try { db.exec(`
-  CREATE TABLE IF NOT EXISTS status_log (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    model_id INTEGER NOT NULL REFERENCES models(id) ON DELETE CASCADE,
-    from_status TEXT,
-    to_status TEXT NOT NULL,
-    note TEXT,
-    changed_at TEXT DEFAULT (datetime('now'))
-  )
-`); } catch {}
-try { db.exec(`CREATE INDEX IF NOT EXISTS idx_status_log_model ON status_log(model_id)`); } catch {}
+    // Collections
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS collections (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL UNIQUE,
+        color TEXT DEFAULT '#5b9bd5',
+        created_at TEXT DEFAULT (datetime('now'))
+      )
+    `);
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS collection_models (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        collection_id INTEGER NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
+        model_id INTEGER NOT NULL REFERENCES models(id) ON DELETE CASCADE,
+        sort_order INTEGER DEFAULT 0,
+        added_at TEXT DEFAULT (datetime('now')),
+        UNIQUE(collection_id, model_id)
+      )
+    `);
+    addColumn('collections', 'pinned INTEGER DEFAULT 0');
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_coll_models_coll ON collection_models(collection_id)`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_coll_models_model ON collection_models(model_id)`);
 
-// Wishlist — models you want to acquire (not yet in library)
-try { db.exec(`
-  CREATE TABLE IF NOT EXISTS wishlist (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    url TEXT NOT NULL,
-    name TEXT,
-    source_site TEXT,
-    notes TEXT,
-    status TEXT DEFAULT 'want' CHECK(status IN ('want','scraping','got','failed')),
-    added_at TEXT DEFAULT (datetime('now'))
-  )
-`); } catch {}
-try { db.exec(`CREATE INDEX IF NOT EXISTS idx_wishlist_status ON wishlist(status)`); } catch {}
+    // Status history log
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS status_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        model_id INTEGER NOT NULL REFERENCES models(id) ON DELETE CASCADE,
+        from_status TEXT,
+        to_status TEXT NOT NULL,
+        note TEXT,
+        changed_at TEXT DEFAULT (datetime('now'))
+      )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_status_log_model ON status_log(model_id)`);
+
+    // Wishlist — models you want to acquire (not yet in library)
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS wishlist (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        url TEXT NOT NULL,
+        name TEXT,
+        source_site TEXT,
+        notes TEXT,
+        status TEXT DEFAULT 'want' CHECK(status IN ('want','scraping','got','failed')),
+        added_at TEXT DEFAULT (datetime('now'))
+      )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_wishlist_status ON wishlist(status)`);
+  },
+  // 2 — user-renamed models keep their name across rescans
+  () => {
+    addColumn('models', 'name_locked INTEGER DEFAULT 0');
+  },
+];
+
+function runMigrations() {
+  const current = db.prepare('PRAGMA user_version').get().user_version || 0;
+  for (let v = current; v < MIGRATIONS.length; v++) {
+    db.transaction(MIGRATIONS[v])();
+    db.exec(`PRAGMA user_version = ${v + 1}`);
+  }
+}
+runMigrations();
+
+db.SCHEMA_VERSION = MIGRATIONS.length;
+db.DB_PATH = DB_PATH;
 
 module.exports = db;
