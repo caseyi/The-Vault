@@ -278,6 +278,79 @@ const MIGRATIONS = [
                WHERE folded_into IS NULL AND attribution LIKE '%"foldedInto"%' AND json_valid(attribution)`);
     } catch { /* JSON1 missing: rows are re-marked by the next scan */ }
   },
+  // 5 — AI enrichment (docs/ai-enrichment.md): runs, an undo log of automatic writes, the
+  //     review list, and aliases the scanner applies when computing work_key
+  () => {
+    addColumn('models', 'enrichment TEXT'); // {sig, at, model, runId}
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS enrich_runs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        started_at TEXT DEFAULT (datetime('now')),
+        finished_at TEXT,
+        model TEXT,
+        scope TEXT,
+        params TEXT,
+        status TEXT DEFAULT 'running',
+        to_process INTEGER DEFAULT 0,
+        applied INTEGER DEFAULT 0,
+        suggested INTEGER DEFAULT 0,
+        merges INTEGER DEFAULT 0,
+        unchanged INTEGER DEFAULT 0,
+        errors INTEGER DEFAULT 0,
+        vision_used INTEGER DEFAULT 0,
+        in_tokens INTEGER DEFAULT 0,
+        out_tokens INTEGER DEFAULT 0,
+        undone_at TEXT
+      )
+    `);
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS enrich_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id INTEGER NOT NULL,
+        model_id INTEGER NOT NULL,
+        field TEXT NOT NULL,
+        old_value TEXT,
+        new_value TEXT,
+        old_provenance TEXT,
+        at TEXT DEFAULT (datetime('now')),
+        reverted_at TEXT
+      )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_enrich_log_run ON enrich_log(run_id)`);
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS suggestions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        model_id INTEGER NOT NULL,
+        type TEXT NOT NULL CHECK(type IN ('field','merge','rename')),
+        field TEXT,
+        current TEXT,
+        proposed TEXT,
+        target_id INTEGER,
+        confidence REAL,
+        reason TEXT,
+        source TEXT DEFAULT 'text',
+        run_id INTEGER,
+        status TEXT DEFAULT 'pending' CHECK(status IN ('pending','accepted','rejected','superseded')),
+        created_at TEXT DEFAULT (datetime('now')),
+        decided_at TEXT
+      )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_suggestions_status ON suggestions(status, type, field)`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_suggestions_model ON suggestions(model_id)`);
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS aliases (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        creator TEXT,
+        kind TEXT,
+        from_key TEXT NOT NULL UNIQUE,
+        to_key TEXT NOT NULL,
+        from_name TEXT,
+        to_name TEXT,
+        source TEXT DEFAULT 'merge' CHECK(source IN ('merge','rename','rules')),
+        created_at TEXT DEFAULT (datetime('now'))
+      )
+    `);
+  },
 ];
 
 db.getSetting = (key) => {

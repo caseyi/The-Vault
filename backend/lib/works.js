@@ -312,6 +312,7 @@ function studioRecords(root, tree, ctx) {
     recs.push({
       ...f, root: root.path, rootCreator: root.creator, container: !!root.container, genre, termHint, ident, variant,
       edition: ident.edition, scope: `${root.path}|${genre || ''}|${tName || ''}`, tName, group,
+      segNames: segs.map(sg => sg.name), // folders below the genre: release year / qualifier tokens
     });
   }
   return recs;
@@ -443,7 +444,8 @@ function studioWorks(recs, ctx) {
       w = { key: wk, kind: r.ident.kind, layout: 'studio', creator: r.ident.creator, studio: naming.studioOf(r.ident.creator), files: [], names: new Map(), genres: new Map(), groups: new Map(), terms: new Map(), sidecar: null, roots: new Map() };
       works.set(wk, w);
     }
-    w.files.push({ abs: r.abs, name: r.name, size: r.size, mtimeMs: r.mtimeMs, dir: r.dir, variant: r.variant, edition: r.ident.kind === 'diorama' ? 'Diorama' : r.edition });
+    w.files.push({ abs: r.abs, name: r.name, size: r.size, mtimeMs: r.mtimeMs, dir: r.dir, variant: r.variant, edition: r.ident.kind === 'diorama' ? 'Diorama' : r.edition,
+      segs: r.segNames || [], scTerm: r.ident.sidecar && r.ident.sidecar.release_term ? r.ident.sidecar.release_term : null, termHint: r.termHint || null });
     const weight = (r.ident.sidecar ? 100 : 0) + (r.ident.prefixed ? 3 : 0) + (r.ident.strong ? 2 : 1);
     w.names.set(r.ident.character, (w.names.get(r.ident.character) || 0) + weight);
     if (r.genre) w.genres.set(r.genre, (w.genres.get(r.genre) || 0) + 1);
@@ -615,7 +617,7 @@ function folderWorks(root, tree, ctx) {
  * Build every work under `libraryPath`.
  * @param {object} opts { libraryPath, tree, meta, overrides, log, scope? (only roots under this path) }
  */
-function planWorks({ libraryPath, tree, meta, overrides = new Map(), log = () => {}, scope = null, containers }) {
+function planWorks({ libraryPath, tree, meta, overrides = new Map(), log = () => {}, scope = null, containers, aliases = null }) {
   const fix = meta?.fix || naming.makeFixer();
   const parseCache = new Map();
   const parse = (name) => { let p = parseCache.get(name); if (!p) { p = naming.parseName(name, { fix }); parseCache.set(name, p); } return p; };
@@ -663,11 +665,261 @@ function planWorks({ libraryPath, tree, meta, overrides = new Map(), log = () =>
     else works.push(...folderWorks(r, tree, ctx).map(w => ({ ...w, creatorFolder: r.path })));
   }
   works.push(...studioWorks(recs, ctx));
+  const joined = applyAliases(works, aliases);
+  if (joined.length !== works.length) log('info', `Aliases (confirmed merges) joined ${works.length - joined.length} card(s)`);
+  // after aliases: a confirmed merge never collapses two releases of a character
+  const merged = splitReleases(joined, meta);
+  if (merged.length !== joined.length) log('info', `Releases: ${merged.length - joined.length} more card(s) for characters released more than once`);
   if (meta) { meta.sidecars = sidecars; meta.sidecarErrors = sidecarErrors; }
   // Root folder per creator (for the creators table)
   const creatorFolders = new Map();
   for (const r of roots) if (!creatorFolders.has(r.creator)) creatorFolders.set(r.creator, r.path);
-  return { works, roots, creatorFolders, sidecars, sidecarErrors };
+  return { works: merged, roots, creatorFolders, sidecars, sidecarErrors };
+}
+
+// ── releases (one card per release of a character) ───────────────────────────
+
+const PRINTABLE_RE = /\.(zip|rar|7z|stl|obj|3mf|lys|lychee|chitubox|ctb|cbddlp|photon|pwmx|goo|blend|ztl)$/i;
+const YEAR_TOKEN = /(?:^|[^0-9a-z])(20[12]\d)(?![0-9])/i;
+const QUALIFIER = /\b(netflix|mcu|classic|comics?|chibi|v ?[2-9]|version ?[2-9])\b/i;
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+// words in product names that say nothing about WHICH release (store, genre, edition, accessory, filler)
+const PRODUCT_FILLER = new Set(['wicked', 'b3dserk', 'sw3d', 'zez', 'star', 'wars', '3d', 'models', 'marvel', 'dc', 'movies', 'movie', 'tv', 'video', 'games', 'game',
+  'anime', 'horror', 'comic', 'other', 'wildcard', 'christmas', 'sculpture', 'sculptures', 'statue', 'bust', 'busts', 'portrait', 'diorama', 'complete',
+  'base', 'accessory', 'accessories', 'term', 'tested', 'and', 'ready', 'for', 'printing', 'print', 'stl', 'stls', 'the', 'of', 'a', 'version', 'update',
+  'updated', 'new', 'special', 'january', 'february', 'march', 'april', 'may', 'june', 'july', 'august', 'september', 'october', 'november', 'december',
+  'pack', 'swag', 'files', 'file', 'model', 'studios', 'studio', 'scale', 'lightsaber', 'lightsabers', 'saber', 'sabers', 'blaster', 'rifle', 'weapon', 'weapons',
+  'helmet', 'hammer', 'shield', 'stand', 'logo', 'sword', 'gun', 'pistol', 'blastech', 'dl', 'mm', 'parts', 'piece', 'one', 'pre', 'supported', 'only']);
+
+function qualifierId(text) {
+  // a bare "V2" / "Comic" folder is a part variant, not a release: the qualifier must sit in a name
+  if (String(text || '').trim().split(/[\s_-]+/).filter(Boolean).length < 2) return null;
+  const m = String(text || '').match(QUALIFIER);
+  if (!m) return null;
+  const q = m[1].toLowerCase().replace(/\s+/g, '');
+  if (/^comics?$/.test(q)) return 'comic';
+  if (/^(v|version)\d$/.test(q)) return `v${q.slice(-1)}`;
+  return q;
+}
+function yearId(text) {
+  const m = naming.cleanStem(String(text || '')).match(YEAR_TOKEN);
+  return m ? m[1] : null;
+}
+
+/**
+ * Release signal of a manifest product: an explicit one (its term, a year or a version qualifier in
+ * its name) or the words left once store, genre, edition, accessory and character words are gone
+ * ("tobey", "andrew garfield"; "base" when nothing is left).
+ */
+function productRelease(prod, workKey, fix) {
+  if (prod.term) return { id: prod.term, explicit: true };
+  const y = yearId(prod.name);
+  if (y) return { id: y, explicit: true };
+  const q = qualifierId(prod.name);
+  if (q) return { id: q, explicit: true };
+  const charToks = String(workKey).split(' ').filter(Boolean);
+  // the character's own words, their stems and typos ("octupu" in Doctor Octopus) — not compounds ("spiderverse")
+  const near = (t) => charToks.some(c => c === t || c.startsWith(t) || (t.startsWith(c) && t.length - c.length <= 2)
+    || (t.length >= 5 && Math.abs(c.length - t.length) <= 2 && editDistance(c, t, 2) <= 2));
+  const left = naming.normKey(prod.name, fix).split(' ').filter(t => t && t.length > 1 && !PRODUCT_FILLER.has(t) && !near(t) && !/^\d+(mm)?$/.test(t));
+  return { id: left.length ? left.slice(0, 3).join('-') : 'base', explicit: false };
+}
+
+function releaseLabel(id, siblings) {
+  if (id === 'base') return null;
+  const m = id.match(/^(\d{4})-(\d{2})$/);
+  if (m) {
+    const sameYear = siblings.filter(s => s !== id && s.slice(0, 4) === m[1]).length;
+    return sameYear ? `${MONTHS[Number(m[2]) - 1]} ${m[1]}` : m[1];
+  }
+  if (/^\d{4}$/.test(id)) return id;
+  if (id === 'mcu') return 'MCU';
+  if (/^v\d$/.test(id)) return `V${id.slice(1)}`;
+  return id.split('-').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+}
+
+/**
+ * Split a studio work into one card per release when the creator released the character more
+ * than once (Daredevil Netflix vs Daredevil March 2026 Term; Captain Marvel and Captain Marvel 2025).
+ *
+ * Per file, best signal first: model.json release_term; the matched manifest product (exact/size
+ * match to a product of this character and studio); the Drive term of the file; a year (2010-2029)
+ * or version qualifier (v2, Netflix, MCU, Comic, Classic, Chibi) in an archive name or a folder
+ * below the genre. A folder's strong majority speaks for its unmatched files; files without any
+ * signal join the release sharing their deepest folder, else the biggest.
+ * Then: a year joins the term of that year (2024 + 2024-05); product leftovers of one release
+ * agree (Sculpture product + Bust product, "tom" ⊂ "tom holland"); implicit releases whose editions
+ * don't overlap are one release (Yoda + Yoda Lightsaber); an implicit release with fewer than two
+ * printable files is not one. Two or more remaining releases with printable files → one card each,
+ * keyed "<key>|r:<release id>". Sculpture + Bust of one release stay together; dioramas never split.
+ */
+function splitReleases(works, meta) {
+  const fix = (meta && meta.fix) || naming.makeFixer();
+  const out = [];
+  const depth = (a, b) => { const x = a.split(path.sep), y = b.split(path.sep); let i = 0; while (i < x.length && i < y.length && x[i] === y[i]) i++; return i; };
+  const printable = (fs) => fs.filter(f => PRINTABLE_RE.test(f.name)).length;
+  for (const w of works) {
+    if (w.layout !== 'studio' || w.kind !== 'work' || w.files.length < 2) { out.push(w); continue; }
+    const wkey = String(w.key).split('|').slice(2).join('|');
+    const wToks = new Set(wkey.split(' ').filter(t => t.length >= 3));
+    const family = (c) => naming.studioOf(c) || c;
+    const strong = new Map(); // file → { id, explicit }
+    for (const f of w.files) {
+      if (f.scTerm) { strong.set(f, { id: f.scTerm, explicit: true }); continue; }
+      if (!meta || IMAGE_EXTS.has(extOf(f.name))) continue;
+      const m = metaLib.matchFile(meta, f.name, f.size, { creator: w.creator, character: w.character, edition: f.edition });
+      if (m && (m.by === 'exact' || m.by === 'size') && m.product.key && m.product.key.split(' ').some(t => wToks.has(t)) && family(m.product.creator) === family(w.creator)) {
+        strong.set(f, productRelease(m.product, wkey, fix)); continue;
+      }
+      const d = metaLib.driveForFile(meta, f.name);
+      if (d && d.term) strong.set(f, { id: d.term, explicit: true });
+    }
+    const byDir = new Map();
+    for (const f of w.files) { if (!byDir.has(f.dir)) byDir.set(f.dir, []); byDir.get(f.dir).push(f); }
+    const dirRelease = new Map();
+    for (const [dir, files] of byDir) {
+      const c = new Map();
+      for (const f of files) if (strong.has(f)) { const s = strong.get(f); const e = c.get(s.id) || { s, n: 0 }; e.n++; c.set(s.id, e); }
+      if (c.size) { dirRelease.set(dir, [...c.values()].sort((a, b) => b.n - a.n || a.s.id.localeCompare(b.s.id))[0].s); continue; }
+      const segs = files[0].segs || [];
+      let id = null;
+      for (let i = segs.length - 1; i >= 0 && !id; i--) id = yearId(segs[i]) || qualifierId(segs[i]);
+      if (!id && files[0].termHint) id = files[0].termHint;
+      if (id) dirRelease.set(dir, { id, explicit: true, fromName: true });
+    }
+    const groups = new Map(); // id → { id, explicit, files }
+    const unassigned = [];
+    for (const f of w.files) {
+      let s = strong.get(f) || null;
+      const dirS = dirRelease.get(f.dir) || null;
+      // the folder's matched files outrank a year in one archive name; that outranks the folder name
+      if (!s && dirS && !dirS.fromName) s = dirS;
+      if (!s && ARCHIVE_RE.test(f.name)) { const id = yearId(f.name) || qualifierId(f.name); if (id) s = { id, explicit: true }; }
+      if (!s) s = dirS;
+      if (!s) { unassigned.push(f); continue; }
+      if (!groups.has(s.id)) groups.set(s.id, { id: s.id, explicit: s.explicit, files: [] });
+      const g = groups.get(s.id);
+      g.explicit = g.explicit || s.explicit;
+      g.files.push(f);
+    }
+    if (groups.size < 2) { out.push(w); continue; }
+    const mergeInto = (from, to) => { to.files.push(...from.files); to.explicit = to.explicit || from.explicit; groups.delete(from.id); };
+    const eds = (g) => new Set(g.files.map(f => f.edition).filter(Boolean));
+    // a year joins the term of that year, else of the next (a "Daredevil v Kingpin 2025" folder
+    // holds the January 2026 Term release)
+    for (const g of [...groups.values()]) {
+      if (!/^\d{4}$/.test(g.id)) continue;
+      const termOf = (y) => [...groups.values()].filter(t => t.id.startsWith(`${y}-`)).sort((a, b) => b.files.length - a.files.length)[0];
+      const t = termOf(g.id) || termOf(String(Number(g.id) + 1));
+      if (t) mergeInto(g, t);
+    }
+    // implicit releases: "tom" ⊂ "tom-holland", "verse" ⊂ "spiderverse", "pepper-pots" ≈ "pepper-potts"
+    for (const g of [...groups.values()]) {
+      if (g.explicit || g.id === 'base' || !groups.has(g.id)) continue;
+      const c = g.id.replace(/-/g, '');
+      const sup = [...groups.values()].filter(t => {
+        if (t === g || t.explicit || t.id === 'base') return false;
+        const d = t.id.replace(/-/g, '');
+        return d.includes(c) || (Math.abs(d.length - c.length) <= 2 && Math.min(c.length, d.length) >= 6 && editDistance(c, d, 2) <= 2);
+      });
+      if (sup.length === 1) mergeInto(g, sup[0]);
+    }
+    // implicit releases whose editions don't overlap are one release (Sculpture product + Bust product)
+    for (let changed = true; changed;) {
+      changed = false;
+      const imp = [...groups.values()].filter(g => !g.explicit).sort((a, b) => b.files.length - a.files.length);
+      for (let i = 0; i < imp.length && !changed; i++) for (let j = i + 1; j < imp.length && !changed; j++) {
+        const a = eds(imp[i]), b = eds(imp[j]);
+        if (![...a].some(e => b.has(e))) { mergeInto(imp[j], imp[i]); changed = true; }
+      }
+    }
+    // a release needs two printable files of its own; an implicit one more than accessories
+    for (const g of [...groups.values()]) {
+      const ge = eds(g);
+      const onlyExtras = !ge.size || [...ge].every(e => e === 'Accessory');
+      // (explicit ones too: one archive with a year in a folder of another release is a stray)
+      if (groups.size < 2 || (printable(g.files) >= 2 && (g.explicit || !onlyExtras))) continue;
+      const others = [...groups.values()].filter(t => t !== g);
+      const best = others.sort((a, b) => Math.max(...b.files.map(x => Math.max(...g.files.map(y => depth(x.dir, y.dir))))) - Math.max(...a.files.map(x => Math.max(...g.files.map(y => depth(x.dir, y.dir))))) || b.files.length - a.files.length)[0];
+      mergeInto(g, best);
+    }
+    // files without a signal: the release sharing the deepest folder, then the biggest
+    for (const f of unassigned) {
+      let best = null, bd = -1, bn = -1;
+      for (const g of groups.values()) {
+        const d = Math.max(...g.files.map(x => depth(x.dir, f.dir)));
+        if (d > bd || (d === bd && g.files.length > bn)) { best = g; bd = d; bn = g.files.length; }
+      }
+      best.files.push(f);
+    }
+    // a release with no printable file (only renders or an info txt) is not a release
+    const real = [...groups.values()].filter(g => printable(g.files) > 0).sort((a, b) => printable(b.files) - printable(a.files) || a.id.localeCompare(b.id));
+    if (real.length < 2) { out.push(w); continue; }
+    for (const g of groups.values()) if (!real.includes(g)) real[0].files.push(...g.files);
+    const relIds = real.map(g => g.id);
+    for (const g of real) {
+      const ge = eds(g);
+      const th = new Map();
+      for (const f of g.files) if (f.termHint) th.set(f.termHint, (th.get(f.termHint) || 0) + 1);
+      const termHint = th.size ? [...th.entries()].sort((a, b) => b[1] - a[1])[0][0] : (/^\d{4}-\d{2}$/.test(g.id) ? g.id : null);
+      out.push({
+        ...w, key: `${w.key}|r:${g.id}`, files: g.files, splitFrom: w.key, releaseId: g.id, releaseLabel: releaseLabel(g.id, relIds),
+        siblingReleases: relIds, editions: EDITION_ORDER.filter(e => ge.has(e)), roots: new Map(w.roots), termHint,
+        groupCandidates: w.groupCandidates ? [...w.groupCandidates] : w.groupCandidates,
+      });
+    }
+  }
+  return out;
+}
+
+/**
+ * Confirmed merges (aliases table, docs/ai-enrichment.md §6): a work whose key was merged into
+ * another key joins that work, so the merge survives every scan. `aliases` maps a full work_key
+ * ("Wicked|work|geral") to { to_key, to_name }. Chains (a→b→c) are followed. The target keeps its
+ * own folder; when the target's files are gone the aliased work takes over its key and name.
+ */
+function applyAliases(works, aliases) {
+  if (!aliases || !aliases.size) return works;
+  const resolve = (k) => {
+    let a = null, cur = k;
+    for (let i = 0; i < 8; i++) { const n = aliases.get(cur); if (!n || n.to_key === cur) break; a = n; cur = n.to_key; }
+    return a ? { ...a, to_key: cur } : null;
+  };
+  const byKey = new Map();
+  const order = [];
+  for (const w of works) {
+    const a = resolve(w.key);
+    if (a) { w.aliasedFrom = w.key; w.key = a.to_key; w.aliasName = a.to_name || null; }
+    if (!byKey.has(w.key)) { byKey.set(w.key, []); order.push(w.key); }
+    byKey.get(w.key).push(w);
+  }
+  const out = [];
+  for (const k of order) {
+    const list = byKey.get(k);
+    if (list.length === 1 && !list[0].aliasedFrom) { out.push(list[0]); continue; }
+    const base = list.find(w => !w.aliasedFrom) || list[0];
+    base.homeDirs = [...new Set(base.files.map(f => f.dir))];
+    for (const w of list) {
+      if (w === base) continue;
+      base.files.push(...w.files);
+      if (w.roots) for (const [r, n] of w.roots) base.roots.set(r, (base.roots.get(r) || 0) + n);
+      if (w.groupCandidates && base.groupCandidates) base.groupCandidates.push(...w.groupCandidates);
+      if (!base.sidecar && w.sidecar) base.sidecar = w.sidecar;
+    }
+    if (base.aliasedFrom) {
+      // the target itself is gone from disk: this work carries its key, kind and name
+      const [creator, kind] = k.split('|');
+      if (kind) base.kind = kind;
+      if (creator) base.creator = creator;
+      if (base.aliasName) { base.name = base.aliasName; if (base.layout === 'studio') base.character = base.aliasName; }
+    }
+    if (base.layout === 'studio') {
+      const eds = new Set(base.files.map(f => f.edition).filter(Boolean));
+      base.editions = EDITION_ORDER.filter(e => eds.has(e));
+    }
+    out.push(base);
+  }
+  return out;
 }
 
 // ── attribution ──────────────────────────────────────────────────────────────
@@ -692,8 +944,9 @@ function attributeWork(w, meta) {
     st.matched.add(`${m.file.key}|${m.file.size}`);
     st.by.add(m.by);
   }
-  // Stem matching (creator + character + edition) when files were renamed/extracted
-  if (meta && w.layout === 'studio' && w.character) {
+  // Stem matching (creator + character + edition) when files were renamed/extracted; not for one
+  // release of a character released several times (the stem would find the other releases' products)
+  if (meta && w.layout === 'studio' && w.character && !w.releaseId) {
     const eds = w.kind === 'diorama' ? ['Diorama'] : (w.editions.length ? w.editions : [null]);
     for (const ed of eds) {
       const hits = metaLib.productsForStem(meta, w.creator, w.character, ed);
@@ -747,7 +1000,8 @@ function attributeWork(w, meta) {
   let drive = null;
   if (meta && w.layout === 'studio') {
     for (const f of w.files) { drive = metaLib.driveForFile(meta, f.name); if (drive) break; }
-    if (!drive) for (const ed of (w.editions.length ? w.editions : [null])) { drive = metaLib.driveForStem(meta, w.creator, w.character, ed); if (drive) break; }
+    // by character stem only when the character has one release (the stem can't tell releases apart)
+    if (!drive && !w.releaseId) for (const ed of (w.editions.length ? w.editions : [null])) { drive = metaLib.driveForStem(meta, w.creator, w.character, ed); if (drive) break; }
   }
   if (!genre && drive && drive.genre) { genre = drive.genre; fields.franchise = 'drive'; }
   if (!genre && meta && w.layout === 'studio') {
@@ -835,6 +1089,7 @@ function finalizeWorks(works, { libraries = [], libraryOf }) {
     w.libraries = [...libs.keys()].sort((a, b) => libs.get(b) - libs.get(a) || a.localeCompare(b));
     w.library = w.libraries[0] || null;
     if (w.folders && w.folders.length === 1) { w.realFolder = w.folders[0]; }
+    else if (w.homeDirs && w.homeDirs.length) { w.realFolder = commonDir(w.homeDirs); } // merged work: the target's own folder
     else {
       // main root = the creator root holding most of its files
       const byRoot = new Map();
@@ -892,6 +1147,6 @@ function realFolder(p) {
 
 module.exports = {
   walkTree, filesUnder, resolveRoots, planWorks, studioRecords, studioWorks, folderWorks, attributeWork,
-  finalizeWorks, realFolder, editDistance, prettyName, inferModelName, releaseVariant, releaseItemName, commonDir, slugify,
+  finalizeWorks, realFolder, editDistance, applyAliases, splitReleases, productRelease, releaseLabel, prettyName, inferModelName, releaseVariant, releaseItemName, commonDir, slugify,
   TRANSPARENT, SKIP_DIR,
 };

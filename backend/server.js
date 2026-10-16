@@ -26,6 +26,8 @@ const { confinePath, tryConfine, sendPathError, imageUrlToFile, isSafeImageUrl }
 const { openSSE } = require('./lib/sse');
 const { acquireOr409 } = require('./lib/jobs');
 const { callClaudeAPI } = require('./lib/claude');
+const enrich = require('./lib/enrich');
+const organizerExport = require('./lib/organizer-export');
 
 const app = wrapAsyncRoutes(express());
 const PORT = process.env.PORT || 3001;
@@ -304,7 +306,7 @@ function addLayoutFilters(q, where, params) {
 
 /** List item: existing fields + parsed layout fields; heavy JSON (products) only on the detail route. */
 function shapeModel(m) {
-  const { products, attribution, ...rest } = m;
+  const { products, attribution, enrichment, ...rest } = m;
   return {
     ...rest,
     tags: parseJSON(m.tags || '[]', []),
@@ -436,8 +438,17 @@ app.get('/api/models/:id(\\d+)', (req, res) => {
   const files = db.prepare('SELECT * FROM model_files WHERE model_id = ? ORDER BY release_name NULLS LAST, filetype, filename').all(model.id);
   const attribution = parseJSON(model.attribution, null);
   if (attribution) { delete attribution.sig; delete attribution.autoFranchise; delete attribution.sourceUrl; delete attribution.foldedInto; }
+  const en = parseJSON(model.enrichment, null);
+  // other releases of the same creator + character ("Daredevil (2025)" next to "Daredevil (Netflix)")
+  const relBase = model.work_key && model.work_key.includes('|r:') ? model.work_key.slice(0, model.work_key.indexOf('|r:')) : null;
+  const siblings = relBase ? db.prepare(`SELECT id, name, release_term, release_label, editions FROM models
+      WHERE work_key LIKE ? ESCAPE '\\' AND id != ? AND folded_into IS NULL ORDER BY release_term, name`)
+    .all(`${likeEscape(relBase)}|r:%`, model.id).map(r => ({ ...r, editions: parseJSON(r.editions, []) })) : [];
   res.json({
     ...shapeModel(model),
+    siblings,
+    enrichment: en && en.at ? { at: en.at, model: en.model || null, runId: en.runId || null } : null,
+    suggestions: enrich.suggestionsFor(db, model.id),
     products: parseJSON(model.products, []).map(({ matchedBy, genre, creator, ...p }) => p),
     attribution: attribution || { confidence: model.confidence || 'none', fields: {}, matchedFiles: 0, totalFiles: files.length },
     files
@@ -445,12 +456,15 @@ app.get('/api/models/:id(\\d+)', (req, res) => {
 });
 
 app.patch('/api/models/:id(\\d+)', (req, res) => {
-  const { print_status, tags, notes, source_url, name, thumbnail_path, hidden, franchise, team, is_favorite, name_locked } = req.body || {};
+  const { print_status, tags, notes, source_url, name, thumbnail_path, hidden, franchise, team, is_favorite, name_locked, character, group_name, editions } = req.body || {};
+  if (editions !== undefined && editions !== null && !(Array.isArray(editions) && editions.every(e => ['Sculpture', 'Bust', 'Accessory', 'Diorama'].includes(e)))) {
+    return res.status(400).json({ error: 'editions must be an array of Sculpture, Bust, Accessory, Diorama' });
+  }
   // thumbnail_path must point at an extracted image under /images/ (or be cleared)
   if (thumbnail_path !== undefined && thumbnail_path !== null && thumbnail_path !== '' && !isSafeImageUrl(thumbnail_path)) {
     return res.status(400).json({ error: 'thumbnail_path must be an /images/... path' });
   }
-  const model = db.prepare('SELECT id, print_status, folded_into FROM models WHERE id = ?').get(req.params.id);
+  const model = db.prepare('SELECT id, print_status, folded_into, attribution FROM models WHERE id = ?').get(req.params.id);
   if (!model) return res.status(404).json({ error: 'Not found' });
   if (hidden !== undefined && !hidden && model.folded_into != null) {
     return res.status(409).json({
@@ -484,12 +498,29 @@ app.patch('/api/models/:id(\\d+)', (req, res) => {
   if (franchise !== undefined) { updates.push('franchise = ?'); params.push(franchise || null); }
   if (team !== undefined) { updates.push('team = ?'); params.push(team || null); }
   if (is_favorite !== undefined) { updates.push('is_favorite = ?'); params.push(is_favorite ? 1 : 0); }
+  if (character !== undefined) { updates.push('character = ?'); params.push(character || null); }
+  if (group_name !== undefined) { updates.push('group_name = ?'); params.push(group_name || null); }
+  if (editions !== undefined) { updates.push('editions = ?'); params.push(JSON.stringify(editions || [])); }
+  // Fields the user set are theirs: rescans and AI enrichment never overwrite them (attribution.userFields)
+  const userSet = Object.entries({ character, franchise, group_name, editions, tags, name }).filter(([, v]) => v !== undefined).map(([k]) => k);
+  if (userSet.length) {
+    const attr = parseJSON(model.attribution, {});
+    attr.userFields = [...new Set([...(Array.isArray(attr.userFields) ? attr.userFields : []), ...userSet])];
+    attr.fields = { ...(attr.fields || {}) };
+    for (const f of userSet) { attr.fields[f] = 'user'; if (attr.ai) delete attr.ai[f]; }
+    updates.push('attribution = ?'); params.push(JSON.stringify(attr));
+  }
 
   if (updates.length === 0) return res.status(400).json({ error: 'Nothing to update' });
   updates.push("updated_at = datetime('now')");
   params.push(req.params.id);
 
   db.prepare(`UPDATE models SET ${updates.join(', ')} WHERE id = ?`).run(...params);
+  if (userSet.length) {
+    // the user decided these fields: pending proposals for them are moot
+    db.prepare(`UPDATE suggestions SET status = 'superseded', decided_at = datetime('now') WHERE model_id = ? AND status = 'pending'
+      AND ((type = 'field' AND field IN (${userSet.map(() => '?').join(',')})) ${userSet.includes('name') ? "OR type = 'rename'" : ''})`).run(req.params.id, ...userSet);
+  }
   res.json({ success: true });
 });
 
@@ -1404,185 +1435,138 @@ app.get('/api/ai/vision-tags', async (req, res) => {
   } finally { release(); }
 });
 
-// ── AI Auto-Tagging (SSE) ────────────────────────────────────────────────────
+// ── AI enrichment (docs/ai-enrichment.md) ────────────────────────────────────
+// Fills character/genre/group/editions/tags, proposes renames and merges, keeps a review list
+// and an undo log. /api/ai/generate-tags is an alias that runs it with tags only (old clients).
 
-app.get('/api/ai/generate-tags', async (req, res) => {
-  const apiKey = req.query.key || process.env.CLAUDE_API_KEY || '';
+function enrichParams(q) {
+  const scope = ['all', 'unattributed', 'creator', 'ids'].includes(q.scope) ? q.scope : (q.ids ? 'ids' : (q.creator ? 'creator' : 'all'));
+  return { scope, creator: q.creator || null, ids: q.ids || null, vision: q.vision === '1' || q.vision === 'true', force: q.force === '1' };
+}
+async function enrichContext() {
+  let sum = null;
+  try { sum = await getMetaSummary(); } catch { sum = null; }
+  return { promptCtx: enrich.promptContext(db, sum || {}), evCtx: { libraryRoot: LIBRARY_PATH } };
+}
+function loadRender(card) {
+  const file = imageUrlToFile(card.thumbnail_path || '');
+  const media = file ? VISION_MEDIA[path.extname(file).toLowerCase()] : null;
+  if (!file || !media) return null;
+  try {
+    const buf = fs.readFileSync(file);
+    if (buf.length > 4_500_000) return null;
+    return { media, data: buf.toString('base64') };
+  } catch { return null; }
+}
+
+app.get('/api/ai/enrich/estimate', async (req, res) => {
+  const model = resolveTagModel(req.query.model);
+  const params = enrichParams(req.query);
+  const { promptCtx, evCtx } = await enrichContext();
+  res.json(enrich.estimate(db, params, { promptCtx, rates: TAG_MODELS[model], model, ctx: evCtx }));
+});
+
+/** One enrichment run streamed over SSE. tagsOnly: the generate-tags alias. */
+async function streamEnrich(req, res, { tagsOnly = false, jobName = 'enrich' } = {}) {
+  const fake = enrich.fakeEnabled();
+  const apiKey = req.query.key || req.headers['x-claude-key'] || process.env.CLAUDE_API_KEY || (fake ? 'fake' : '');
   if (!apiKey) { res.status(401).json({ error: 'API key required' }); return; }
   const model = resolveTagModel(req.query.model);
-
-  const release = acquireOr409(res, 'generate-tags');
+  const params = tagsOnly ? { scope: 'all', tagsOnly: true } : enrichParams(req.query);
+  const release = acquireOr409(res, jobName);
   if (!release) return;
   const sse = openSSE(req, res);
   sse.onAbort(release);
-  const send = (data) => sse.send(data);
-  const log = (level, msg) => send({ level, msg, ts: new Date().toISOString() });
-  const finish = (data) => { release(); sse.end({ type: 'done', ...data }); };
+  const log = (level, msg) => sse.send({ level, msg, ts: new Date().toISOString() });
+  let runId = null;
   try {
-
-  // Gather all models with creator names and slicer info
-  const models = db.prepare(`
-    SELECT m.id, m.name, m.tags, m.folder_path, m.has_chitubox, m.has_lychee, c.name as creator_name
-    FROM models m LEFT JOIN creators c ON m.creator_id = c.id
-    WHERE (m.hidden IS NULL OR m.hidden = 0)
-    ORDER BY c.name, m.name
-  `).all();
-
-  if (models.length === 0) {
-    log('info', 'No models found to tag.');
-    return finish({ success: true, tagged: 0, total: 0 });
-  }
-
-  log('info', `Found ${models.length} model(s) to tag`);
-
-  // Build a manifest for Claude — batch into chunks of 50 for better progress visibility
-  const BATCH_SIZE = 50;
-  const batches = [];
-  for (let i = 0; i < models.length; i += BATCH_SIZE) {
-    batches.push(models.slice(i, i + BATCH_SIZE));
-  }
-
-  log('info', `Split into ${batches.length} batch(es) of up to ${BATCH_SIZE}`);
-
-  let totalTagged = 0;
-  let totalErrors = 0;
-
-  const systemPrompt = `You are a tagging assistant for "The Vault", a 3D print model library.
-Given a list of 3D printable models with their names, creator names, folder paths, and slicer format, generate up to 7 relevant tags per model.
-
-Rules:
-- Max 7 tags per model. Fewer is fine if there aren't 7 meaningful tags.
-- The creator name should ALWAYS be included as a tag (exactly as given, lowercase).
-- Tags should be lowercase.
-- Tags should describe the model's franchise, category, character, or theme.
-- If slicer is "resin" (Chitubox/Lychee files present), include "resin" as a tag.
-- If slicer is "fdm" (no resin slicer files), include "fdm" as a tag. This is important for filtering by print technology.
-- Examples: "star wars", "marvel", "thundercats", "dragon", "miniature", "terrain", "bust", "vehicle", "droid", "rebel", "empire", "fantasy", "sci-fi", "anime", "warhammer", "dnd", "resin", "fdm"
-- Use broad franchise tags (e.g. "star wars") AND specific tags (e.g. "rebel", "x-wing")
-- Optionally prefix a tag with a facet for cleaner organising: "type:" (bust/miniature/terrain/prop/vehicle), "franchise:", "scale:", "tech:" (e.g. "type:bust", "franchise:star wars", "tech:resin"). Plain tags are still fine; don't force facets where they don't help.
-- Use the folder path structure for context clues (e.g. "Star Wars/Vehicles/X-wing" → tags: ["star wars", "vehicle", "x-wing"])
-- If a model name suggests a known character or IP, tag appropriately (e.g. "Cheetara" → ["thundercats", "cheetara"])
-
-Respond with ONLY a JSON array. Each element: {"id": <model_id>, "tags": ["tag1", "tag2", ...]}
-No other text or explanation — just the JSON array.`;
-
-  for (let b = 0; b < batches.length; b++) {
-    if (sse.aborted) { log('warn', 'Client disconnected — stopping'); return release(); }
-    const batch = batches[b];
-    const batchLabel = `Batch ${b + 1}/${batches.length}`;
-    const firstCreator = batch[0]?.creator_name || 'unknown';
-    const lastCreator = batch[batch.length - 1]?.creator_name || 'unknown';
-    const creatorRange = firstCreator === lastCreator ? firstCreator : `${firstCreator} → ${lastCreator}`;
-
-    log('info', `${batchLabel} — ${batch.length} models (${creatorRange})`);
-    log('api', `${batchLabel} — sending to Claude API…`);
-
-    const manifest = batch.map(m => ({
-      id: m.id,
-      name: m.name,
-      creator: m.creator_name,
-      path: realFolder(m.folder_path).replace(/^\/library\/?/, ''),
-      slicer: (m.has_chitubox || m.has_lychee) ? 'resin' : 'fdm'
-    }));
-
-    const userContent = `Tag these 3D models:\n\n${JSON.stringify(manifest, null, 1)}`;
-
-    try {
-      const parsed = await callClaudeAPI(apiKey, {
-        model,
-        max_tokens: 4096,
-        system: systemPrompt,
-        messages: [{ role: 'user', content: userContent }]
-      }, { timeoutMs: 180000, signal: sse.signal }); // 3 min per batch
-
-      const textBlocks = (parsed.content || []).filter(b => b.type === 'text');
-      const fullText = textBlocks.map(b => b.text).join('\n');
-
-      // Log token usage
-      if (parsed.usage) {
-        log('info', `${batchLabel} — API responded (${parsed.usage.input_tokens} in / ${parsed.usage.output_tokens} out tokens)`);
-      }
-
-      // Extract JSON array — may be wrapped in code fences
-      const jsonMatch = fullText.match(/\[[\s\S]*\]/);
-      if (!jsonMatch) {
-        log('error', `${batchLabel} — Claude didn't return a JSON array. Response preview: "${fullText.substring(0, 120)}…"`);
-        totalErrors++;
-        continue;
-      }
-
-      let result;
-      try {
-        result = JSON.parse(jsonMatch[0]);
-      } catch (parseErr) {
-        log('error', `${batchLabel} — couldn't parse JSON from Claude response: ${parseErr.message}`);
-        totalErrors++;
-        continue;
-      }
-
-      if (!Array.isArray(result)) {
-        log('error', `${batchLabel} — expected array but got ${typeof result}`);
-        totalErrors++;
-        continue;
-      }
-
-      log('info', `${batchLabel} — received tags for ${result.length} model(s), applying…`);
-
-      // Apply tags to DB
-      const updateStmt = db.prepare(`UPDATE models SET tags = ?, updated_at = datetime('now') WHERE id = ?`);
-      let batchTagged = 0;
-      const applyBatch = db.transaction((tagResults) => {
-        for (const item of tagResults) {
-          if (!item.id || !Array.isArray(item.tags)) continue;
-          const existing = batch.find(m => m.id === item.id);
-          const existingTags = existing ? JSON.parse(existing.tags || '[]') : [];
-          const merged = [...new Set([...existingTags, ...item.tags.map(t => t.toLowerCase())])].slice(0, 7);
-          updateStmt.run(JSON.stringify(merged), item.id);
-          batchTagged++;
-        }
-      });
-      applyBatch(result);
-      totalTagged += batchTagged;
-
-      // Show some example tags from this batch
-      const examples = result.slice(0, 3).map(r => {
-        const m = batch.find(bm => bm.id === r.id);
-        return `${m?.name || r.id}: [${r.tags.join(', ')}]`;
-      });
-      for (const ex of examples) {
-        log('tag', `  ${ex}`);
-      }
-      if (result.length > 3) log('tag', `  … and ${result.length - 3} more`);
-
-      log('success', `${batchLabel} — ✓ tagged ${batchTagged} models (${totalTagged} total so far)`);
-
-    } catch (e) {
-      log('error', `${batchLabel} — ✗ ${e.message}`);
-      totalErrors++;
-
-      // If it's an auth error, no point continuing
-      if (e.message.includes('Invalid API key') || e.message.includes('lacks permission')) {
-        log('error', 'Stopping — fix your API key and try again.');
-        return finish({ success: false, error: e.message, tagged: totalTagged, total: models.length });
-      }
-
-      // If rate limited, wait and retry
-      if (e.message.includes('Rate limited')) {
-        log('warn', 'Waiting 30s before retrying…');
-        await sse.sleep(30000);
-        b--; // retry this batch
-        continue;
-      }
+    if (fake) console.warn('[enrich] ENRICH_FAKE=1: using the dev fake model, not Claude');
+    const { promptCtx, evCtx } = await enrichContext();
+    const sel = enrich.selectCards(db, params, evCtx);
+    runId = enrich.createRun(db, { model: fake ? `${model} (fake)` : model, scope: tagsOnly ? 'tags' : params.scope, params: { ...params, tagsOnly } });
+    log('info', `Enrich run #${runId}: ${sel.cards.length} card(s) to process, ${sel.skipped} unchanged since the last run`);
+    if (!sel.cards.length) {
+      enrich.finishRun(db, runId, { total: 0, unchanged: sel.skipped }, 'complete');
+      release();
+      sse.end({ type: 'done', success: true, runId, applied: 0, suggested: 0, merges: 0, unchanged: sel.skipped, errors: 0, visionUsed: 0, tagged: 0, total: 0 });
+      return;
     }
-  }
-
-  const msg = totalErrors > 0
-    ? `Done with ${totalErrors} error(s) — tagged ${totalTagged} of ${models.length} models`
-    : `✓ All done — tagged ${totalTagged} of ${models.length} models`;
-  log(totalErrors > 0 ? 'warn' : 'success', msg);
-  finish({ success: true, tagged: totalTagged, total: models.length, errors: totalErrors });
+    const counts = await enrich.runEnrich({
+      db, cards: sel.cards, runId, model, apiKey, promptCtx, ctxOpts: evCtx, vision: params.vision, tagsOnly,
+      client: enrich.getClient(log), log, progress: (p) => sse.send(p), aborted: () => sse.aborted, sleep: (ms) => sse.sleep(ms),
+      signal: sse.signal, loadImage: loadRender,
+    });
+    counts.unchanged = sel.skipped;
+    const status = counts.fatal ? 'error' : (counts.cancelled ? 'cancelled' : 'complete');
+    enrich.finishRun(db, runId, counts, status);
+    if (counts.cancelled && sse.aborted) { console.log(`[enrich] run #${runId} stopped: client disconnected`); return; }
+    const ok = !counts.fatal;
+    log(ok ? (counts.errors ? 'warn' : 'success') : 'error', ok
+      ? `Done: ${counts.applied} applied, ${counts.suggested} suggestion(s), ${counts.merges} merge proposal(s), ${counts.errors} error(s)`
+      : `Stopped: ${counts.fatal}`);
+    release();
+    sse.end({
+      type: 'done', success: ok, runId, applied: counts.applied, suggested: counts.suggested, merges: counts.merges,
+      unchanged: sel.skipped, errors: counts.errors, visionUsed: counts.visionUsed,
+      // generate-tags clients read these
+      tagged: counts.applied, total: sel.cards.length, ...(counts.fatal ? { error: counts.fatal } : {}),
+    });
+  } catch (e) {
+    if (runId) enrich.finishRun(db, runId, {}, 'error');
+    log('error', e.message);
+    release();
+    sse.end({ type: 'done', success: false, error: e.message, runId });
   } finally { release(); }
+}
+
+app.get('/api/ai/enrich', (req, res) => streamEnrich(req, res));
+// Old clients: "Generate tags" is Enrich with tags only (additive, never removes a tag, cap 12)
+app.get('/api/ai/generate-tags', (req, res) => streamEnrich(req, res, { tagsOnly: true, jobName: 'generate-tags' }));
+
+app.get('/api/ai/enrich/runs', (req, res) => res.json({ runs: enrich.listRuns(db, clampInt(req.query.limit, 50, 1, 500)) }));
+app.post('/api/ai/enrich/runs/:id(\\d+)/undo', (req, res) => {
+  try { res.json(enrich.undoRun(db, Number(req.params.id))); } catch (e) { res.status(e.status || 500).json({ error: e.message }); }
 });
+
+app.get('/api/suggestions', (req, res) => res.json(enrich.listSuggestions(db, req.query)));
+app.get('/api/suggestions/summary', (req, res) => res.json(enrich.summary(db)));
+app.post('/api/suggestions/decide', (req, res) => {
+  const { ids, decision } = req.body || {};
+  if (!Array.isArray(ids) || !ids.length) return res.status(400).json({ error: 'ids array required' });
+  if (!['accept', 'reject'].includes(decision)) return res.status(400).json({ error: 'decision must be "accept" or "reject"' });
+  res.json(enrich.decide(db, ids.map(Number).filter(Number.isInteger), decision));
+});
+app.post('/api/suggestions/decide-filter', (req, res) => {
+  const { filter, decision } = req.body || {};
+  if (!['accept', 'reject'].includes(decision)) return res.status(400).json({ error: 'decision must be "accept" or "reject"' });
+  res.json(enrich.decideFilter(db, filter || {}, decision));
+});
+
+// ── Organizer export (docs/ai-enrichment.md §7) ──────────────────────────────
+
+async function exportCtx(req) {
+  let sum = null;
+  try { sum = await getMetaSummary(); } catch { sum = null; }
+  const libs = healthCache.libraries && healthCache.libraries.length ? healthCache.libraries : librariesLib.listLibraries(LIBRARY_PATH, sum?.libraryLabels);
+  return { since: req.query.since || null, metaSummary: sum || {}, libraries: libs };
+}
+app.get('/api/organizer/export', async (req, res) => {
+  const ctx = await exportCtx(req);
+  const generatedAt = new Date().toISOString();
+  const files = Object.entries(organizerExport.FILES).map(([name, f]) => ({
+    name, url: `/api/organizer/export/${name}${ctx.since ? `?since=${encodeURIComponent(ctx.since)}` : ''}`, rows: f.fn(db, ctx).rows.length,
+  }));
+  res.json({ generatedAt, since: ctx.since, cursor: generatedAt, files });
+});
+app.get('/api/organizer/export/:file', async (req, res) => {
+  const f = organizerExport.FILES[req.params.file];
+  if (!f) return res.status(404).json({ error: 'Unknown export file' });
+  const out = f.fn(db, await exportCtx(req));
+  res.setHeader('Content-Type', f.type);
+  res.setHeader('Content-Disposition', `attachment; filename="${req.params.file}"`);
+  res.send(out.text);
+});
+
 
 // ── AI Image Finder (SSE) ────────────────────────────────────────────────────
 
@@ -2292,6 +2276,9 @@ function startServer() {
   markRunningScans('interrupted', 'Server restarted during scan');
 
   const server = app.listen(PORT, HOST, () => console.log(`The Vault v${APP_VERSION.version} (build ${APP_VERSION.build}) running on ${HOST}:${PORT}`));
+  if (enrich.fakeEnabled()) {
+    console.warn('\n' + '!'.repeat(78) + '\n!! ENRICH_FAKE=1: AI enrichment answers come from the DEV FAKE MODEL, not Claude.\n!! For UI demos only. Unset ENRICH_FAKE in any real deployment.\n' + '!'.repeat(78) + '\n');
+  }
 
   // Daily DB snapshot: first check 60s after start (never delays the
   // healthcheck), then hourly; writes one file per day.

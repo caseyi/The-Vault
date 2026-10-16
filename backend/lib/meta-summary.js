@@ -22,6 +22,9 @@ function summarize(meta) {
     loadedAt: meta.loadedAt || new Date().toISOString(),
     status: metaLib.metaStatus(meta),
     libraryLabels: (meta.vault && meta.vault.libraryLabels) || null,
+    // organizer rules (fix/genre/group/guess…) and genre_map: AI prompt context and export de-duplication
+    rules: meta.rules || {},
+    genreMap: Object.fromEntries(meta.genreMap instanceof Map ? meta.genreMap : []),
     products: (meta.products || []).filter(p => !p.unknown).map(p => ({
       creator: p.creator, rawCreator: p.rawCreator || '', studio: p.studio || null, name: p.name, term: p.term || null,
       libraryUrl: p.libraryUrl || null, productUrl: p.productUrl || null,
