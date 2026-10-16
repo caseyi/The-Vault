@@ -2323,3 +2323,10 @@ input:focus-visible, textarea:focus-visible, select:focus-visible { outline-offs
 .file-dup-name { font-family: var(--font-mono); font-size: 11px; color: var(--text); padding: 6px 8px 2px; overflow-wrap: anywhere; }
 .file-dup-copies { list-style: none; padding: 2px 8px 8px; display: flex; flex-direction: column; gap: 3px; }
 .file-dup-copies li { font-size: 11px; min-width: 0; }
+.notice-info { border-left-color: var(--blue); }
+.collection-banner { display: flex; gap: 10px; align-items: flex-start; margin: 10px 24px 0; padding: 10px 12px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg2); }
+.collection-banner-dot { width: 10px; height: 10px; border-radius: 50%; margin-top: 4px; flex-shrink: 0; }
+.collection-banner-name { font-family: var(--font-mono); font-size: 10px; letter-spacing: 1.5px; text-transform: uppercase; color: var(--text-faint); }
+.collection-banner-desc { font-size: 12px; color: var(--text-muted); white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.45; margin-top: 2px; }
+.attr-folded { margin: 8px 0 0; font-size: 11px; color: var(--text-faint); line-height: 1.45; }
+@media (max-width: 768px) { .collection-banner { margin: 8px 12px 0; } }

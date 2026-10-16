@@ -348,7 +348,8 @@ export default function Sidebar({ open, onToggle, stats, creators, tags, filters
                         ) : (
                           <span style={{ width: 8, height: 8, borderRadius: '50%', background: c.color, flexShrink: 0 }} />
                         )}
-                        <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', flex: 1 }}>{c.name}</span>
+                        <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', flex: 1 }} title={c.description || undefined}>{c.name}</span>
+                        {c.description && <span className="sr-only">: {c.description}</span>}
                         <span className="count">{c.model_count}</span>
                       </button>
                       <button type="button" onClick={() => handleTogglePin(c)} className={`row-icon-btn ${c.pinned ? 'on' : ''}`}

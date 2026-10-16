@@ -297,6 +297,20 @@ function FilterChips({ chips, onRemove, onClearAll }) {
   );
 }
 
+/** Name + description of the collection being browsed (e.g. "Was: DC" from the regroup). */
+export function CollectionBanner({ collection }) {
+  if (!collection || !collection.description) return null;
+  return (
+    <div className="collection-banner" role="note" aria-label={`About collection ${collection.name}`}>
+      <span className="collection-banner-dot" style={{ background: collection.color }} aria-hidden="true" />
+      <div className="collection-banner-body">
+        <div className="collection-banner-name">{collection.name}</div>
+        <div className="collection-banner-desc">{collection.description}</div>
+      </div>
+    </div>
+  );
+}
+
 const SORT_OPTIONS = [
   { value: 'creator', label: 'Creator / Name' },
   { value: 'name', label: 'Name A–Z' },
@@ -439,7 +453,12 @@ export default function Gallery({ filters, onFilterChange, onModelClick, showHid
   };
 
   const handleBulkHide = async (hide) => {
-    await apiSend('/api/models/bulk', 'POST', { ids: selectedList, hidden: hide });
+    const r = await apiSend('/api/models/bulk', 'POST', { ids: selectedList, hidden: hide });
+    const skipped = (r && r.skippedFolded) || 0;
+    if (!hide && skipped > 0) {
+      notify(`${skipped} card${skipped !== 1 ? 's were' : ' was'} folded into a work when the library was regrouped and stay${skipped !== 1 ? '' : 's'} hidden. Open the work instead; its tags, notes and collections are there.`,
+        { type: 'info', duration: 10000 });
+    }
     clearSelection();
     reload();
     if (onRefreshStats) onRefreshStats();
@@ -450,7 +469,12 @@ export default function Gallery({ filters, onFilterChange, onModelClick, showHid
       await apiSend(`/api/models/${id}`, 'PATCH', { hidden: hide });
       reload();
       if (onRefreshStats) onRefreshStats();
-    } catch (e) { notify(`Couldn't ${hide ? 'hide' : 'unhide'} model: ${errorMessage(e)}`); }
+    } catch (e) {
+      // 409: the row was folded into a work by the regroup; the server explains where its data went
+      if (e && e.status === 409) notify(errorMessage(e), { duration: 12000 });
+      else notify(`Couldn't ${hide ? 'hide' : 'unhide'} model: ${errorMessage(e)}`);
+      reload(); // re-sync the card with the server either way
+    }
   }, [fetchModels, onRefreshStats, notify]); // eslint-disable-line
 
   const handleFavorite = useCallback(async (id, fav) => {
@@ -515,6 +539,9 @@ export default function Gallery({ filters, onFilterChange, onModelClick, showHid
       </div>
 
       <FilterChips chips={chips} onRemove={removeChip} onClearAll={clearAll} />
+      {filters.collection && Array.isArray(collections) && (
+        <CollectionBanner collection={collections.find(c => String(c.id) === String(filters.collection))} />
+      )}
 
       <div className="gallery-scroll">
         {models.length === 0 && !loading && loadedOnce && (

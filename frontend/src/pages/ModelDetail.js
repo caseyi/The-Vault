@@ -491,7 +491,10 @@ export default function ModelDetail({ modelId, onBack, onSaved, onQueueChange, c
                 await apiSend(`/api/models/${model.id}`, 'PATCH', { hidden: newHidden });
                 setModel(m => ({ ...m, hidden: newHidden ? 1 : 0 }));
                 if (onSaved) onSaved();
-              } catch (e) { notify(`Couldn't ${newHidden ? 'hide' : 'unhide'} model: ${errorMessage(e)}`); }
+              } catch (e) {
+                if (e && e.status === 409) notify(errorMessage(e), { duration: 12000 });
+                else notify(`Couldn't ${newHidden ? 'hide' : 'unhide'} model: ${errorMessage(e)}`);
+              }
             }}
             className={`chip-btn ${isHidden ? 'active' : ''}`}>
             {isHidden ? '👁 Unhide' : '🙈 Hide'}

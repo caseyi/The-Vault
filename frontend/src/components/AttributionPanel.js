@@ -112,6 +112,8 @@ export default function AttributionPanel({ model }) {
   const norm = s => String(s || '').trim().toLowerCase();
   const group = model.group_name && ![norm(model.character), norm(model.name), norm(model.franchise)].includes(norm(model.group_name)) ? model.group_name : '';
   const knownSource = model.source && model.source !== 'unknown';
+  const folded = (Array.isArray(attribution && attribution.foldedFrom) ? attribution.foldedFrom : [])
+    .map(e => (typeof e === 'string' ? e : e && e.name)).filter(Boolean);
   const explanation = confidence ? explainConfidence(attribution, { source: model.source }) : '';
 
   return (
@@ -165,6 +167,9 @@ export default function AttributionPanel({ model }) {
       )}
       {libraries.length > 0 && <Row label={libraries.length > 1 ? 'Libraries' : 'Library'}>{libraries.join(' + ')}</Row>}
 
+      {folded.length > 0 && (
+        <p className="attr-folded">Includes data from: {[...new Set(folded)].join(', ')}</p>
+      )}
       {explanation && <p className={`attr-explain ${isAttributed(confidence) ? '' : 'weak'}`}>{explanation}</p>}
 
       {products.length > 0 && (

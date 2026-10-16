@@ -72,3 +72,9 @@ test('release items: no empty genre dash, group equal to the name is dropped, un
   expect(panel).toHaveTextContent('Going Down the Drain');
   expect(panel).toHaveTextContent('Creator');
 });
+
+test('lists the old cards folded into this work', () => {
+  render(<AttributionPanel model={{ id: 4, name: 'Ken', studio: 'Wicked', confidence: 'exact',
+    attribution: { confidence: 'exact', foldedFrom: [{ id: 7, name: 'Ken Bust' }, { id: 8, name: 'WICKED - Ken (Non Supported)', collection: 3 }, 'DC'] } }} />);
+  expect(screen.getByText('Includes data from: Ken Bust, WICKED - Ken (Non Supported), DC')).toBeInTheDocument();
+});
