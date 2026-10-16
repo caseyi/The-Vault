@@ -4,7 +4,7 @@ import { useNotify } from './Notices';
 import { useConfirm } from './ConfirmDialog';
 import {
   REVIEW_GROUPS, FIELD_LABELS, BAND_LABELS, HIGH_MIN, band, pct, asValues, addedValues,
-  formatRunDate, decideSummary,
+  formatRunDate, decideToasts, splitDecideErrors, actualCost,
 } from '../enrich';
 import { formatTerm } from '../library';
 
@@ -140,6 +140,87 @@ function ReviewRow({ item, active, selected, onSelect, onDecide, busy, rowRef, o
   );
 }
 
+function unmergeMessage(r) {
+  const x = (r && r.restored) || {};
+  const parts = [];
+  if (x.files) parts.push(`${x.files} file${x.files !== 1 ? 's' : ''}`);
+  if (x.collections) parts.push(`${x.collections} collection${x.collections !== 1 ? 's' : ''}`);
+  if (x.queue) parts.push('its print-queue entry');
+  let msg = `Unmerged${parts.length ? `: restored ${parts.join(', ')}` : ''}${x.alias ? '; alias removed' : ''}.`;
+  const kept = Array.isArray(r && r.notReverted) ? r.notReverted : [];
+  if (kept.length) msg += ` Not reverted: ${kept.join('; ')}.`;
+  return msg;
+}
+
+/** Merges already accepted, each with Unmerge (POST /api/suggestions/:id/unmerge). */
+export function AcceptedMerges({ refreshKey, onUnmerged }) {
+  const notify = useNotify();
+  const [confirmUi, askConfirm] = useConfirm();
+  const [items, setItems] = useState(null);
+  const [total, setTotal] = useState(0);
+  const [supported, setSupported] = useState(true);
+  const [busy, setBusy] = useState(null);
+  const load = useCallback(() => {
+    apiGet('/api/suggestions?status=accepted&type=merge&limit=20')
+      .then(d => { setItems((d && d.items) || []); setTotal((d && d.total) || 0); })
+      .catch(() => setItems([]));
+  }, []);
+  useEffect(() => { load(); }, [load, refreshKey]);
+
+  const unmerge = async (s) => {
+    const ok = await askConfirm({
+      title: `Unmerge "${s.model?.name}" from "${s.target?.name}"?`,
+      message: (
+        <>
+          <p><b>{s.model?.name}</b> becomes its own card again, with its files, collections and print-queue entry. The alias is removed, and this merge is not proposed again.</p>
+          <p>Tags, notes and print status that were merged into <b>{s.target?.name}</b> stay there.</p>
+        </>
+      ),
+      confirmLabel: 'Unmerge',
+      danger: true,
+    });
+    if (!ok) return;
+    setBusy(s.id);
+    try {
+      const r = await apiSend(`/api/suggestions/${s.id}/unmerge`, 'POST');
+      notify(unmergeMessage(r), { type: 'success', duration: 9000 });
+      clearReviewCardCache();
+      load();
+      if (onUnmerged) onUnmerged();
+    } catch (e) {
+      // an older backend has no unmerge route (plain 404 without a JSON error)
+      if (e && e.status === 404 && !(e.body && typeof e.body === 'object' && e.body.error)) {
+        setSupported(false);
+        notify('Unmerge needs a newer backend; this server does not support it yet.');
+      } else notify(`Couldn't unmerge: ${errorMessage(e)}`);
+    }
+    setBusy(null);
+  };
+
+  if (!items || items.length === 0) return null;
+  return (
+    <div className="review-runs accepted-merges">
+      {confirmUi}
+      <div className="attr-subtitle">Accepted merges <span className="attr-faint">{total.toLocaleString()}</span></div>
+      <ul className="accepted-merge-list">
+        {items.map(s => (
+          <li key={s.id} className="org-health-row accepted-merge-row">
+            <span className="org-health-name" title={`${s.model?.name} → ${s.target?.name}`}>
+              {s.model?.name} <span className="diff-arrow" aria-hidden="true">→</span><span className="sr-only"> merged into </span> {s.target?.name}
+            </span>
+            <span className="org-health-creator">{s.model?.creator_name}</span>
+            {s.decidedAt && <span className="attr-faint num">{formatRunDate(s.decidedAt)}</span>}
+            {supported && (
+              <button className="org-btn org-btn-sm org-btn-danger" disabled={busy != null} onClick={() => unmerge(s)}
+                aria-label={`Unmerge ${s.model?.name} from ${s.target?.name}`}>↶ Unmerge</button>
+            )}
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
 export function RunsHistory({ refreshKey, onUndone }) {
   const notify = useNotify();
   const [confirmUi, askConfirm] = useConfirm();
@@ -177,7 +258,7 @@ export function RunsHistory({ refreshKey, onUndone }) {
       <div className="attr-subtitle">Enrich runs</div>
       <div className="runs-scroll">
       <table className="attr-cov-table runs-table">
-        <thead><tr><th scope="col">Run</th><th scope="col">Started</th><th scope="col">Scope</th><th scope="col">Applied</th><th scope="col">Suggested</th><th scope="col">Merges</th><th scope="col"><span className="sr-only">Actions</span></th></tr></thead>
+        <thead><tr><th scope="col">Run</th><th scope="col">Started</th><th scope="col">Scope</th><th scope="col">Applied</th><th scope="col">Suggested</th><th scope="col">Merges</th><th scope="col">Actual cost</th><th scope="col"><span className="sr-only">Actions</span></th></tr></thead>
         <tbody>
           {runs.map(r => (
             <tr key={r.id}>
@@ -187,6 +268,7 @@ export function RunsHistory({ refreshKey, onUndone }) {
               <td className="num">{r.applied ?? 0}</td>
               <td className="num">{r.suggested ?? 0}</td>
               <td className="num">{r.merges ?? 0}</td>
+              <td className="num" title={actualCost(r) ? 'Tokens and USD actually used' : undefined}>{actualCost(r) || <span className="attr-faint">—</span>}</td>
               <td>
                 {r.undone ? <span className="attr-faint">undone</span> : (
                   <button className="org-btn org-btn-sm org-btn-danger" onClick={() => undo(r)} disabled={!r.applied}
@@ -264,25 +346,55 @@ export default function ReviewTab({ onSummary }) {
 
   useEffect(() => { load(1); }, [load]);
 
-  const decide = useCallback(async (ids, decision, rows = []) => {
+  const [mergesKey, setMergesKey] = useState(0);
+
+  const runDecide = useCallback(async (ids, decision, rows = []) => {
     if (!ids.length) return;
     setBusy(true);
     try {
       const r = await apiSend('/api/suggestions/decide', 'POST', { ids, decision });
-      const failed = new Set((r?.errors || []).map(e => e.id));
+      // superseded ("changed since") rows are no longer pending: they leave the list too
+      const failed = new Set(splitDecideErrors(r).failed.map(e => e.id));
       setItems(prev => prev.filter(x => !ids.includes(x.id) || failed.has(x.id)));
       setTotal(t => Math.max(0, t - (ids.length - failed.size)));
       setSelected(prev => { const n = new Set(prev); ids.forEach(id => n.delete(id)); return n; });
       const merge = rows.length === 1 && rows[0].type === 'merge' && decision === 'accept' && r?.merged;
-      if (merge) notify(`Merged "${rows[0].model?.name}" into "${rows[0].target?.name}". Its tags, notes and collections moved with it.`, { type: 'success' });
-      else notify(decideSummary(r), { type: failed.size ? 'error' : 'success' });
-      if (failed.size) notify(`${failed.size} could not be applied: ${r.errors[0].error}`);
-      if (r?.merged) clearReviewCardCache();
+      const toasts = decideToasts(r);
+      if (merge) {
+        notify(`Merged "${rows[0].model?.name}" into "${rows[0].target?.name}". Its tags, notes and collections moved with it; Unmerge is under Accepted merges.`, { type: 'success' });
+        toasts.filter(t => t.type !== 'success').forEach(t => notify(t.message, { type: t.type }));
+      } else toasts.forEach(t => notify(t.message, { type: t.type }));
+      if (r?.merged) { clearReviewCardCache(); setMergesKey(k => k + 1); }
       loadSummary();
       setRunsKey(k => k + 1);
     } catch (e) { notify(`Couldn't ${decision} suggestions: ${errorMessage(e)}`); }
     setBusy(false);
   }, [loadSummary, notify]);
+
+  // Accepting more than one suggestion, or any merge, asks first (merges are only reversible by Unmerge)
+  const decide = useCallback(async (ids, decision, rows = []) => {
+    if (!ids.length) return;
+    if (decision === 'accept') {
+      const merges = rows.filter(r => r.type === 'merge');
+      if (merges.length || ids.length > 1) {
+        const single = ids.length === 1 && merges.length === 1 ? merges[0] : null;
+        const ok = await askConfirm({
+          title: single ? `Merge "${single.model?.name}" into "${single.target?.name}"?` : `Accept ${ids.length} selected suggestion${ids.length !== 1 ? 's' : ''}?`,
+          message: (
+            <>
+              {!single && <p>Accepts <b>{ids.length - merges.length}</b> field change{ids.length - merges.length !== 1 ? 's' : ''}{merges.length ? <> and <b>{merges.length}</b> merge{merges.length !== 1 ? 's' : ''}</> : null}.</p>}
+              {merges.length > 0 && (
+                <p>{merges.length} merge{merges.length !== 1 ? 's' : ''} will fold cards (a DB snapshot is taken first). Tags, notes and collections move to the card that stays; the alias is remembered for future scans. You can Unmerge later from Accepted merges.</p>
+              )}
+            </>
+          ),
+          confirmLabel: single ? 'Merge' : `Accept ${ids.length}`,
+        });
+        if (!ok) return;
+      }
+    }
+    await runDecide(ids, decision, rows);
+  }, [askConfirm, runDecide]);
 
   const acceptHigh = async () => {
     if (!filter) return;
@@ -299,7 +411,7 @@ export default function ReviewTab({ onSummary }) {
       message: (
         <>
           <p>Accepts <b>{n}</b> pending suggestion{n !== 1 ? 's' : ''} in <b>{groupDef.label}</b> with confidence of {Math.round(HIGH_MIN * 100)}% or more{creator ? <> from <b>{creator}</b></> : ''}.</p>
-          {groupDef.id === 'merges' && <p>Each merge folds a card into the other; tags, notes and collections are kept and the alias is remembered for future scans.</p>}
+          {groupDef.id === 'merges' && <p>{n} merge{n !== 1 ? 's' : ''} will fold cards (a DB snapshot is taken first). Tags, notes and collections are kept and the alias is remembered for future scans; each can be undone with Unmerge.</p>}
           <p>{total - n > 0 ? `${total - n} lower-confidence suggestion${total - n !== 1 ? 's stay' : ' stays'} in the list.` : 'Nothing else is pending in this group.'}</p>
         </>
       ),
@@ -309,8 +421,8 @@ export default function ReviewTab({ onSummary }) {
     setBusy(true);
     try {
       const r = await apiSend('/api/suggestions/decide-filter', 'POST', { filter: { ...base, minConfidence: HIGH_MIN, status: 'pending' }, decision: 'accept' });
-      notify(decideSummary(r), { type: (r?.errors || []).length ? 'error' : 'success' });
-      if (r?.merged) clearReviewCardCache();
+      decideToasts(r).forEach(t => notify(t.message, { type: t.type }));
+      if (r?.merged) { clearReviewCardCache(); setMergesKey(k => k + 1); }
       await loadSummary();
       load(1);
       setRunsKey(k => k + 1);
@@ -358,6 +470,7 @@ export default function ReviewTab({ onSummary }) {
     return (
       <div className="org-tab-body review-tab">
         <div className="org-empty">Nothing to review. Run Enrich metadata (Scan Library → AI) to get suggestions.</div>
+        <AcceptedMerges refreshKey={mergesKey} onUnmerged={loadSummary} />
         <RunsHistory refreshKey={runsKey} onUndone={loadSummary} />
       </div>
     );
@@ -430,6 +543,7 @@ export default function ReviewTab({ onSummary }) {
         )}
       </div>
 
+      <AcceptedMerges refreshKey={mergesKey} onUnmerged={() => { loadSummary(); setRunsKey(k => k + 1); }} />
       <RunsHistory refreshKey={runsKey} onUndone={() => { loadSummary(); load(1); }} />
     </div>
   );

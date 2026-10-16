@@ -6,7 +6,8 @@ import ReleaseFileList from '../components/ReleaseFileList';
 import RenderHintPanel from '../components/RenderHintPanel';
 import Modal from '../components/Modal';
 import AttributionPanel, { hasAttributionData, AiMark } from '../components/AttributionPanel';
-import { decideSummary, isTermLabel } from '../enrich';
+import { decideToasts, splitDecideErrors, isTermLabel } from '../enrich';
+import { useConfirm } from '../components/ConfirmDialog';
 import { formatTerm } from '../library';
 import { asList } from '../library';
 import { useNotify } from '../components/Notices';
@@ -266,6 +267,7 @@ function useNarrow() {
 
 export default function ModelDetail({ modelId, onBack, onSaved, onQueueChange, collections, onCollectionsChange, onOpenModel, onSuggestionsChange }) {
   const notify = useNotify();
+  const [confirmUi, askConfirm] = useConfirm();
   const narrow = useNarrow();
   const [model, setModel] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -387,10 +389,18 @@ export default function ModelDetail({ modelId, onBack, onSaved, onQueueChange, c
   };
 
   const decideSuggestion = async (ids, decision, item) => {
+    if (item && item.type === 'merge' && decision === 'accept') {
+      const ok = await askConfirm({
+        title: `Merge "${item.model?.name}" into "${item.target?.name}"?`,
+        message: <p>The merge folds this card into the other (a DB snapshot is taken first). Tags, notes and collections move with it; you can Unmerge later from Organize → Review.</p>,
+        confirmLabel: 'Merge',
+      });
+      if (!ok) return;
+    }
     try {
       const r = await apiSend('/api/suggestions/decide', 'POST', { ids, decision });
-      const errs = (r && r.errors) || [];
-      if (errs.length) { notify(`Couldn't ${decision}: ${errs[0].error}`); return; }
+      const { failed } = splitDecideErrors(r);
+      if (failed.length) { notify(`Couldn't ${decision}: ${failed[0].error}`); return; }
       if (onSuggestionsChange) onSuggestionsChange();
       if (item && item.type === 'merge' && decision === 'accept' && r && r.merged) {
         const intoOther = item.model && item.model.id === model.id && item.target;
@@ -398,7 +408,7 @@ export default function ModelDetail({ modelId, onBack, onSaved, onQueueChange, c
         if (onSaved) onSaved();
         if (intoOther && onOpenModel) { onOpenModel(item.target); return; }
       } else {
-        notify(decideSummary(r), { type: 'success' });
+        decideToasts(r).forEach(t => notify(t.message, { type: t.type }));
         if (onSaved) onSaved();
       }
       await refreshModel();
@@ -510,6 +520,7 @@ export default function ModelDetail({ modelId, onBack, onSaved, onQueueChange, c
 
   return (
     <div className="detail-page">
+      {confirmUi}
       <div className="detail-header">
         <button className="back-btn" onClick={goBack}>← Back</button>
         <div className="detail-title-wrap">

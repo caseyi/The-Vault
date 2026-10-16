@@ -2467,3 +2467,7 @@ input:focus-visible, textarea:focus-visible, select:focus-visible { outline-offs
   .organize-modal .org-health-list.review-list-wrap { max-height: 60vh; }
   .review-title-line { flex-wrap: wrap; }
 }
+.enrich-actual { font-family: var(--font-mono); font-size: 11px; color: var(--text-muted); }
+.accepted-merge-list { list-style: none; border: 1px solid var(--border); border-radius: var(--radius); max-height: 240px; overflow-y: auto; }
+.accepted-merge-row { gap: 10px; flex-wrap: wrap; }
+.accepted-merge-row .org-health-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

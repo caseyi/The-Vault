@@ -64,4 +64,22 @@ describe('ModelDetail: AI enrichment', () => {
     await waitFor(() => expect(f.mock.calls.some(([u, o]) => u === '/api/models/3751' && o && o.method === 'PATCH' && JSON.parse(o.body).character === 'Matt Murdock')).toBe(true));
     expect(await screen.findByText(/Scans and AI will keep your value/)).toBeInTheDocument();
   });
+
+  test('accepting an inline merge asks first', async () => {
+    mockFetch([
+      [/\/api\/models\/3751$/, { ...daredevil, suggestions: [{ id: 88, type: 'merge', model: { id: 3751, name: 'Daredevil (2026)' }, target: { id: 3760, name: 'Daredevil' }, confidence: 0.85, reason: 'same', source: 'text', status: 'pending' }] }],
+      ['/api/queue', []], ['/status-log', []], ['/tag-suggestions', []], ['/collections', []],
+    ], {});
+    render(<NoticeProvider><ModelDetail modelId={3751} onBack={() => {}} collections={[]} /></NoticeProvider>);
+    fireEvent.click(await screen.findByRole('button', { name: 'Accept: Same character as Daredevil' }));
+    expect(await screen.findByRole('dialog', { name: 'Merge "Daredevil (2026)" into "Daredevil"?' })).toBeInTheDocument();
+    expect(global.fetch.mock.calls.some(([u]) => u === '/api/suggestions/decide')).toBe(false);
+  });
+
+  test('removing a tag PATCHes the full remaining tag list', async () => {
+    const f = setup();
+    render(<NoticeProvider><ModelDetail modelId={3751} onBack={() => {}} collections={[]} /></NoticeProvider>);
+    fireEvent.click(await screen.findByRole('button', { name: 'Remove tag type:statue' }));
+    await waitFor(() => expect(f.mock.calls.some(([u, o]) => u === '/api/models/3751' && o && o.method === 'PATCH' && Array.isArray(JSON.parse(o.body).tags) && JSON.parse(o.body).tags.length === 0)).toBe(true));
+  });
 });

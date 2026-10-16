@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react'
 import TaskLog from './TaskLog';
 import { apiGet, errorMessage, isAbortError } from '../api';
 import { filterParams, hasActiveFilters } from '../filters';
-import { usd } from '../enrich';
+import { usd, actualCost } from '../enrich';
 
 // "Enrich metadata": fills character / genre / group / editions / tags with a
 // cheap text pass (and optionally the render for hard cases), proposes merges,
@@ -217,11 +217,12 @@ export default function EnrichPanel({ apiKey: apiKeyProp, filters, presetIds, on
                 <>
                   <span><b>{estimate.toProcess.toLocaleString()}</b> card{estimate.toProcess !== 1 ? 's' : ''} to process</span>
                   <span className="attr-faint">{(estimate.unchanged || 0).toLocaleString()} unchanged{estimate.batches ? ` · ${estimate.batches} batch${estimate.batches !== 1 ? 'es' : ''}` : ''}</span>
-                  <span>Text <b className="enrich-cost">~{usd(estimate.text?.usd)}</b></span>
+                  <span>Text <b className="enrich-cost">≈{usd(estimate.text?.usd)}</b></span>
                   {vision && (estimate.vision?.maxItems ? (
-                    <span>Vision up to {estimate.vision.maxItems.toLocaleString()} card{estimate.vision.maxItems !== 1 ? 's' : ''} <b className="enrich-cost">~{usd(estimate.vision.usd)}</b></span>
+                    <span>Vision up to {estimate.vision.maxItems.toLocaleString()} card{estimate.vision.maxItems !== 1 ? 's' : ''} <b className="enrich-cost">≈{usd(estimate.vision.usd)}</b></span>
                   ) : <span className="attr-faint">Vision: no cards with a render in this scope</span>)}
-                  <span>Total <b className="enrich-cost">~{usd(vision ? estimate.totalUsd : estimate.text?.usd)}</b></span>
+                  <span>Total <b className="enrich-cost">≈{usd(vision ? estimate.totalUsd : estimate.text?.usd)}</b></span>
+                  <span className="attr-faint" title="Token counts are estimated from the evidence size; the run reports what it actually used">{estimate.approx === false ? 'estimate' : 'approximate'}</span>
                   {vision && estimate.vision?.note && <span className="attr-faint enrich-note">{estimate.vision.note}</span>}
                   {estimating && <span className="attr-faint">updating…</span>}
                 </>
@@ -257,6 +258,7 @@ export default function EnrichPanel({ apiKey: apiKeyProp, filters, presetIds, on
           {result.success ? (
             <>
               <span>✓ Run #{result.runId}: {result.applied} applied · {result.suggested} suggestions · {result.merges} merges · {(result.unchanged || 0).toLocaleString()} unchanged{result.visionUsed ? ` · ${result.visionUsed} with renders` : ''}{result.errors ? ` · ${result.errors} errors` : ''}</span>
+              {actualCost(result) && <span className="enrich-actual" title="What this run actually used">Actual: {actualCost(result)}</span>}
               {pending > 0 && onOpenReview && <button className="link-btn enrich-review-link" onClick={onOpenReview}>Review {pending} →</button>}
             </>
           ) : <span>✗ {result.error || 'Run failed'}</span>}

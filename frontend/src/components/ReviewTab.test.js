@@ -68,6 +68,10 @@ describe('Review tab', () => {
     expect(within(row).getByText('typo of Geralt of Rivia; same creator and genre')).toBeInTheDocument();
     // accepting a merge says so
     fireEvent.click(within(row).getByRole('button', { name: /Accept Same character for Geral/ }));
+    const dlg = await screen.findByRole('dialog', { name: 'Merge "Geral" into "Geralt"?' });
+    expect(dlg).toHaveTextContent('1 merge will fold cards (a DB snapshot is taken first)');
+    expect(decideBodies).toHaveLength(0);
+    fireEvent.click(within(dlg).getByRole('button', { name: 'Merge' }));
     expect(await screen.findByText(/Merged "Geral" into "Geralt"/)).toBeInTheDocument();
     expect(decideBodies[0]).toEqual(expect.objectContaining({ ids: [10], decision: 'accept' }));
     await waitFor(() => expect(screen.queryByRole('listitem', { name: 'Same character: Geral' })).not.toBeInTheDocument());
@@ -122,6 +126,9 @@ describe('Review tab', () => {
     fireEvent.click(screen.getByLabelText('Select suggestion for Alan Scott'));
     fireEvent.click(screen.getByLabelText('Select suggestion for Ciri'));
     fireEvent.click(screen.getByRole('button', { name: '✓ Accept 2' }));
+    const dlg = await screen.findByRole('dialog', { name: 'Accept 2 selected suggestions?' });
+    expect(dlg).toHaveTextContent('Accepts 2 field changes.');
+    fireEvent.click(within(dlg).getByRole('button', { name: 'Accept 2' }));
     await waitFor(() => expect(decideBodies[0]).toEqual(expect.objectContaining({ ids: [9, 21], decision: 'accept' })));
     expect(await screen.findByText('2 accepted')).toBeInTheDocument();
   });
@@ -180,5 +187,78 @@ describe('Review tab', () => {
     setup([['/api/suggestions/summary', { pending: 0, byType: {}, byField: {}, byConfidence: {} }]]);
     renderTab();
     expect(await screen.findByText(/Nothing to review/)).toBeInTheDocument();
+  });
+
+  test('pressing a on a merge row asks first; a bulk accept with merges says cards will fold', async () => {
+    setup();
+    renderTab();
+    const row = await screen.findByRole('listitem', { name: 'Same character: Geral' });
+    row.focus();
+    fireEvent.keyDown(row, { key: 'a' });
+    const dlg = await screen.findByRole('dialog', { name: 'Merge "Geral" into "Geralt"?' });
+    fireEvent.click(within(dlg).getByRole('button', { name: 'Cancel' }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    expect(decideBodies).toHaveLength(0);
+    fireEvent.click(screen.getByLabelText('Select suggestion for Geral'));
+    fireEvent.click(screen.getByLabelText('Select suggestion for Doct Oct'));
+    fireEvent.click(screen.getByRole('button', { name: '✓ Accept 2' }));
+    const bulk = await screen.findByRole('dialog', { name: 'Accept 2 selected suggestions?' });
+    expect(bulk).toHaveTextContent('2 merges will fold cards (a DB snapshot is taken first)');
+  });
+
+  test('rows that changed since are reported and leave the pending list', async () => {
+    setup([['/api/suggestions/decide', (u, o) => {
+      const b = JSON.parse(o.body); decideBodies.push(b);
+      return { accepted: 0, rejected: 0, merged: 0, superseded: 2, errors: b.ids.map(id => ({ id, error: 'changed since: the value is not the one this proposal was made for' })) };
+    }]]);
+    renderTab();
+    fireEvent.click(await screen.findByRole('tab', { name: /Genres/ }));
+    await screen.findByRole('listitem', { name: 'Genre: Ciri' });
+    fireEvent.click(screen.getByLabelText('Select suggestion for Alan Scott'));
+    fireEvent.click(screen.getByLabelText('Select suggestion for Ciri'));
+    fireEvent.click(screen.getByRole('button', { name: '✓ Accept 2' }));
+    fireEvent.click(within(await screen.findByRole('dialog')).getByRole('button', { name: 'Accept 2' }));
+    expect(await screen.findByText('2 skipped: value changed since the suggestion')).toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByRole('listitem', { name: 'Genre: Ciri' })).not.toBeInTheDocument());
+    expect(screen.queryByRole('listitem', { name: 'Genre: Alan Scott' })).not.toBeInTheDocument();
+    expect(screen.getByRole('listitem', { name: 'Genre: Angela' })).toBeInTheDocument();
+  });
+
+  test('accepted merges can be unmerged (with confirmation); the result is reported', async () => {
+    const accepted = { ...mergeItem, id: 50, status: 'accepted', decidedAt: '2026-10-16 09:00:00' };
+    setup([
+      ['/api/suggestions?status=accepted&type=merge', { total: 1, page: 1, pages: 1, items: [accepted] }],
+      ['/api/suggestions/50/unmerge', { restored: { files: 6, collections: 1, queue: false, alias: true }, notReverted: ['tags, notes and print status merged into the target stay on it'] }],
+    ]);
+    renderTab();
+    const btn = await screen.findByRole('button', { name: 'Unmerge Geral from Geralt' });
+    fireEvent.click(btn);
+    const dlg = await screen.findByRole('dialog', { name: 'Unmerge "Geral" from "Geralt"?' });
+    fireEvent.click(within(dlg).getByRole('button', { name: 'Unmerge' }));
+    expect(await screen.findByText('Unmerged: restored 6 files, 1 collection; alias removed. Not reverted: tags, notes and print status merged into the target stay on it.')).toBeInTheDocument();
+    expect(global.fetch.mock.calls.some(([u, o]) => u === '/api/suggestions/50/unmerge' && o.method === 'POST')).toBe(true);
+  });
+
+  test('unmerge on an older backend (route missing) degrades gracefully', async () => {
+    const accepted = { ...mergeItem, id: 51, status: 'accepted' };
+    setup([
+      ['/api/suggestions?status=accepted&type=merge', { total: 1, page: 1, pages: 1, items: [accepted] }],
+    ]);
+    const base = global.fetch;
+    global.fetch = jest.fn((u, o) => (String(u) === '/api/suggestions/51/unmerge'
+      ? Promise.resolve({ ok: false, status: 404, headers: { get: () => 'text/html' }, text: () => Promise.resolve('<pre>Cannot POST</pre>'), json: () => Promise.reject(new Error('html')) })
+      : base(u, o)));
+    renderTab();
+    fireEvent.click(await screen.findByRole('button', { name: 'Unmerge Geral from Geralt' }));
+    fireEvent.click(within(await screen.findByRole('dialog')).getByRole('button', { name: 'Unmerge' }));
+    expect(await screen.findByText(/Unmerge needs a newer backend/)).toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Unmerge Geral from Geralt' })).not.toBeInTheDocument());
+  });
+
+  test('runs show actual tokens and USD when present', async () => {
+    setup([['/api/ai/enrich/runs', { runs: [{ ...runs.runs[0], actualInTokens: 674627, actualOutTokens: 172726, actualUsd: 1.54 }, runs.runs[1]] }]]);
+    renderTab();
+    expect(await screen.findByText('$1.54 · 675k in / 173k out')).toBeInTheDocument();
+    expect(screen.getByRole('columnheader', { name: 'Actual cost' })).toBeInTheDocument();
   });
 });

@@ -26,14 +26,15 @@ describe('EnrichPanel', () => {
     expect(await screen.findByText(/cards? to process/)).toHaveTextContent('812 cards to process');
     expect(screen.getByText(/3,652 unchanged/)).toBeInTheDocument();
     expect(screen.getByText('Text').parentElement || screen.getByText(/Text/)).toBeTruthy();
-    expect(screen.getAllByText('~$0.71').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('≈$0.71').length).toBeGreaterThan(0);
+    expect(screen.getByText('approximate')).toBeInTheDocument();
     expect(lastEstimate().get('scope')).toBe('all');
     expect(lastEstimate().get('vision')).toBeNull();
 
     fireEvent.click(screen.getByLabelText('Use renders for hard cases'));
     await waitFor(() => expect(lastEstimate().get('vision')).toBe('1'));
     expect(await screen.findByText(/up to 140 cards/)).toBeInTheDocument();
-    expect(screen.getByText('~$1.00')).toBeInTheDocument();
+    expect(screen.getByText('≈$1.00')).toBeInTheDocument();
     expect(screen.getByText('Only cards the text pass could not resolve')).toBeInTheDocument();
   });
 
@@ -79,7 +80,8 @@ describe('EnrichPanel', () => {
     expect(screen.getByText(/Batch 1\/21/)).toBeInTheDocument();
     expect(screen.getByRole('button', { name: '■ Stop' })).toBeInTheDocument();
 
-    act(() => es.emit({ type: 'done', success: true, runId: 4, applied: 412, suggested: 100, merges: 15, unchanged: 3652, errors: 0, visionUsed: 0 }));
+    act(() => es.emit({ type: 'done', success: true, runId: 4, applied: 412, suggested: 100, merges: 15, unchanged: 3652, errors: 0, visionUsed: 0, actualInTokens: 398000, actualOutTokens: 61200, actualUsd: 0.69 }));
+    expect(screen.getByText('Actual: $0.69 · 398k in / 61k out')).toBeInTheDocument();
     expect(screen.getByText(/Run #4: 412 applied · 100 suggestions · 15 merges · 3,652 unchanged/)).toBeInTheDocument();
     expect(es.closed).toBe(true);
     expect(onDone).toHaveBeenCalledWith(expect.objectContaining({ runId: 4 }));

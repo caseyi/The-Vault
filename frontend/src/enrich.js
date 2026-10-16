@@ -87,3 +87,45 @@ export function decideSummary(r) {
 export function isTermLabel(label) {
   return /google\s*drive|\bterm\b\s*\d{4}/i.test(String(label || ''));
 }
+
+/** Errors that mean "no longer pending": the row leaves the list (superseded / already decided). */
+export const isGoneError = (e) => /^(changed since|already )/i.test(String(e && e.error || ''));
+
+/** Split a decide result into superseded ("changed since") and real failures. */
+export function splitDecideErrors(r) {
+  const errors = (r && Array.isArray(r.errors)) ? r.errors : [];
+  const changed = errors.filter(e => /^changed since/i.test(String(e.error || '')));
+  const gone = errors.filter(isGoneError);
+  const failed = errors.filter(e => !isGoneError(e));
+  return { changed, gone, failed };
+}
+
+/** Toast lines for a decide / decide-filter result: [{ message, type }]. */
+export function decideToasts(r) {
+  const { changed, failed } = splitDecideErrors(r);
+  const out = [];
+  const parts = [];
+  if (r?.accepted) parts.push(`${r.accepted} accepted`);
+  if (r?.merged) parts.push(`${r.merged} merged`);
+  if (r?.rejected) parts.push(`${r.rejected} rejected`);
+  if (parts.length) out.push({ message: parts.join(', '), type: 'success' });
+  if (changed.length) out.push({ message: `${changed.length} skipped: value changed since the suggestion`, type: 'info' });
+  if (failed.length) out.push({ message: `${failed.length} could not be applied: ${failed[0].error}`, type: 'error' });
+  if (r?.backupError && !failed.some(f => f.error === r.backupError)) out.push({ message: r.backupError, type: 'error' });
+  if (!out.length) out.push({ message: 'Nothing changed', type: 'info' });
+  return out;
+}
+
+/** "674k" style token counts. */
+export function tokens(n) {
+  const v = Number(n) || 0;
+  if (v >= 1e6) return `${(v / 1e6).toFixed(1)}M`;
+  if (v >= 1e3) return `${Math.round(v / 1e3)}k`;
+  return String(v);
+}
+
+/** "$0.53 actual · 675k in / 173k out", or '' when the run has no actual counts. */
+export function actualCost(r) {
+  if (!r || r.actualUsd == null || !(Number(r.actualInTokens) || Number(r.actualOutTokens))) return '';
+  return `${usd(r.actualUsd)} · ${tokens(r.actualInTokens)} in / ${tokens(r.actualOutTokens)} out`;
+}
