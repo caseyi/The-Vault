@@ -5,6 +5,8 @@ import TaskLog from '../components/TaskLog';
 import ReleaseFileList from '../components/ReleaseFileList';
 import RenderHintPanel from '../components/RenderHintPanel';
 import Modal from '../components/Modal';
+import AttributionPanel, { hasAttributionData } from '../components/AttributionPanel';
+import { asList } from '../library';
 import { useNotify } from '../components/Notices';
 import { apiSend, errorMessage } from '../api';
 
@@ -244,8 +246,25 @@ function SaveIndicator({ state, onRetry }) {
   return <span className={`save-indicator save-${state}`} aria-live="polite">{text}</span>;
 }
 
+// On phones the layout is one column; show the attribution panel right under
+// the images instead of after the (long) file list.
+function useNarrow() {
+  const q = '(max-width: 768px)';
+  const get = () => (typeof window !== 'undefined' && window.matchMedia ? window.matchMedia(q).matches : false);
+  const [narrow, setNarrow] = useState(get);
+  useEffect(() => {
+    if (!window.matchMedia) return undefined;
+    const mql = window.matchMedia(q);
+    const on = () => setNarrow(mql.matches);
+    if (mql.addEventListener) mql.addEventListener('change', on); else if (mql.addListener) mql.addListener(on);
+    return () => { if (mql.removeEventListener) mql.removeEventListener('change', on); else if (mql.removeListener) mql.removeListener(on); };
+  }, []);
+  return narrow;
+}
+
 export default function ModelDetail({ modelId, onBack, onSaved, onQueueChange, collections, onCollectionsChange }) {
   const notify = useNotify();
+  const narrow = useNarrow();
   const [model, setModel] = useState(null);
   const [loading, setLoading] = useState(true);
   const [inQueue, setInQueue] = useState(false);
@@ -444,6 +463,9 @@ export default function ModelDetail({ modelId, onBack, onSaved, onQueueChange, c
 
   const images = model.images || [];
   const isHidden = model.hidden === 1 || model.hidden === true;
+  const showAttribution = hasAttributionData(model);
+  const fileLibraries = new Set((model.files || []).map(f => f.library).filter(Boolean));
+  const spansLibraries = asList(model.libraries).length > 1 || fileLibraries.size > 1;
 
   return (
     <div className="detail-page">
@@ -557,6 +579,8 @@ export default function ModelDetail({ modelId, onBack, onSaved, onQueueChange, c
                 )}
               </div>
             )}
+
+            {narrow && <div style={{ marginBottom: 16 }}><AttributionPanel model={model} /></div>}
 
             {/* Image tools */}
             <div className="detail-card" style={{ marginBottom: 16 }}>
@@ -675,6 +699,7 @@ export default function ModelDetail({ modelId, onBack, onSaved, onQueueChange, c
                     viewingStlId={viewingStl?.id}
                     printMode={printMode}
                     onTogglePrinted={handleTogglePrinted}
+                    showLibrary={spansLibraries}
                   />
                 </div>
               );
@@ -683,10 +708,11 @@ export default function ModelDetail({ modelId, onBack, onSaved, onQueueChange, c
 
           {/* Middle: metadata panel */}
           <div className="detail-panel">
+            {!narrow && <AttributionPanel model={model} />}
             <div className="detail-card">
               <div className="detail-card-title">Info</div>
-              <div className="meta-row"><span className="meta-label">Creator</span><span className="meta-val">{model.creator_name || '—'}</span></div>
-              {model.franchise && <div className="meta-row"><span className="meta-label">Franchise</span><span className="meta-val">{model.franchise}</span></div>}
+              {!showAttribution && <div className="meta-row"><span className="meta-label">Creator</span><span className="meta-val">{model.creator_name || '—'}</span></div>}
+              {!showAttribution && model.franchise && <div className="meta-row"><span className="meta-label">Franchise</span><span className="meta-val">{model.franchise}</span></div>}
               {model.team && <div className="meta-row"><span className="meta-label">Team</span><span className="meta-val">{model.team}</span></div>}
               <div className="meta-row"><span className="meta-label">Files</span><span className="meta-val">{model.file_count}</span></div>
               <div className="meta-row"><span className="meta-label">Has STL</span><span className="meta-val">{model.has_stl ? '✓' : '✗'}</span></div>

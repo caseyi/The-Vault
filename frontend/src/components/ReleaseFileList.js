@@ -1,9 +1,11 @@
 import React, { useState } from 'react';
+import { EDITION_ORDER, variantLabel, compareVariants } from '../library';
 
-function formatBytes(bytes) {
+export function formatBytes(bytes) {
   if (!bytes) return '';
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+  return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
 }
 
 const TYPE_STYLE = {
@@ -59,7 +61,7 @@ function RoleBadge({ name }) {
 
 const PRINTABLE_TYPES = new Set(['stl', 'slicer', 'zip']);
 
-function FileRow({ file, onView3D, viewing3D, printMode, onTogglePrinted }) {
+function FileRow({ file, onView3D, viewing3D, printMode, onTogglePrinted, showLibrary, hideRole }) {
   const isPrinted = !!file.printed_at;
   const isPrintable = PRINTABLE_TYPES.has(file.filetype);
 
@@ -87,7 +89,7 @@ function FileRow({ file, onView3D, viewing3D, printMode, onTogglePrinted }) {
         </button>
       ) : null}
       <FileBadge type={file.filetype} />
-      <span style={{
+      <span className="file-name" style={{
         flex: 1, fontSize: 11, color: 'var(--text)',
         whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
         fontFamily: 'var(--font-mono)',
@@ -95,7 +97,10 @@ function FileRow({ file, onView3D, viewing3D, printMode, onTogglePrinted }) {
       }} title={file.filename}>
         {file.filename}
       </span>
-      <RoleBadge name={file.filename} />
+      {!hideRole && <RoleBadge name={file.filename} />}
+      {showLibrary && file.library && (
+        <span className="file-library" title={`On ${file.library}`}>{file.library}</span>
+      )}
       <span style={{ fontFamily: 'var(--font-mono)', fontSize: 9, color: 'var(--text-faint)', flexShrink: 0 }}>
         {formatBytes(file.filesize)}
       </span>
@@ -201,7 +206,84 @@ function ReleaseSection({ releaseName, files, defaultOpen = true, onView3D, view
   );
 }
 
-export default function ReleaseFileList({ files = [], onView3D, viewingStlId, printMode, onTogglePrinted }) {
+const editionRank = (e) => { const i = EDITION_ORDER.indexOf(e); return e == null ? 99 : i < 0 ? EDITION_ORDER.length : i; };
+
+/** Group files by edition, then variant (works from the library-metadata scanner). */
+export function groupByEditionVariant(files) {
+  const eds = new Map();
+  for (const f of files) {
+    const ed = f.edition || null;
+    if (!eds.has(ed)) eds.set(ed, new Map());
+    const vars = eds.get(ed);
+    const v = f.variant || null;
+    if (!vars.has(v)) vars.set(v, []);
+    vars.get(v).push(f);
+  }
+  return [...eds.entries()]
+    .sort((a, b) => editionRank(a[0]) - editionRank(b[0]) || String(a[0]).localeCompare(String(b[0])))
+    .map(([edition, vars]) => ({
+      edition,
+      files: [...vars.values()].flat(),
+      variants: [...vars.entries()]
+        .sort((a, b) => compareVariants(a[0], b[0]))
+        .map(([variant, list]) => ({ variant, label: variantLabel(variant), files: [...list].sort((x, y) => String(x.filename).localeCompare(String(y.filename))) })),
+    }));
+}
+
+function VariantGroups({ variants, rowProps, viewingStlId }) {
+  return variants.map(v => (
+    <div key={v.variant || '__none__'} className="variant-group" role="group" aria-label={v.label}>
+      <div className="variant-label">
+        <span>{v.label}</span>
+        <span className="variant-count">{v.files.length}</span>
+      </div>
+      {v.files.map(f => (
+        <FileRow key={f.id} file={f} viewing3D={viewingStlId === f.id} hideRole {...rowProps} />
+      ))}
+    </div>
+  ));
+}
+
+function EditionSection({ edition, files, variants, defaultOpen, rowProps, viewingStlId, otherLabel }) {
+  const [open, setOpen] = useState(defaultOpen);
+  const total = files.reduce((a, f) => a + (Number(f.filesize) || 0), 0);
+  const libs = [...new Set(files.map(f => f.library).filter(Boolean))].sort();
+  return (
+    <section className="edition-section" aria-label={edition || otherLabel}>
+      <button type="button" className={`edition-head ${open ? 'open' : ''}`} onClick={() => setOpen(o => !o)} aria-expanded={open}>
+        <span aria-hidden="true" className="edition-chevron">{open ? '▾' : '▸'}</span>
+        <span className="edition-name">{edition || otherLabel}</span>
+        {rowProps.showLibrary && libs.length > 0 && <span className="edition-libs">{libs.join(' + ')}</span>}
+        <span className="edition-summary">{files.length} file{files.length !== 1 ? 's' : ''}{total ? ` · ${formatBytes(total)}` : ''}</span>
+      </button>
+      {open && (
+        <div className="edition-body">
+          <VariantGroups variants={variants} rowProps={rowProps} viewingStlId={viewingStlId} />
+        </div>
+      )}
+    </section>
+  );
+}
+
+export default function ReleaseFileList({ files = [], onView3D, viewingStlId, printMode, onTogglePrinted, showLibrary }) {
+  // Works from the layout-aware scanner carry edition/variant per file
+  if (files.some(f => f.edition || f.variant)) {
+    const groups = groupByEditionVariant(files);
+    const rowProps = { onView3D, printMode, onTogglePrinted, showLibrary };
+    if (groups.length === 1 && !groups[0].edition) {
+      return <div className="work-files"><VariantGroups variants={groups[0].variants} rowProps={rowProps} viewingStlId={viewingStlId} /></div>;
+    }
+    return (
+      <div className="work-files">
+        {groups.map(g => (
+          <EditionSection key={g.edition || '__none__'} edition={g.edition} otherLabel="Other files"
+            files={g.files} variants={g.variants} defaultOpen={groups.length <= 3 || g === groups[0]}
+            rowProps={rowProps} viewingStlId={viewingStlId} />
+        ))}
+      </div>
+    );
+  }
+
   // Group by release_name (null = ungrouped, goes last)
   const groups = new Map();
   for (const f of files) {
@@ -231,7 +313,7 @@ export default function ReleaseFileList({ files = [], onView3D, viewingStlId, pr
       <div>
         {groups.get(null).map(f => (
           <FileRow key={f.id} file={f} onView3D={onView3D} viewing3D={viewingStlId === f.id}
-            printMode={printMode} onTogglePrinted={onTogglePrinted} />
+            printMode={printMode} onTogglePrinted={onTogglePrinted} showLibrary={showLibrary} />
         ))}
       </div>
     );

@@ -2,59 +2,10 @@ import React, { useState } from 'react';
 import RenderHintPanel from './RenderHintPanel';
 import FolderTree from './FolderTree';
 import TagManager from './TagManager';
+import FacetFilters, { useCollapsed } from './FacetFilters';
 import { useConfirm } from './ConfirmDialog';
 import { useNotify } from './Notices';
 import { apiSend, errorMessage } from '../api';
-
-const COLLAPSED_HEIGHT = 200; // px — show ~6 items before "Show more"
-
-/** Scrollable, collapsible sidebar list with a "Show N more" toggle */
-function CollapsibleList({ label, onClear, items, renderItem, activeKey, getKey, extraControls }) {
-  const [expanded, setExpanded] = useState(false);
-  const hasActive = activeKey && items.some(i => getKey(i) === activeKey);
-  // If the active item is past the fold, always expand
-  const shouldExpand = expanded || hasActive;
-
-  return (
-    <div className="sidebar-section">
-      <div className="sidebar-section-label" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-        <span>{label} <span style={{ fontFamily: 'var(--font-mono)', fontSize: 9, color: 'var(--text-faint)' }}>{items.length}</span></span>
-        <div style={{ display: 'flex', gap: 4 }}>
-          {extraControls}
-          {onClear && (
-            <button onClick={onClear} className="sec-clear-btn" aria-label={`Clear ${label} filter`}>
-              CLEAR
-            </button>
-          )}
-        </div>
-      </div>
-      <div className="creator-list" style={{ maxHeight: shouldExpand ? 320 : COLLAPSED_HEIGHT, overflowY: 'auto' }}>
-        {items.map(item => renderItem(item))}
-      </div>
-      {items.length > 6 && (
-        <button onClick={() => setExpanded(e => !e)} aria-expanded={shouldExpand}
-          className="sec-more-btn">
-          {shouldExpand ? '▲ Show less' : `▼ Show all ${items.length}`}
-        </button>
-      )}
-    </div>
-  );
-}
-
-// Remembered collapse state for a sidebar section (persisted in localStorage)
-function useCollapsed(key, defaultOpen = true) {
-  const storageKey = 'vault_sec_' + key;
-  const [open, setOpen] = useState(() => {
-    try { const v = localStorage.getItem(storageKey); return v === null ? defaultOpen : v === '1'; }
-    catch { return defaultOpen; }
-  });
-  const toggle = () => setOpen(o => {
-    const n = !o;
-    try { localStorage.setItem(storageKey, n ? '1' : '0'); } catch {}
-    return n;
-  });
-  return [open, toggle];
-}
 
 const STATUS_OPTIONS = [
   { value: '', label: 'All Models', dot: 'all' },
@@ -92,7 +43,7 @@ function VersionTag({ appVersion, gitSha }) {
   );
 }
 
-export default function Sidebar({ open, onToggle, stats, creators, tags, filters, onFilterChange, onScanClick, onOrganizeClick, onHomeClick, showHidden, onToggleHidden, appVersion, gitSha, isMobile, onRescanCreator, franchises, collections, queueCount, onQueueClick, onWishlistClick, wishlistCount, onCollectionClick, onCollectionsChange, recentlyViewed, onRecentClick, folderTree, onFolderSelect, density, onToggleDensity, theme, onToggleTheme, onTagsChange, scanRunning, scanCount, scanLast }) {
+export default function Sidebar({ open, onToggle, stats, creators, tags, filters, onFilterChange, onScanClick, onOrganizeClick, onHomeClick, showHidden, onToggleHidden, appVersion, gitSha, isMobile, onRescanCreator, franchises, facets, collections, queueCount, onQueueClick, onWishlistClick, wishlistCount, onCollectionClick, onCollectionsChange, recentlyViewed, onRecentClick, folderTree, onFolderSelect, density, onToggleDensity, theme, onToggleTheme, onTagsChange, scanRunning, scanCount, scanLast }) {
   const [confirmUi, askConfirm] = useConfirm();
   const notify = useNotify();
   const [showTagManager, setShowTagManager] = useState(false);
@@ -336,25 +287,8 @@ export default function Sidebar({ open, onToggle, stats, creators, tags, filters
               </button>
             </div>
 
-            {/* Franchise filter */}
-            {franchises && franchises.length > 0 && (
-              <CollapsibleList
-                label="Franchise"
-                onClear={filters.franchise ? () => onFilterChange({ ...filters, franchise: '' }) : null}
-                items={franchises}
-                renderItem={f => (
-                  <button
-                    key={f.franchise}
-                    className={`creator-btn ${filters.franchise === f.franchise ? 'active' : ''}`}
-                    onClick={() => onFilterChange({ ...filters, franchise: filters.franchise === f.franchise ? '' : f.franchise })}>
-                    <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', flex: 1 }}>{f.franchise}</span>
-                    <span className="count">{f.count}</span>
-                  </button>
-                )}
-                activeKey={filters.franchise}
-                getKey={f => f.franchise}
-              />
-            )}
+            {/* Library / kind / studio / genre / term / source / attribution */}
+            <FacetFilters facets={facets} franchises={franchises} filters={filters} onFilterChange={onFilterChange} />
 
             {/* Collections */}
             <div className="sidebar-section">
