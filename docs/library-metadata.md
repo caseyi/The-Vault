@@ -148,6 +148,7 @@ and hidden folders are skipped.
 ## 10. Known limits
 
 - Part zips with descriptive names can become small extra cards ("P Weapon Split", "Anakin Arm L").
-- Different sculpts of one character share a card unless the name carries a year or qualifier.
+- Different releases of one character now get separate cards (see `docs/ai-enrichment.md` section 9);
+  two sculpts in the same release with no distinguishing name or product still share one.
 - Short typos (under 6 letters) and ZEZ abbreviations ("Doct Oct") are not merged.
 - About 30% of Wicked-family cards are attributed by path only (Drive-only or older Patreon packs).
