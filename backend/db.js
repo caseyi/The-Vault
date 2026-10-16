@@ -228,7 +228,53 @@ const MIGRATIONS = [
   () => {
     addColumn('models', 'name_locked INTEGER DEFAULT 0');
   },
+  // 3 — library layout, works and attribution (docs/library-metadata.md §6)
+  () => {
+    addColumn('models', 'work_key TEXT');
+    addColumn('models', 'kind TEXT');
+    addColumn('models', 'library TEXT');
+    addColumn('models', 'libraries TEXT');
+    addColumn('models', 'studio TEXT');
+    addColumn('models', 'character TEXT');
+    addColumn('models', 'group_name TEXT');
+    addColumn('models', 'editions TEXT');
+    addColumn('models', 'release_term TEXT');
+    addColumn('models', 'release_label TEXT');
+    addColumn('models', 'source TEXT');
+    addColumn('models', 'products TEXT');
+    addColumn('models', 'attribution TEXT');
+    addColumn('models', 'confidence TEXT');
+    addColumn('model_files', 'library TEXT');
+    addColumn('model_files', 'variant TEXT');
+    addColumn('model_files', 'edition TEXT');
+    addColumn('model_files', 'product TEXT');
+    addColumn('model_files', 'matched_by TEXT');
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_models_work_key ON models(work_key)`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_models_kind ON models(kind)`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_models_studio ON models(studio)`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_models_release_term ON models(release_term)`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_models_library ON models(library)`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_models_source ON models(source)`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_models_confidence ON models(confidence)`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_files_product ON model_files(product)`);
+    // Small key/value store (e.g. "layout_regroup_done" after the first layout-aware scan)
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS settings (
+        key TEXT PRIMARY KEY,
+        value TEXT,
+        updated_at TEXT DEFAULT (datetime('now'))
+      )
+    `);
+  },
 ];
+
+db.getSetting = (key) => {
+  try { const r = db.prepare('SELECT value FROM settings WHERE key = ?').get(key); return r ? r.value : null; } catch { return null; }
+};
+db.setSetting = (key, value) => {
+  db.prepare(`INSERT INTO settings (key, value, updated_at) VALUES (?, ?, datetime('now'))
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`).run(key, value == null ? null : String(value));
+};
 
 function runMigrations() {
   const current = db.prepare('PRAGMA user_version').get().user_version || 0;

@@ -14,7 +14,10 @@ try {
 } catch {}
 
 const db = require('./db');
-const { LIBRARY_PATH, pickRenderArchives, analyzeFolder, extractImagesFromArchive } = require('./scanner');
+const { LIBRARY_PATH, pickRenderArchives, analyzeFolder, extractImagesFromArchive, analysisFromFiles, realFolder, loadLibraryMeta } = require('./scanner');
+const metaLib = require('./lib/meta');
+const librariesLib = require('./lib/libraries');
+const zipLib = require('./lib/zip');
 const { scrapeImagesFromUrl, detectUrlFromFolderName } = require('./scraper');
 const organizeRouter = require('./organize');
 const { wrapAsyncRoutes, originPolicy, errorHandler } = require('./lib/middleware');
@@ -30,12 +33,6 @@ const IMAGES_DIR = process.env.IMAGES_DIR || '/data/images';
 
 /** Escape LIKE wildcards so user text matches literally (use with ESCAPE '\\'). */
 const likeEscape = (s) => String(s).replace(/[\\%_]/g, '\\$&');
-/** Archives above ARCHIVE_MAX_MB (default 500) are never opened (they're read fully into memory). */
-function archiveTooBig(p) {
-  const mb = parseFloat(process.env.ARCHIVE_MAX_MB);
-  const max = (Number.isFinite(mb) && mb > 0 ? mb : 500) * 1024 * 1024;
-  try { return fs.statSync(p).size > max; } catch { return false; }
-}
 /** Parse a positive integer query param, clamped to [min, max]. */
 function clampInt(v, def, min, max) {
   const n = parseInt(v, 10);
@@ -52,6 +49,19 @@ app.use(originPolicy());
 app.use(express.json({ limit: '10mb' }));
 app.use('/images', express.static(IMAGES_DIR));
 app.use('/api/organize', organizeRouter);
+
+// ── Library metadata (_Meta) cache ────────────────────────────────────────────
+// The scan worker loads its own copy; the server keeps one for /api/meta/* and
+// /api/attribution/gaps, reloaded on demand and after every scan.
+let metaCache = null;
+function getMeta({ reload = false } = {}) {
+  if (!metaCache || reload) {
+    try { metaCache = loadLibraryMeta().meta; }
+    catch (e) { metaCache = metaLib.emptyMeta(); metaCache.errors.push(e.message); metaCache.loadedAt = new Date().toISOString(); }
+  }
+  return metaCache;
+}
+const parseJSON = (s, d) => { try { const v = JSON.parse(s); return v == null ? d : v; } catch { return d; } };
 
 // ── Scan ──────────────────────────────────────────────────────────────────────
 
@@ -111,6 +121,7 @@ function startScanWorker(workerData, startLogLines) {
         const r = m.result || {};
         pushLog('success', `✓ Scan complete — ${r.modelsFound ?? 0} found · ${r.modelsAdded ?? 0} added · ${r.modelsUpdated ?? 0} updated · ${r.modelsSkipped ?? 0} skipped`);
         scanSummary = { type: 'done', success: true, ...r };
+        metaCache = null; // _Meta may have changed; reload lazily
       } else {
         pushLog('error', `✗ Error: ${m.error}`);
         scanSummary = { type: 'done', success: false, error: m.error };
@@ -241,6 +252,50 @@ const SORT_MAP = {
   status:     'm.print_status ASC, m.name ASC',
 };
 
+/**
+ * Filters shared by /api/models and /api/export for the library-metadata fields:
+ * library, studio, genre (= franchise), term, kind, attributed, source, confidence.
+ * Tools (kind = 'tool') are hidden unless kind=tool or includeTools=1.
+ */
+function addLayoutFilters(q, where, params) {
+  const kinds = q.kind ? String(q.kind).split(',').map(k => k.trim()).filter(Boolean) : [];
+  if (kinds.length) {
+    where.push(`COALESCE(m.kind, 'model') IN (${kinds.map(() => '?').join(',')})`);
+    params.push(...kinds);
+  } else if (q.includeTools !== '1' && q.includeTools !== 'true') {
+    where.push(`COALESCE(m.kind, 'model') != 'tool'`);
+  }
+  if (q.library) {
+    where.push(`(m.library = ? OR m.libraries LIKE ? ESCAPE '\\')`);
+    params.push(String(q.library), `%"${likeEscape(q.library)}"%`);
+  }
+  if (q.studio) { where.push('m.studio = ?'); params.push(String(q.studio)); }
+  if (q.genre) { where.push('m.franchise = ?'); params.push(String(q.genre)); }
+  if (q.term) {
+    const t = String(q.term);
+    if (/^\d{4}$/.test(t)) { where.push('m.release_term LIKE ?'); params.push(`${t}-%`); }
+    else { where.push('m.release_term = ?'); params.push(t); }
+  }
+  if (q.source) { where.push('m.source = ?'); params.push(String(q.source)); }
+  if (q.confidence) { where.push(`COALESCE(m.confidence, 'none') = ?`); params.push(String(q.confidence)); }
+  if (q.attributed === 'yes') where.push(`m.confidence IN ('sidecar','exact','name')`);
+  else if (q.attributed === 'no') where.push(`(m.confidence IS NULL OR m.confidence IN ('none','path'))`);
+}
+
+/** List item: existing fields + parsed layout fields; heavy JSON (products) only on the detail route. */
+function shapeModel(m) {
+  const { products, attribution, ...rest } = m;
+  return {
+    ...rest,
+    tags: parseJSON(m.tags || '[]', []),
+    images: parseJSON(m.images || '[]', []),
+    kind: m.kind || 'model',
+    libraries: parseJSON(m.libraries, m.library ? [m.library] : []),
+    editions: parseJSON(m.editions, []),
+    confidence: m.confidence || null,
+  };
+}
+
 app.get('/api/models', (req, res) => {
   const { search, creator, status, tags, franchise, collection, folder, favorite, show_hidden, has_thumbnail, recently_added, sort } = req.query;
   const page = clampInt(req.query.page, 1, 1, 1e6);
@@ -290,14 +345,17 @@ app.get('/api/models', (req, res) => {
   // `folder` is an absolute container path (e.g. /library/STL Archive/SomeCreator)
   // as supplied by /api/library/tree.
   if (folder) {
-    where.push("(m.folder_path = ? OR m.folder_path LIKE ? ESCAPE '\\')");
-    params.push(folder, likeEscape(String(folder).replace(/\/+$/, '')) + '/%');
+    // works sharing a folder carry a virtual "<folder>#<slug>" path
+    where.push("(m.folder_path = ? OR m.folder_path LIKE ? ESCAPE '\\' OR m.folder_path LIKE ? ESCAPE '\\')");
+    const f = likeEscape(String(folder).replace(/\/+$/, ''));
+    params.push(folder, f + '/%', f + '#%');
   }
+  addLayoutFilters(req.query, where, params);
 
   if (search) {
-    where.push("(m.name LIKE ? ESCAPE '\\' OR c.name LIKE ? ESCAPE '\\' OR m.tags LIKE ? ESCAPE '\\' OR m.notes LIKE ? ESCAPE '\\')");
+    where.push("(m.name LIKE ? ESCAPE '\\' OR c.name LIKE ? ESCAPE '\\' OR m.tags LIKE ? ESCAPE '\\' OR m.notes LIKE ? ESCAPE '\\' OR m.character LIKE ? ESCAPE '\\' OR m.group_name LIKE ? ESCAPE '\\')");
     const s = `%${likeEscape(search)}%`;
-    params.push(s, s, s, s);
+    params.push(s, s, s, s, s, s);
   }
   if (creator) { where.push('c.name = ?'); params.push(creator); }
   if (status) { where.push('m.print_status = ?'); params.push(status); }
@@ -321,11 +379,7 @@ app.get('/api/models', (req, res) => {
   `).all(...params, limit, offset);
 
   res.json({
-    models: models.map(m => ({
-      ...m,
-      tags: JSON.parse(m.tags || '[]'),
-      images: JSON.parse(m.images || '[]')
-    })),
+    models: models.map(shapeModel),
     total,
     page,
     pages: Math.ceil(total / limit)
@@ -358,10 +412,12 @@ app.get('/api/models/:id(\\d+)', (req, res) => {
   if (!model) return res.status(404).json({ error: 'Not found' });
 
   const files = db.prepare('SELECT * FROM model_files WHERE model_id = ? ORDER BY release_name NULLS LAST, filetype, filename').all(model.id);
+  const attribution = parseJSON(model.attribution, null);
+  if (attribution) { delete attribution.sig; delete attribution.autoFranchise; delete attribution.sourceUrl; delete attribution.foldedInto; }
   res.json({
-    ...model,
-    tags: JSON.parse(model.tags || '[]'),
-    images: JSON.parse(model.images || '[]'),
+    ...shapeModel(model),
+    products: parseJSON(model.products, []).map(({ matchedBy, genre, creator, ...p }) => p),
+    attribution: attribution || { confidence: model.confidence || 'none', fields: {}, matchedFiles: 0, totalFiles: files.length },
     files
   });
 });
@@ -496,14 +552,17 @@ async function reextractCreator(req, res) {
     if (sse.aborted) return;
     // Yield between models so a big creator doesn't monopolise the event loop
     await new Promise(r => setImmediate(r));
-    if (!tryConfine(model.folder_path)) {
+    const folder = realFolder(model.folder_path);
+    if (!tryConfine(folder)) {
       send('warn', `  ⚠ ${model.name}: folder is outside the library, skipped`);
       skipped++;
       continue;
     }
     // Model-level hint overrides creator hint
     const effectiveHint = model.render_zip_hint || hint;
-    const analysis = analyzeFolder(model.folder_path, creator.name);
+    // Works (layout scanner) own a file list — they may share a folder or span libraries
+    const dbFiles = model.work_key ? db.prepare('SELECT filename, filepath, filesize, variant FROM model_files WHERE model_id = ?').all(model.id).filter(f => tryConfine(f.filepath)) : [];
+    const analysis = dbFiles.length ? analysisFromFiles(dbFiles) : analyzeFolder(folder, creator.name);
     const renderArchives = pickRenderArchives(analysis, effectiveHint);
 
     if (renderArchives.length === 0) {
@@ -552,26 +611,28 @@ app.patch('/api/models/:id(\\d+)/render-hint', (req, res) => {
 // ── Stats ─────────────────────────────────────────────────────────────────────
 
 app.get('/api/stats', (req, res) => {
-  const total = db.prepare('SELECT COUNT(*) as n FROM models WHERE hidden IS NULL OR hidden = 0').get().n;
+  // Tools (_Tools: slicer projects, printer files…) are not models: left out of the stats
+  const VIS = `(hidden IS NULL OR hidden = 0) AND COALESCE(kind, 'model') != 'tool'`;
+  const total = db.prepare(`SELECT COUNT(*) as n FROM models WHERE ${VIS}`).get().n;
   const totalHidden = db.prepare('SELECT COUNT(*) as n FROM models WHERE hidden = 1').get().n;
   const byStatus = db.prepare(`
-    SELECT print_status, COUNT(*) as n FROM models WHERE hidden IS NULL OR hidden = 0 GROUP BY print_status
+    SELECT print_status, COUNT(*) as n FROM models WHERE ${VIS} GROUP BY print_status
   `).all();
-  const creators = db.prepare('SELECT COUNT(*) as n FROM creators').get().n;
-  const withImages = db.prepare("SELECT COUNT(*) as n FROM models WHERE thumbnail_path IS NOT NULL AND (hidden IS NULL OR hidden = 0)").get().n;
-  const favorites = db.prepare("SELECT COUNT(*) as n FROM models WHERE is_favorite = 1 AND (hidden IS NULL OR hidden = 0)").get().n;
+  const creators = db.prepare(`SELECT COUNT(*) as n FROM creators WHERE name != '_Tools'`).get().n;
+  const withImages = db.prepare(`SELECT COUNT(*) as n FROM models WHERE thumbnail_path IS NOT NULL AND ${VIS}`).get().n;
+  const favorites = db.prepare(`SELECT COUNT(*) as n FROM models WHERE is_favorite = 1 AND ${VIS}`).get().n;
   const lastScan = db.prepare('SELECT * FROM scan_log ORDER BY id DESC LIMIT 1').get();
 
   // Count models added since the last scan started
   let recentlyAdded = 0;
   if (lastScan?.started_at) {
-    recentlyAdded = db.prepare('SELECT COUNT(*) as n FROM models WHERE (hidden IS NULL OR hidden = 0) AND created_at >= ?').get(lastScan.started_at).n;
+    recentlyAdded = db.prepare(`SELECT COUNT(*) as n FROM models WHERE ${VIS} AND created_at >= ?`).get(lastScan.started_at).n;
   }
 
   // Franchise list with counts
   const franchises = db.prepare(`
     SELECT franchise, COUNT(*) as count FROM models
-    WHERE franchise IS NOT NULL AND franchise != '' AND (hidden IS NULL OR hidden = 0)
+    WHERE franchise IS NOT NULL AND franchise != '' AND ${VIS}
     GROUP BY franchise ORDER BY count DESC, franchise
   `).all();
 
@@ -727,6 +788,7 @@ app.get('/api/export', (req, res) => {
     where.push('m.thumbnail_path IS NOT NULL');
   }
   if (franchise) { where.push('m.franchise = ?'); params.push(franchise); }
+  addLayoutFilters(req.query, where, params);
   if (collection) {
     where.push('m.id IN (SELECT model_id FROM collection_models WHERE collection_id = ?)');
     params.push(collection);
@@ -791,7 +853,7 @@ app.get('/api/models/:id(\\d+)/scrape-stream', async (req, res) => {
 
   let sourceUrl = req.query.url || model.source_url;
   if (!sourceUrl) {
-    const folderName = path.basename(model.folder_path);
+    const folderName = path.basename(realFolder(model.folder_path));
     const detected = detectUrlFromFolderName(folderName);
     if (detected) { sourceUrl = detected.url; send('info', `Auto-detected URL: ${sourceUrl}`); }
   }
@@ -842,7 +904,7 @@ app.post('/api/models/:id(\\d+)/scrape', async (req, res) => {
 
   let sourceUrl = req.body?.url || model.source_url;
   if (!sourceUrl) {
-    const folderName = path.basename(model.folder_path);
+    const folderName = path.basename(realFolder(model.folder_path));
     const detected = detectUrlFromFolderName(folderName);
     if (detected) { sourceUrl = detected.url; sendLog('info', `Auto-detected URL from folder name: ${sourceUrl}`); }
   }
@@ -882,7 +944,7 @@ app.get('/api/models/:id(\\d+)/detect-url', (req, res) => {
 
   if (model.source_url) return res.json({ url: model.source_url, source: 'saved' });
 
-  const folderName = path.basename(model.folder_path);
+  const folderName = path.basename(realFolder(model.folder_path));
   const detected = detectUrlFromFolderName(folderName);
   if (detected) return res.json({ url: detected.url, site: detected.site, source: 'folder_name' });
 
@@ -904,28 +966,20 @@ app.get('/api/models/:id(\\d+)/zips', (req, res) => {
 });
 
 // Preview images inside a ZIP without extracting
-app.get('/api/files/:fileId/zip-contents', (req, res) => {
+app.get('/api/files/:fileId/zip-contents', async (req, res) => {
   const file = db.prepare('SELECT * FROM model_files WHERE id = ?').get(req.params.fileId);
   if (!file) return res.status(404).json({ error: 'File not found' });
   try { confinePath(file.filepath); } catch (e) { if (sendPathError(res, e)) return; throw e; }
   if (!fs.existsSync(file.filepath)) return res.status(404).json({ error: 'File not found on disk' });
-  if (archiveTooBig(file.filepath)) return res.status(413).json({ error: 'Archive is larger than ARCHIVE_MAX_MB' });
+  if (zipLib.zipTooBig(file.filepath)) return res.status(413).json({ error: 'Archive is larger than ZIP_MAX_MB/ARCHIVE_MAX_MB' });
 
-  const IMAGE_EXTS = new Set(['.jpg', '.jpeg', '.png', '.webp', '.gif']);
   try {
-    const AdmZip = require('adm-zip');
-    const zip = new AdmZip(file.filepath);
-    const entries = zip.getEntries()
+    // yauzl reads the central directory only — fine for multi-GB archives
+    const entries = (await zipLib.listZip(file.filepath))
       .filter(e => !e.isDirectory)
       .map(e => {
-        const ext = path.extname(e.entryName).toLowerCase();
-        return {
-          name: e.entryName,
-          basename: path.basename(e.entryName),
-          size: e.header.size,
-          isImage: IMAGE_EXTS.has(ext),
-          ext
-        };
+        const ext = path.extname(e.name).toLowerCase();
+        return { name: e.name, basename: path.basename(e.name), size: e.size, isImage: zipLib.IMAGE_EXTS.has(ext), ext };
       });
     res.json({
       filename: file.filename,
@@ -939,7 +993,7 @@ app.get('/api/files/:fileId/zip-contents', (req, res) => {
 });
 
 // Extract images from a specific ZIP and save them
-app.post('/api/files/:fileId/extract-images', (req, res) => {
+app.post('/api/files/:fileId/extract-images', async (req, res) => {
   const file = db.prepare('SELECT * FROM model_files WHERE id = ?').get(req.params.fileId);
   if (!file) return res.status(404).json({ error: 'File not found' });
 
@@ -949,38 +1003,15 @@ app.post('/api/files/:fileId/extract-images', (req, res) => {
   const { selectedFiles } = req.body || {}; // optional: array of entry names to extract, or extract all images
   try { confinePath(file.filepath); } catch (e) { if (sendPathError(res, e)) return; throw e; }
   if (!fs.existsSync(file.filepath)) return res.status(404).json({ error: 'File not found on disk' });
-  if (archiveTooBig(file.filepath)) return res.status(413).json({ error: 'Archive is larger than ARCHIVE_MAX_MB' });
+  if (zipLib.zipTooBig(file.filepath)) return res.status(413).json({ error: 'Archive is larger than ZIP_MAX_MB/ARCHIVE_MAX_MB' });
 
-  const IMAGE_EXTS = new Set(['.jpg', '.jpeg', '.png', '.webp', '.gif']);
   try {
-    const AdmZip = require('adm-zip');
-    const zip = new AdmZip(file.filepath);
-    const entries = zip.getEntries().filter(e => {
-      if (e.isDirectory) return false;
-      const ext = path.extname(e.entryName).toLowerCase();
-      if (!IMAGE_EXTS.has(ext)) return false; // only ever extract images
-      if (Array.isArray(selectedFiles) && selectedFiles.length > 0) {
-        return selectedFiles.includes(e.entryName);
-      }
-      return true;
-    });
-
-    if (entries.length === 0) {
-      return res.status(422).json({ error: 'No image files found in this ZIP' });
-    }
-
     const modelImgDir = path.join(IMAGES_DIR, model.uuid);
-    if (!fs.existsSync(modelImgDir)) fs.mkdirSync(modelImgDir, { recursive: true });
-
-    const savedPaths = [];
-    for (const entry of entries) {
-      const safeName = path.basename(entry.entryName).replace(/[^a-zA-Z0-9._-]/g, '_');
-      const destPath = path.join(modelImgDir, safeName);
-      zip.extractEntryTo(entry, modelImgDir, false, true, false, safeName);
-      if (fs.existsSync(destPath)) {
-        savedPaths.push(`/images/${model.uuid}/${safeName}`);
-      }
-    }
+    const names = await zipLib.extractZipImages(file.filepath, modelImgDir, {
+      select: Array.isArray(selectedFiles) && selectedFiles.length ? selectedFiles : null,
+    });
+    if (!names.length) return res.status(422).json({ error: 'No image files found in this ZIP' });
+    const savedPaths = [...new Set(names)].map(n => `/images/${model.uuid}/${n}`);
 
     // Merge with existing images
     const existingImages = JSON.parse(model.images || '[]');
@@ -1303,7 +1334,7 @@ app.get('/api/ai/vision-tags', async (req, res) => {
       b64 = buf.toString('base64');
     } catch { log('warn', `${label} — could not read image`); continue; }
 
-    const meta = `File metadata:\n- name: ${m.name}\n- creator: ${m.creator_name || 'unknown'}\n- folder: ${m.folder_path.replace(/^\/library\/?/, '')}`;
+    const meta = `File metadata:\n- name: ${m.name}\n- creator: ${m.creator_name || 'unknown'}\n- folder: ${realFolder(m.folder_path).replace(/^\/library\/?/, '')}`;
     try {
       const parsed = await callClaudeAPI(apiKey, {
         model, max_tokens: 400, system: systemPrompt,
@@ -1417,7 +1448,7 @@ No other text or explanation — just the JSON array.`;
       id: m.id,
       name: m.name,
       creator: m.creator_name,
-      path: m.folder_path.replace(/^\/library\/?/, ''),
+      path: realFolder(m.folder_path).replace(/^\/library\/?/, ''),
       slicer: (m.has_chitubox || m.has_lychee) ? 'resin' : 'fdm'
     }));
 
@@ -1532,7 +1563,7 @@ function scoreMatchability(model) {
   if (model.source_url) { score += 50; reasons.push('has source URL'); }
 
   // Folder name matches a known site pattern (thingiverse ID, printables slug, etc.)
-  const folderName = path.basename(model.folder_path);
+  const folderName = path.basename(realFolder(model.folder_path));
   if (detectUrlFromFolderName(folderName)) { score += 40; reasons.push('folder has site ID'); }
 
   // Has a real creator name (not just a generic folder name)
@@ -1628,7 +1659,7 @@ app.get('/api/ai/find-images', async (req, res) => {
 
     // Try folder name detection first (free, no API call)
     if (!sourceUrl) {
-      const folderName = path.basename(model.folder_path);
+      const folderName = path.basename(realFolder(model.folder_path));
       const detected = detectUrlFromFolderName(folderName);
       if (detected) {
         sourceUrl = detected.url;
@@ -1927,14 +1958,102 @@ app.get('/api/models/:id(\\d+)/collections', (req, res) => {
 function libraryWritable() {
   try { fs.accessSync(LIBRARY_PATH, fs.constants.W_OK); return true; } catch { return false; }
 }
-app.get('/api/health', (req, res) => res.json({
-  ok: true,
-  libraryPath: LIBRARY_PATH,
-  ...APP_VERSION,
-  gitSha: process.env.GIT_SHA || 'dev',
-  buildDate: process.env.BUILD_DATE || '',
-  libraryWritable: libraryWritable(),
-}));
+app.get('/api/health', (req, res) => {
+  let libraries = [];
+  try { libraries = librariesLib.listLibraries(LIBRARY_PATH, metaCache?.vault?.libraryLabels).map(l => ({ name: l.name, path: l.path, writable: !!l.writable })); } catch {}
+  res.json({
+    ok: true,
+    libraryPath: LIBRARY_PATH,
+    ...APP_VERSION,
+    gitSha: process.env.GIT_SHA || 'dev',
+    buildDate: process.env.BUILD_DATE || '',
+    libraryWritable: libraryWritable(),
+    layoutMode: (process.env.LAYOUT_MODE || 'layout').toLowerCase() === 'legacy' ? 'legacy' : 'layout',
+    libraries,
+  });
+});
+
+// ── Facets, _Meta and attribution (docs/library-metadata.md §7) ──────────────
+
+const ATTRIBUTED = new Set(['sidecar', 'exact', 'name']);
+const countList = (m) => [...m.entries()].map(([name, count]) => ({ name, count })).sort((a, b) => b.count - a.count || String(a.name).localeCompare(String(b.name)));
+
+app.get('/api/facets', (req, res) => {
+  const rows = db.prepare(`
+    SELECT m.library, m.libraries, m.studio, m.franchise, m.release_term, COALESCE(m.kind, 'model') AS kind, m.source, m.confidence, c.name AS creator
+    FROM models m LEFT JOIN creators c ON c.id = m.creator_id
+    WHERE (m.hidden IS NULL OR m.hidden = 0)
+  `).all();
+  const f = { libraries: new Map(), studios: new Map(), creators: new Map(), genres: new Map(), terms: new Map(), kinds: new Map(), sources: new Map(), confidence: new Map() };
+  const inc = (m, k) => { if (k) m.set(k, (m.get(k) || 0) + 1); };
+  for (const r of rows) {
+    inc(f.kinds, r.kind);
+    if (r.kind === 'tool') continue;
+    const libs = parseJSON(r.libraries, r.library ? [r.library] : []);
+    for (const l of libs) inc(f.libraries, l);
+    inc(f.studios, r.studio); inc(f.creators, r.creator); inc(f.genres, r.franchise); inc(f.terms, r.release_term);
+    inc(f.sources, r.source); inc(f.confidence, r.confidence || 'none');
+  }
+  const out = Object.fromEntries(Object.entries(f).map(([k, m]) => [k, countList(m)]));
+  out.terms.sort((a, b) => String(b.name).localeCompare(String(a.name)));
+  res.json(out);
+});
+
+/** _Meta status; model.json sidecars are counted by the scanner (it walks the library, the server does not). */
+function metaStatusBody(meta) {
+  const st = metaLib.metaStatus(meta);
+  const sc = parseInt(db.getSetting ? db.getSetting('meta_sidecars') : '', 10);
+  if (Number.isFinite(sc)) st.counts.sidecars = sc;
+  return st;
+}
+app.get('/api/meta/status', (req, res) => res.json(metaStatusBody(getMeta())));
+app.post('/api/meta/reload', (req, res) => res.json(metaStatusBody(getMeta({ reload: true }))));
+
+/** Owned manifest products with no file on any library (by file match or by card). */
+function attributionGaps(creatorFilter) {
+  const meta = getMeta();
+  const owned = new Set();
+  for (const r of db.prepare(`SELECT products FROM models WHERE products IS NOT NULL AND products != '[]'`).all()) {
+    for (const p of parseJSON(r.products, [])) owned.add(p.libraryUrl || p.name);
+  }
+  for (const r of db.prepare('SELECT DISTINCT product FROM model_files WHERE product IS NOT NULL').all()) owned.add(r.product);
+  const want = creatorFilter ? String(creatorFilter).toLowerCase() : null;
+  return meta.products
+    .filter(p => !p.unknown && !owned.has(p.libraryUrl || p.name) && !owned.has(p.name))
+    .filter(p => !want || [p.creator, p.rawCreator, p.studio].some(x => x && String(x).toLowerCase() === want))
+    .map(p => ({
+      creator: p.creator, name: p.name, term: p.term || null, libraryUrl: p.libraryUrl, productUrl: p.productUrl || null,
+      files: p.files.length, sizeGB: Math.round(p.files.reduce((t, f) => t + (f.size || 0), 0) / 1e7) / 100,
+    }))
+    .sort((a, b) => String(a.creator).localeCompare(String(b.creator)) || String(b.term || '').localeCompare(String(a.term || '')) || a.name.localeCompare(b.name));
+}
+
+app.get('/api/attribution/summary', (req, res) => {
+  const rows = db.prepare(`
+    SELECT m.libraries, m.library, m.studio, m.confidence FROM models m
+    WHERE (m.hidden IS NULL OR m.hidden = 0) AND COALESCE(m.kind, 'model') != 'tool'
+  `).all();
+  const byConfidence = {};
+  const lib = new Map(), studio = new Map();
+  const add = (m, k, a) => { if (!k) return; const v = m.get(k) || { name: k, total: 0, attributed: 0 }; v.total++; if (a) v.attributed++; m.set(k, v); };
+  for (const r of rows) {
+    const c = r.confidence || 'none';
+    byConfidence[c] = (byConfidence[c] || 0) + 1;
+    const a = ATTRIBUTED.has(c);
+    for (const l of parseJSON(r.libraries, r.library ? [r.library] : [])) add(lib, l, a);
+    add(studio, r.studio || 'Other', a);
+  }
+  res.json({
+    total: rows.length, byConfidence,
+    byLibrary: [...lib.values()].sort((a, b) => b.total - a.total),
+    byStudio: [...studio.values()].sort((a, b) => b.total - a.total),
+    gaps: attributionGaps().length,
+  });
+});
+
+app.get('/api/attribution/gaps', (req, res) => {
+  res.json({ products: attributionGaps(req.query.creator) });
+});
 
 // ── Library roots ───────────────────────────────────────────────────────────
 // Lists the top-level folders mounted under LIBRARY_PATH (one per docker-compose
@@ -1973,7 +2092,8 @@ app.get('/api/library/tree', (req, res) => {
   const root = { name: 'Library', path: LIBRARY_PATH, children: {}, count: 0 };
   const base = LIBRARY_PATH.replace(/\/+$/, '');
 
-  for (const { folder_path } of rows) {
+  for (const row of rows) {
+    const folder_path = realFolder(row.folder_path); // virtual "<folder>#<slug>" counts toward its folder
     if (!folder_path || !folder_path.startsWith(base)) continue;
     const rel = folder_path.slice(base.length).replace(/^\/+/, '');
     const parts = rel.split('/').filter(Boolean);

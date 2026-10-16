@@ -17,7 +17,8 @@ const express  = require('express');
 const fs       = require('fs');
 const path     = require('path');
 const db       = require('./db');
-const { pickRenderArchives, analyzeFolder, extractImagesFromArchive } = require('./scanner');
+const { pickRenderArchives, analyzeFolder, extractImagesFromArchive, analysisFromFiles, realFolder } = require('./scanner');
+const librariesLib = require('./lib/libraries');
 const { callClaudeAPI, claudeStream } = require('./lib/claude');
 const { confinePath, tryConfine, sendPathError, isSafeSegment } = require('./lib/paths');
 const { openSSE } = require('./lib/sse');
@@ -483,7 +484,7 @@ router.get('/health', async (req, res) => {
            m.source_url, m.tags, m.franchise, m.creator_id, c.name AS creator_name
     FROM models m
     LEFT JOIN creators c ON m.creator_id = c.id
-    WHERE (m.hidden IS NULL OR m.hidden = 0)
+    WHERE (m.hidden IS NULL OR m.hidden = 0) AND COALESCE(m.kind, 'model') != 'tool'
     ORDER BY m.name
   `).all();
 
@@ -516,6 +517,39 @@ router.get('/health', async (req, res) => {
   }
   crossCreatorDupes.sort((a, b) => b.models.length - a.models.length);
 
+  // File level: the same name + byte size in two libraries (Dagobah / Endor) is a
+  // backup copy, never a duplicate; inside ONE library it is a duplicate.
+  const libs = librariesLib.listLibraries();
+  const fileRows = db.prepare(`
+    SELECT f.filename, f.filesize, f.filepath, f.library, f.model_id, m.name AS model_name
+    FROM model_files f JOIN models m ON m.id = f.model_id
+    WHERE (m.hidden IS NULL OR m.hidden = 0) AND f.filesize >= 102400
+  `).all();
+  const bySig = new Map();
+  for (const f of fileRows) {
+    const k = `${f.filename.toLowerCase()}|${f.filesize}`;
+    if (!bySig.has(k)) bySig.set(k, []);
+    bySig.get(k).push(f);
+  }
+  const fileDuplicates = [];
+  let backupCopies = 0;
+  for (const list of bySig.values()) {
+    if (list.length < 2) continue;
+    const perLib = new Map();
+    for (const f of list) {
+      const lib = f.library || librariesLib.libraryOf(f.filepath, libs) || '';
+      if (!perLib.has(lib)) perLib.set(lib, []);
+      perLib.get(lib).push(f);
+    }
+    if (perLib.size > 1) backupCopies++;
+    for (const [lib, same] of perLib) {
+      if (same.length > 1) fileDuplicates.push({ library: lib || null, filename: same[0].filename, filesize: same[0].filesize, copies: same.map(f => ({ filepath: f.filepath, model_id: f.model_id, model_name: f.model_name })) });
+    }
+  }
+  fileDuplicates.sort((a, b) => b.filesize * b.copies.length - a.filesize * a.copies.length);
+  // Synology Drive conflict copies ("…_Conflict") are indexed but flagged
+  const conflictFolders = models.filter(m => /_Conflict(?:\b|$)/i.test(realFolder(m.folder_path) || ''));
+
   res.json({
     summary: {
       total: models.length,
@@ -526,6 +560,9 @@ router.get('/health', async (req, res) => {
       noTags: noTags.length,
       noFranchise: noFranchise.length,
       crossCreatorDupes: crossCreatorDupes.length,
+      fileDuplicates: fileDuplicates.length,
+      backupCopies,
+      conflictFolders: conflictFolders.length,
     },
     duplicates,
     crossCreatorDupes,
@@ -534,6 +571,9 @@ router.get('/health', async (req, res) => {
     noSource,
     noTags,
     noFranchise,
+    fileDuplicates: fileDuplicates.slice(0, 500),
+    backupCopies,
+    conflictFolders,
   });
 });
 
@@ -569,11 +609,15 @@ function isReadOnlyError(e) {
 router.post('/apply-franchise', (req, res) => {
   const dryRun = req.body?.dryRun !== false; // safe default: dry run
 
+  // Studio works (identity-grouped cards) and works sharing a folder ("<folder>#<slug>")
+  // are filed by the organizer, never moved from here: their folder holds other cards' files.
   const models = db.prepare(`
     SELECT id, name, folder_path, franchise
     FROM models
     WHERE franchise IS NOT NULL AND franchise != ''
       AND (hidden IS NULL OR hidden = 0)
+      AND COALESCE(kind, 'model') NOT IN ('work', 'diorama', 'tool')
+      AND instr(folder_path, '#') = 0
     ORDER BY length(folder_path) DESC
   `).all();
 
@@ -864,7 +908,7 @@ router.post('/fix-thumbnails', async (req, res) => {
 
   // Pass 2: models with no images at all — try to extract from render archives
   const noImages = db.prepare(`
-    SELECT m.id, m.uuid, m.folder_path, m.render_zip_hint,
+    SELECT m.id, m.uuid, m.folder_path, m.render_zip_hint, m.work_key,
            c.render_zip_hint AS creator_hint
     FROM models m LEFT JOIN creators c ON c.id = m.creator_id
     WHERE (m.hidden IS NULL OR m.hidden = 0)
@@ -876,9 +920,11 @@ router.post('/fix-thumbnails', async (req, res) => {
   let extracted = 0;
   for (const m of noImages) {
     try {
-      if (!tryConfine(m.folder_path) || !fs.existsSync(m.folder_path)) continue;
+      const folder = realFolder(m.folder_path);
+      if (!tryConfine(folder) || !fs.existsSync(folder)) continue;
       const hint = m.render_zip_hint || m.creator_hint || null;
-      const analysis = analyzeFolder(m.folder_path, null);
+      const dbFiles = m.work_key ? db.prepare('SELECT filename, filepath, filesize, variant FROM model_files WHERE model_id = ?').all(m.id).filter(f => tryConfine(f.filepath)) : [];
+      const analysis = dbFiles.length ? analysisFromFiles(dbFiles) : analyzeFolder(folder, null);
       const archives = pickRenderArchives(analysis, hint);
       const imgs = [];
       for (const archPath of archives) {
@@ -915,7 +961,7 @@ router.get('/integrity', (req, res) => {
 
   for (const m of models) {
     checked.folders++;
-    if (!m.folder_path || !fs.existsSync(m.folder_path)) {
+    if (!m.folder_path || !fs.existsSync(realFolder(m.folder_path))) {
       missingFolders.push({ id: m.id, name: m.name, creator_name: m.creator_name, folder_path: m.folder_path });
     } else {
       checked.ok++;

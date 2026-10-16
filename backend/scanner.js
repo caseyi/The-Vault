@@ -1,9 +1,12 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const AdmZip = require('adm-zip');
 const { createExtractorFromData } = require('node-unrar-js');
 const db = require('./db');
+const {
+  discoverModelFolders, VARIANT_DIR, MEDIA_DIR, IGNORED_FOLDERS, isJunkFile,
+} = require('./lib/discovery');
+const zipLib = require('./lib/zip');
 const uuidv4 = () => crypto.randomUUID();
 
 const IMAGES_DIR = process.env.IMAGES_DIR || '/data/images';
@@ -35,24 +38,6 @@ function archiveTooBig(p) {
     }
   } catch { return true; }
   return false;
-}
-
-// Synology system / junk folders to skip during scanning
-const IGNORED_FOLDERS = new Set([
-  '@eaDir', '@tmp', '@appstore', '@autoupdate', '@database', '@S2S',
-  '#recycle', '#snapshot',
-  '.DS_Store', '.Spotlight-V100', '.Trashes', '.fseventsd',
-  '__MACOSX', 'Thumbs.db', '.synology_cache',
-  '$RECYCLE.BIN', 'System Volume Information',
-]);
-
-// Synology extended-attribute stream files and other junk file patterns to skip
-function isJunkFile(filename) {
-  return filename.includes('@SynoEAStream') ||
-         filename.includes('@SynoResource') ||
-         filename.startsWith('._') ||
-         filename === '.DS_Store' ||
-         filename === 'Thumbs.db';
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -177,26 +162,21 @@ function inferModelName(folderPath) {
 
 // ── Image extraction ──────────────────────────────────────────────────────────
 
-function extractImagesFromZip(zipPath, modelUuid) {
-  const extracted = [];
-  if (archiveTooBig(zipPath)) return extracted;
+// Streams the central directory with yauzl (lib/zip.js) instead of loading the
+// archive, so multi-GB zips get thumbnails. ZIP_MAX_MB / an explicit ARCHIVE_MAX_MB cap it.
+async function extractImagesFromZip(zipPath, modelUuid, opts = {}) {
+  if (zipLib.zipTooBig(zipPath)) {
+    console.warn(`Skipping ${zipPath}: larger than ZIP_MAX_MB/ARCHIVE_MAX_MB`);
+    return [];
+  }
   try {
-    const zip = new AdmZip(zipPath);
     const modelImgDir = path.join(IMAGES_DIR, modelUuid);
-    if (!fs.existsSync(modelImgDir)) fs.mkdirSync(modelImgDir, { recursive: true });
-    for (const entry of zip.getEntries()) {
-      if (!entry.isDirectory && isRenderImage(entry.entryName)) {
-        if (entry.header && entry.header.size > MAX_IMAGE_ENTRY_BYTES) continue;
-        const safeName = path.basename(entry.entryName).replace(/[^a-zA-Z0-9._-]/g, '_');
-        const outPath = path.join(modelImgDir, safeName);
-        if (!fs.existsSync(outPath)) zip.extractEntryTo(entry, modelImgDir, false, true, false, safeName);
-        extracted.push(`/images/${modelUuid}/${safeName}`);
-      }
-    }
+    const names = await zipLib.extractZipImages(zipPath, modelImgDir, { limit: opts.limit || 0, rank: rankImages });
+    return [...new Set(names)].map(n => `/images/${modelUuid}/${n}`);
   } catch (e) {
     console.warn(`Could not extract zip ${zipPath}: ${e.message}`);
+    return [];
   }
-  return extracted;
 }
 
 // node-unrar-js v2's createExtractorFromData is async (it loads a WASM module);
@@ -233,10 +213,10 @@ async function extractImagesFromRar(rarPath, modelUuid) {
 }
 
 /** Extract render images from a .zip/.rar into IMAGES_DIR/<uuid>/. Always returns a Promise. */
-async function extractImagesFromArchive(archivePath, modelUuid) {
+async function extractImagesFromArchive(archivePath, modelUuid, opts) {
   const ext = path.extname(archivePath).toLowerCase();
   if (ext === '.rar') return extractImagesFromRar(archivePath, modelUuid);
-  return extractImagesFromZip(archivePath, modelUuid);
+  return extractImagesFromZip(archivePath, modelUuid, opts);
 }
 
 function extractImagesFromFolder(folderPath, modelUuid) {
@@ -247,6 +227,7 @@ function extractImagesFromFolder(folderPath, modelUuid) {
       if (isJunkFile(file)) continue;
       if (isRenderImage(file)) {
         const src = path.join(folderPath, file);
+        try { if (fs.statSync(src).size > imageMaxBytes()) continue; } catch { continue; } // IMAGE_MAX_MB (default 50)
         if (!fs.existsSync(modelImgDir)) fs.mkdirSync(modelImgDir, { recursive: true });
         const safeName = file.replace(/[^a-zA-Z0-9._-]/g, '_');
         const dest = path.join(modelImgDir, safeName);
@@ -341,171 +322,9 @@ function analyzeFolder(folderPath, creatorName) {
   return result;
 }
 
-// ── Model-folder discovery ────────────────────────────────────────────────────
-
-// Sub-folder names that are a VARIANT or ROLE of the model around them, not a
-// separate model: "Mandalorian Bust/FDM/*.stl" + "/Resin/*.stl" + "/Renders/*.png"
-// is ONE model with three sub-folders.
-const STRONG_VARIANT_DIR = /^(?:(?:pre|un)?[- _]?supported|supports?|no[- _]?supports?|fdm|resin|sla|msla|dlp|lychee|chitubox|hollow(?:ed)?|solid)(?:[- _](?:files?|version|stls?|parts))?$/i;
-const GENERIC_CONTAINER_DIR = /^(?:stls?|files|parts|3mf|obj|stl[- _]files|print[- _]files)$/i;
-const MEDIA_DIR = /^(?:renders?|images?|pics?|photos?|previews?|pictures?|gallery)$/i;
-const VARIANT_DIR = new RegExp(`${STRONG_VARIANT_DIR.source}|${GENERIC_CONTAINER_DIR.source}|${MEDIA_DIR.source}`, 'i');
-
-function isPrintableName(name) {
-  const ext = path.extname(name).toLowerCase();
-  return STL_EXTS.has(ext) || ARCHIVE_EXTS.has(ext) || SLICE_EXTS.has(ext) || PLATE_EXTS.has(ext);
-}
-
-function listDir(dir) {
-  try {
-    return fs.readdirSync(dir, { withFileTypes: true }).filter(e => !IGNORED_FOLDERS.has(e.name) && !isJunkFile(e.name));
-  } catch { return []; }
-}
-
-/** Does `dir` contain printable files within `depth` levels? */
-function containsPrintable(dir, depth) {
-  const entries = listDir(dir);
-  if (entries.some(e => !e.isDirectory() && isPrintableName(e.name))) return true;
-  if (depth <= 0) return false;
-  return entries.some(e => e.isDirectory() && containsPrintable(path.join(dir, e.name), depth - 1));
-}
-
-/**
- * A variant folder is "flat" when it holds the model's printables itself
- * (Supported/*.stl), or only nested variant/media folders that do
- * (Supported/STL/*.stl). A variant-named folder that instead holds OTHER
- * sub-folders with printables (e.g. a Patreon release laid out as
- * "Pre-Supported/<Model A>/", "Pre-Supported/<Model B>/") is a container of
- * separate models and must never be merged into one card.
- */
-function isFlatVariant(dir, depth = 2) {
-  const entries = listDir(dir);
-  const subdirs = entries.filter(e => e.isDirectory());
-  for (const sub of subdirs) {
-    const full = path.join(dir, sub.name);
-    const n = sub.name.trim();
-    if (MEDIA_DIR.test(n)) continue;
-    if (VARIANT_DIR.test(n) && depth > 0 && (isFlatVariant(full, depth - 1) || !containsPrintable(full, 3))) continue;
-    if (containsPrintable(full, 3)) return false; // holds an independent model folder
-  }
-  return true;
-}
-
-/** A generic "Files"/"STLs" folder that actually holds 3+ separate model folders. */
-function looksLikeModelContainer(dir) {
-  const kids = listDir(dir).filter(e => e.isDirectory() && !VARIANT_DIR.test(e.name.trim()));
-  let withPrintables = 0;
-  for (const k of kids) {
-    if (listDir(path.join(dir, k.name)).some(e => !e.isDirectory() && isPrintableName(e.name))) withPrintables++;
-    if (withPrintables >= 3) return true;
-  }
-  return false;
-}
-
-/**
- * Classify the sub-folders of a folder that has NO printable files of its own.
- * Returns { merge: boolean, absorbed: string[] } — merge=true means the folder
- * is ONE model whose sub-folders are variants/roles (FDM/Resin/Supported/Renders…).
- * Any folder-role override on a sub-folder marks it as independent (blocks the
- * merge), except 'ignore' which just drops it.
- */
-function classifyVariantContainer(dir, subdirs, overrides) {
-  const absorbed = [];
-  let variantWithPrintables = false;
-  const needsCheck = [];
-  let hasVariantName = false;
-  for (const sub of subdirs) {
-    const name = sub.name.trim();
-    const full = path.join(dir, sub.name);
-    if (overrides.has(full)) return { merge: false, absorbed: [] };
-    if (VARIANT_DIR.test(name)) hasVariantName = true;
-    needsCheck.push({ sub, name, full });
-  }
-  if (!hasVariantName) return { merge: false, absorbed: [] }; // plain category folder — cheap exit
-  for (const { sub, name, full } of needsCheck) {
-    if (MEDIA_DIR.test(name)) { absorbed.push(sub.name); continue; }
-    if (STRONG_VARIANT_DIR.test(name) || GENERIC_CONTAINER_DIR.test(name)) {
-      // A variant-named folder full of separate model folders is a container,
-      // not a variant: keep the old per-folder behaviour (recurse).
-      if (!isFlatVariant(full)) return { merge: false, absorbed: [] };
-      if (GENERIC_CONTAINER_DIR.test(name) && looksLikeModelContainer(full)) return { merge: false, absorbed: [] };
-      absorbed.push(sub.name);
-      if (containsPrintable(full, 3)) variantWithPrintables = true;
-      continue;
-    }
-    // Any other name: an independent model if it holds printables; otherwise
-    // (instructions, paint guides…) it's just part of this model.
-    if (containsPrintable(full, 3)) return { merge: false, absorbed: [] };
-    absorbed.push(sub.name);
-  }
-  return { merge: variantWithPrintables, absorbed: variantWithPrintables ? absorbed : [] };
-}
-
-/**
- * Recursively discover model folders under a root directory.
- *  - A folder that directly contains printable files (STL, ZIP, …) is a model.
- *    Its variant/role sub-folders (FDM, Resin, Supported, Renders…) belong to it;
- *    other sub-folders are searched for further models.
- *  - A folder with NO printable files of its own whose sub-folders are all
- *    variants/roles (at least one holding printables) is ONE model too.
- *  - Any other folder with only subdirectories is a "category" — we recurse deeper.
- * Folder-role overrides (folder_overrides table) take precedence: 'ignore' skips
- * a folder, and any override on a folder or sub-folder disables the variant merge.
- * Returns array of { name, fullPath, variantDirs } entries.
- * @param {string} rootDir - The directory to search
- * @param {string} namePrefix - Breadcrumb prefix for display names (e.g. "Star Wars / Vehicles")
- * @param {number} maxDepth - Maximum recursion depth (default 5)
- * @param {Map<string,string>} [overrides] - folder_overrides path → role
- */
-function discoverModelFolders(rootDir, namePrefix, maxDepth, overrides) {
-  if (maxDepth === undefined) maxDepth = 5;
-  const ov = overrides instanceof Map ? overrides : new Map();
-  const results = [];
-
-  function recurse(dir, prefix, depth) {
-    if (depth <= 0) return;
-    if (ov.get(dir) === 'ignore') return;
-    const entries = listDir(dir);
-    const subdirs = entries.filter(e => e.isDirectory() && ov.get(path.join(dir, e.name)) !== 'ignore');
-    const files   = entries.filter(e => !e.isDirectory());
-    const hasPrintableFiles = files.some(f => isPrintableName(f.name));
-    const name = prefix || path.basename(dir);
-    const childName = (sub) => (prefix ? `${prefix} / ${sub.name}` : sub.name);
-
-    if (hasPrintableFiles) {
-      const variantDirs = [];
-      const descend = [];
-      for (const sub of subdirs) {
-        const full = path.join(dir, sub.name);
-        const n = sub.name.trim();
-        const isVariant = !ov.has(full) && (MEDIA_DIR.test(n) ||
-          (STRONG_VARIANT_DIR.test(n) && isFlatVariant(full)) ||
-          (GENERIC_CONTAINER_DIR.test(n) && isFlatVariant(full) && !looksLikeModelContainer(full)));
-        if (isVariant) variantDirs.push(sub.name); else descend.push(sub);
-      }
-      results.push({ name, fullPath: dir, variantDirs });
-      // Other sub-folders may contain their own models (e.g. a folder with ZIPs
-      // at one level AND sub-folders with more models)
-      for (const sub of descend) recurse(path.join(dir, sub.name), childName(sub), depth - 1);
-      return;
-    }
-
-    if (subdirs.length === 0) return;
-
-    // (Not at the root: the root is the creator folder, not a model.)
-    if (depth < maxDepth && !ov.has(dir)) {
-      const { merge, absorbed } = classifyVariantContainer(dir, subdirs, ov);
-      if (merge) {
-        results.push({ name, fullPath: dir, variantDirs: absorbed });
-        return;
-      }
-    }
-    for (const sub of subdirs) recurse(path.join(dir, sub.name), childName(sub), depth - 1);
-  }
-
-  recurse(rootDir, namePrefix || '', maxDepth);
-  return results;
-}
+// ── Model-folder discovery (lib/discovery.js) ─────────────────────────────────
+// Sub-folder names that are a VARIANT or ROLE of the model around them live in
+// lib/discovery.js (shared with the layout-aware scanner).
 
 // ── Prepared statements (compiled once, reused thousands of times) ────────────
 
@@ -833,7 +652,7 @@ async function processCreatorModels(ctx, progressCallback, counters) {
   }
 }
 
-async function scanLibrary(libraryPath, progressCallback, logger) {
+async function scanLibraryLegacy(libraryPath, progressCallback, logger) {
   const log = logger || (() => {});
   const logId = db.prepare('INSERT INTO scan_log (scan_path, status) VALUES (?, ?)').run(libraryPath, 'running').lastInsertRowid;
 
@@ -902,7 +721,7 @@ async function scanLibrary(libraryPath, progressCallback, logger) {
  * Uses the same per-model pipeline as scanLibrary.
  * Called by POST /api/scan/creator/:id.
  */
-async function scanSingleCreator(creatorPath, creatorId, creatorName, progressCallback, logger) {
+async function scanSingleCreatorLegacy(creatorPath, creatorId, creatorName, progressCallback, logger) {
   const log = logger || (() => {});
   const logId = db.prepare('INSERT INTO scan_log (scan_path, status) VALUES (?, ?)').run(creatorPath, 'running').lastInsertRowid;
 
@@ -929,7 +748,482 @@ async function scanSingleCreator(creatorPath, creatorId, creatorName, progressCa
   }
 }
 
+// ── Layout-aware scan (docs/library-metadata.md) ─────────────────────────────
+// LAYOUT_MODE=legacy keeps the folder-based scanner above; the default groups
+// files into works (studio identity, release packs, folder fallback) and
+// attributes them from <library>/_Meta.
+const worksLib = require('./lib/works');
+const metaLib = require('./lib/meta');
+const librariesLib = require('./lib/libraries');
+
+function layoutMode() {
+  return String(process.env.LAYOUT_MODE || 'layout').trim().toLowerCase() === 'legacy' ? 'legacy' : 'layout';
+}
+
+function imageMaxBytes() {
+  const mb = parseFloat(process.env.IMAGE_MAX_MB);
+  return (Number.isFinite(mb) && mb > 0 ? mb : 50) * 1024 * 1024;
+}
+const MAX_RENDER_ARCHIVES = 2;   // per work and scan (Wicked works carry one Images.zip per edition/variant)
+const MAX_ARCHIVE_IMAGES = 12;   // best-ranked images taken from each archive
+const MAX_LOOSE_IMAGES = 24;
+
+/** Libraries (top-level folders) + the merged _Meta of every library. */
+function loadLibraryMeta(log = () => {}) {
+  const root = process.env.LIBRARY_PATH || LIBRARY_PATH;
+  let libs = librariesLib.listLibraries(root);
+  const dirs = [...new Set([path.join(root, '_Meta'), ...libs.map(l => path.join(l.path, '_Meta'))])];
+  const meta = metaLib.loadMeta({ dirs, roots: [...new Set([root, ...libs.map(l => l.path)])], log });
+  if (meta.vault && meta.vault.libraryLabels) libs = librariesLib.listLibraries(root, meta.vault.libraryLabels);
+  return { meta, libs };
+}
+
+/** analyzeFolder()-shaped result from a list of model_files rows (works may share or span folders). */
+function analysisFromFiles(rows) {
+  const result = { files: [], hasStl: false, hasChitubox: false, hasLychee: false, hasPlate: false, images: [], renderArchives: [], releases: new Set() };
+  for (const r of rows) {
+    const fp = r.filepath || r.abs;
+    const filename = r.filename || r.name || path.basename(fp);
+    const ext = path.extname(filename).toLowerCase();
+    result.files.push({ filename, filepath: fp, ext, size: r.filesize ?? r.size ?? 0, release_name: r.release_name || null });
+    if (STL_EXTS.has(ext)) result.hasStl = true;
+    if (ext === '.chitubox' || ext === '.ctb' || ext === '.photon') result.hasChitubox = true;
+    if (ext === '.lys' || ext === '.lychee') result.hasLychee = true;
+    if (PLATE_EXTS.has(ext)) result.hasPlate = true;
+    if (IMAGE_EXTS.has(ext)) result.images.push(fp);
+    if (ARCHIVE_EXTS.has(ext) && (isRenderArchive(filename) || r.variant === 'images')) result.renderArchives.push(fp);
+  }
+  return result;
+}
+
+function copyImageFiles(paths, modelUuid) {
+  const out = [];
+  const dir = path.join(IMAGES_DIR, modelUuid);
+  for (const src of paths) {
+    try {
+      const st = fs.statSync(src);
+      if (st.size > imageMaxBytes()) continue;
+      const safeName = path.basename(src).replace(/[^a-zA-Z0-9._-]/g, '_');
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      const dest = path.join(dir, safeName);
+      if (!fs.existsSync(dest)) fs.copyFileSync(src, dest);
+      out.push(`/images/${modelUuid}/${safeName}`);
+    } catch (e) {
+      console.warn(`Could not copy image ${src}: ${e.message}`);
+    }
+  }
+  return out;
+}
+
+/** Renders for a work: hinted/render archives first (legacy order), then loose images. */
+async function workImages(w, modelUuid, hint, log) {
+  const analysis = analysisFromFiles(w.files);
+  const fresh = [];
+  const archives = pickRenderArchives(analysis, hint).slice(0, MAX_RENDER_ARCHIVES);
+  for (const a of archives) {
+    log('zip', `    📦 ${path.basename(a)}`);
+    const imgs = await extractImagesFromArchive(a, modelUuid, { limit: MAX_ARCHIVE_IMAGES });
+    fresh.push(...imgs);
+    if (imgs.length) log('img', `       → ${imgs.length} image(s)`);
+  }
+  if (!fresh.length && analysis.images.length) fresh.push(...copyImageFiles(rankImages(analysis.images).slice(0, MAX_LOOSE_IMAGES), modelUuid));
+  return fresh;
+}
+
+const parseJSON = (s, d) => { try { const v = JSON.parse(s); return v == null ? d : v; } catch { return d; } };
+
+const STUDIO_KINDS = new Set(['work', 'diorama']);
+function pathSegmentSet(...paths) {
+  const out = new Set();
+  for (const p of paths) for (const seg of String(worksLib.realFolder(p || '')).split(/[\\/]/)) if (seg) out.add(seg.trim().toLowerCase());
+  return out;
+}
+const eqi = (a, b) => !!a && !!b && String(a).trim().toLowerCase() === String(b).trim().toLowerCase();
+
+/**
+ * franchise (= genre) and team for a work. User edits win; values the old folder scanner
+ * derived from the path are cleaned up: a franchise equal to a folder of the card that is not a
+ * genre ("Humblewood STLs", "Unsupported", "April"), and on works/dioramas/release items a team
+ * that mirrors the group or a folder. A franchise still holding our previous automatic value follows the new one.
+ */
+function franchiseAndTeam(w, base, prevAttr, meta) {
+  const auto = w.attr.genre || null;
+  const autoTeam = w.kind === 'model' ? (w.pathTeam || null) : null;
+  if (!base) return { franchise: auto, team: autoTeam };
+  const segs = pathSegmentSet(base.folder_path, w.folderPath);
+  let fr = base.franchise || null;
+  if (fr && segs.has(fr.trim().toLowerCase()) && !metaLib.isKnownGenre(meta, fr)) fr = null;
+  if (fr && prevAttr.autoFranchise !== undefined && fr === prevAttr.autoFranchise) fr = null;
+  let team = base.team || null;
+  if (team && !(w.kind === 'model' || w.kind === 'tool')) {
+    if (eqi(team, base.group_name) || eqi(team, w.group) || segs.has(team.trim().toLowerCase())) team = null;
+  }
+  return { franchise: fr || auto, team: team || autoTeam };
+}
+
+/** release_name like the old analyzeFolder: first sub-folder below the work folder, or the archive stem. */
+function releaseNameFor(file, folder, creatorName) {
+  const rel = path.relative(folder, file.abs);
+  if (rel.startsWith('..')) return null;
+  const parts = rel.split(path.sep);
+  if (parts.length > 1) return inferReleaseName(parts[0], creatorName);
+  return ARCHIVE_EXTS.has(path.extname(file.name).toLowerCase()) ? inferReleaseName(file.name, creatorName) : null;
+}
+
+function cleanupJunkCreators(log) {
+  const junkCreators = db.prepare(
+    `SELECT id, name FROM creators WHERE ${[...IGNORED_FOLDERS].map(() => 'name = ?').join(' OR ')}`
+  ).all(...IGNORED_FOLDERS);
+  if (junkCreators.length > 0) {
+    const junkIds = junkCreators.map(c => c.id);
+    const placeholders = junkIds.map(() => '?').join(',');
+    const deletedModels = db.prepare(`DELETE FROM models WHERE creator_id IN (${placeholders})`).run(...junkIds).changes;
+    const deletedCreators = db.prepare(`DELETE FROM creators WHERE id IN (${placeholders})`).run(...junkIds).changes;
+    log('info', `Cleaned up ${deletedCreators} system folder creator(s) and ${deletedModels} model(s) (${junkCreators.map(c => c.name).join(', ')})`);
+  }
+}
+
+let L = null; // layout statements, prepared on first use (scanner.test.js mocks the DB)
+function layoutStmts() {
+  if (L) return L;
+  L = {
+    insert: db.prepare(`
+      INSERT INTO models (uuid, name, creator_id, folder_path, source_site, source_url,
+        file_count, has_stl, has_chitubox, has_lychee, has_plate, thumbnail_path, images, folder_hash,
+        franchise, team, work_key, kind, library, libraries, studio, character, group_name, editions,
+        release_term, release_label, source, products, attribution, confidence, last_scanned)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'))`),
+    update: db.prepare(`
+      UPDATE models SET
+        name = CASE WHEN COALESCE(name_locked, 0) = 1 THEN name ELSE ? END,
+        creator_id=?, folder_path=?, source_site=COALESCE(?, source_site), source_url=?,
+        file_count=?, has_stl=?, has_chitubox=?, has_lychee=?, has_plate=?,
+        thumbnail_path=?, images=?, folder_hash=?, franchise=?, team=?,
+        work_key=?, kind=?, library=?, libraries=?, studio=?, character=?, group_name=?, editions=?,
+        release_term=?, release_label=?, source=?, products=?, attribution=?, confidence=?,
+        last_scanned=datetime('now'), updated_at=datetime('now')
+      WHERE id=?`),
+    touch: db.prepare(`UPDATE models SET last_scanned=datetime('now') WHERE id=?`),
+    setPath: db.prepare(`UPDATE models SET folder_path=? WHERE id=?`),
+    delByPath: db.prepare('DELETE FROM model_files WHERE filepath = ?'),
+    delModelScope: db.prepare('DELETE FROM model_files WHERE model_id = ? AND filepath > ? AND filepath < ?'),
+    delModelAll: db.prepare('DELETE FROM model_files WHERE model_id = ?'),
+    insFile: db.prepare(`
+      INSERT OR REPLACE INTO model_files (model_id, filename, filepath, filetype, filesize, release_name, library, variant, edition, product, matched_by, printed_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`),
+    fileStats: db.prepare(`SELECT COUNT(*) n, GROUP_CONCAT(DISTINCT library) libs FROM model_files WHERE model_id = ?`),
+    fold: db.prepare(`UPDATE models SET hidden = 1, folder_hash = NULL, work_key = NULL, attribution = ?, creator_id = COALESCE(?, creator_id), updated_at = datetime('now') WHERE id = ?`),
+    full: db.prepare('SELECT * FROM models WHERE id = ?'),
+    mergeUser: db.prepare(`UPDATE models SET tags=?, is_favorite=?, print_status=?, notes=?, images=?, thumbnail_path=?, name=?, name_locked=?, source_url=COALESCE(NULLIF(source_url,''), ?), updated_at=datetime('now') WHERE id=?`),
+  };
+  return L;
+}
+
+/**
+ * The layout-aware scan. `scope` limits it to one creator folder (per-creator rescan):
+ * only files under scope are walked, replaced and re-grouped.
+ */
+async function scanLibraryLayout(libraryPath, progressCallback, logger, { scope = null } = {}) {
+  const log = logger || (() => {});
+  const t0 = Date.now();
+  const logId = db.prepare('INSERT INTO scan_log (scan_path, status) VALUES (?, ?)').run(scope || libraryPath, 'running').lastInsertRowid;
+  const counters = { modelsFound: 0, modelsAdded: 0, modelsUpdated: 0, modelsSkipped: 0, folded: 0 };
+  cleanupJunkCreators(log);
+  const S = layoutStmts();
+  try {
+    if (!scope && typeof db.getSetting === 'function' && !db.getSetting('layout_regroup_done')) {
+      const n = db.prepare('SELECT COUNT(*) AS n FROM models').get().n;
+      if (n > 0) {
+        const file = require('./lib/backup').snapshot('pre-regroup', { db, log: { log: (m) => log('info', m), error: (m) => log('warn', m) } });
+        if (file) log('info', `Backup written before regrouping into works: ${path.basename(file)}`);
+      }
+    }
+    const tm = Date.now();
+    const { meta, libs } = loadLibraryMeta(log);
+    const metaMs = Date.now() - tm;
+    const overrides = loadFolderOverrides();
+    const ignore = new Set([...overrides].filter(([, r]) => r === 'ignore').map(([p]) => p));
+    const tw = Date.now();
+    const tree = worksLib.walkTree(libraryPath, { ignore, scope });
+    log('info', `Walked ${tree.fileCount} file(s) in ${Date.now() - tw} ms`);
+    const plan = worksLib.planWorks({ libraryPath, tree, meta, overrides, log, scope });
+    worksLib.finalizeWorks(plan.works, { libraries: libs, libraryOf: librariesLib.libraryOf });
+    for (const w of plan.works) {
+      w.attr = worksLib.attributeWork(w, meta);
+      if (w.attr.character) { w.name = w.attr.character; w.character = w.attr.character; }
+    }
+    const byKind = {};
+    for (const w of plan.works) byKind[w.kind] = (byKind[w.kind] || 0) + 1;
+    log('info', `Grouped into ${plan.works.length} card(s): ${Object.entries(byKind).map(([k, n]) => `${n} ${k}`).join(', ')}`);
+
+    // ── existing state ──
+    const scopeRoot = scope || libraryPath;
+    const [lo, hi] = nextPathBound(scopeRoot);
+    const inScope = (p) => p > lo && p < hi;
+    const existingFiles = new Map();
+    const ownedTotal = new Map();
+    for (const r of db.prepare('SELECT model_id, filepath, printed_at FROM model_files').all()) {
+      ownedTotal.set(r.model_id, (ownedTotal.get(r.model_id) || 0) + 1);
+      if (inScope(r.filepath)) existingFiles.set(r.filepath, r);
+    }
+    const rows = new Map(db.prepare('SELECT id, uuid, work_key, folder_path, hidden, name, name_locked, folder_hash, images, thumbnail_path, render_zip_hint, creator_id, attribution, franchise, team, group_name, source_url FROM models').all().map(r => [r.id, r]));
+    const byKey = new Map();
+    const byFolder = new Map();
+    for (const r of rows.values()) {
+      r.folded = /#folded-\d+$/.test(r.folder_path || '') || !!parseJSON(r.attribution, {}).foldedInto;
+      if (r.work_key && !r.folded && (!byKey.has(r.work_key) || byKey.get(r.work_key).hidden)) byKey.set(r.work_key, r);
+      byFolder.set(r.folder_path, r);
+    }
+    const produced = new Set(plan.works.map(w => w.key));
+    const walked = new Set();
+    for (const w of plan.works) for (const f of w.files) walked.add(f.abs);
+
+    // ── bases: the row each work updates (same work_key, else a stale/legacy row in its folder) ──
+    const claimed = new Map(); // row id → work
+    for (const w of plan.works) {
+      const owners = new Map();
+      for (const f of w.files) { const e = existingFiles.get(f.abs); if (e) owners.set(e.model_id, (owners.get(e.model_id) || 0) + 1); }
+      w.owners = owners;
+      let base = byKey.get(w.key);
+      if (base && claimed.has(base.id)) base = null;
+      if (!base) {
+        const real = worksLib.realFolder(w.folderPath);
+        for (const fp of [w.folderPath, real]) {
+          const r = byFolder.get(fp);
+          if (r && !claimed.has(r.id) && !r.folded && (!r.work_key || !produced.has(r.work_key))) { base = r; break; }
+        }
+      }
+      if (base) claimed.set(base.id, w);
+      w.base = base || null;
+    }
+    // Rows left without files once the works take theirs → folded at the end. That covers
+    // folder models whose files were re-grouped and the empty rows the folder scanner left
+    // (sub-folders whose files a parent model had claimed).
+    const moved = new Map();
+    for (const w of plan.works) for (const [id, n] of w.owners) moved.set(id, (moved.get(id) || 0) + n);
+    const emptyFolders = new Map(); // real folder → row ids with no files at all
+    const foldable = new Set();
+    for (const r of rows.values()) {
+      if (claimed.has(r.id) || r.folded || (r.work_key && produced.has(r.work_key))) continue;
+      const total = ownedTotal.get(r.id) || 0;
+      if (total && moved.get(r.id) === total) foldable.add(r.id);
+      else if (!total && !r.hidden) {
+        const rf = worksLib.realFolder(r.folder_path || '');
+        if (rf && inScope(rf + path.sep)) { if (!emptyFolders.has(rf)) emptyFolders.set(rf, []); emptyFolders.get(rf).push(r.id); }
+      }
+    }
+    const emptyTarget = new Map(); // row id → work holding most files under its folder
+    if (emptyFolders.size) {
+      // the folder itself, else its nearest ancestor below the creator (a row left inside a
+      // skipped ".ArchiveServiceTemp…" folder belongs with the work around it)
+      const wanted = new Set();
+      for (const folder of emptyFolders.keys()) {
+        for (let d = folder, i = 0; i < 4 && d.length > scopeRoot.length; i++, d = path.dirname(d)) wanted.add(d);
+      }
+      const counts = new Map(); // folder → Map(work → n)
+      for (const w of plan.works) {
+        for (const f of w.files) {
+          for (let d = f.dir; d.length >= scopeRoot.length; d = path.dirname(d)) {
+            if (wanted.has(d)) { const m = counts.get(d) || new Map(); m.set(w, (m.get(w) || 0) + 1); counts.set(d, m); }
+            if (d === path.dirname(d)) break;
+          }
+        }
+      }
+      for (const [folder, ids] of emptyFolders) {
+        let m = null;
+        for (let d = folder, i = 0; !m && i < 4 && d.length > scopeRoot.length; i++, d = path.dirname(d)) m = counts.get(d) || null;
+        if (!m) continue; // nothing left there: kept for /api/organize/integrity
+        const best = [...m.entries()].sort((a, b) => b[1] - a[1])[0][0];
+        for (const id of ids) { foldable.add(id); emptyTarget.set(id, best); }
+      }
+    }
+    // ── folder_path collisions with rows that are not moving ──
+    db.transaction(() => {
+      for (const [id, w] of claimed) {
+        const r = rows.get(id);
+        if (r.folder_path !== w.folderPath) S.setPath.run(`${r.folder_path}#tmp-${id}`, id);
+      }
+      for (const w of plan.works) {
+        const holder = byFolder.get(w.folderPath);
+        if (!holder || (w.base && holder.id === w.base.id) || claimed.has(holder.id)) continue;
+        if (foldable.has(holder.id) || holder.folded) { S.setPath.run(`${holder.folder_path}#folded-${holder.id}`, holder.id); holder.folder_path = `${holder.folder_path}#folded-${holder.id}`; holder.folded = true; }
+        else w.folderPath = `${worksLib.realFolder(w.folderPath)}#${worksLib.slugify(`${w.kind} ${w.name}`)}`;
+      }
+    })();
+
+    // ── upsert works in chunks: filesystem work first, then one short transaction ──
+    const CHUNK = 25;
+    const works = plan.works.sort((a, b) => (a.creator || '').localeCompare(b.creator || '') || a.name.localeCompare(b.name));
+    for (let ci = 0; ci < works.length; ci += CHUNK) {
+      const chunk = works.slice(ci, ci + CHUNK);
+      const prepared = [];
+      for (const w of chunk) {
+        counters.modelsFound++;
+        if (progressCallback) progressCallback({ stage: 'scanning', creator: w.creator, model: w.name, found: counters.modelsFound });
+        const base = w.base;
+        const prevAttr = base ? parseJSON(base.attribution, {}) : {};
+        const products = JSON.stringify(w.attr.products);
+        const attribution = { ...w.attr.attribution, autoFranchise: w.attr.genre || null, sourceUrl: w.attr.sourceUrl || null };
+        const attrSig = JSON.stringify([products, w.attr.attribution, w.attr.genre, w.attr.release_term, w.attr.release_label, w.group || null, w.editions || [], w.libraries, w.name]);
+        attribution.sig = crypto.createHash('sha1').update(attrSig).digest('hex').slice(0, 12);
+        const filesOwned = base && w.owners.size === 1 && w.owners.get(base.id) === w.files.length;
+        const ft = franchiseAndTeam(w, base, prevAttr, meta);
+        const sameLabels = base && (base.franchise || null) === ft.franchise && (base.team || null) === ft.team;
+        if (base && base.folder_hash === w.hash && filesOwned && prevAttr.sig === attribution.sig && base.folder_path === w.folderPath && sameLabels) {
+          prepared.push({ w, skip: true });
+          continue;
+        }
+        const uuid = base ? base.uuid : uuidv4();
+        const creatorRow = stmts.getCreator.get(w.creator);
+        const hint = (base && base.render_zip_hint) || (creatorRow && creatorRow.render_zip_hint) || null;
+        let images = base ? parseJSON(base.images, []) : [];
+        const needImages = !base || base.folder_hash !== w.hash || !images.length;
+        if (needImages) {
+          try {
+            const fresh = await workImages(w, uuid, hint, log);
+            if (fresh.length) images = [...new Set([...fresh, ...images])];
+          } catch (e) { log('warn', `    images for ${w.name}: ${e.message}`); }
+        }
+        images = rankImages(images);
+        const thumbnail = base && base.thumbnail_path && images.includes(base.thumbnail_path) ? base.thumbnail_path : (images[0] || null);
+        prepared.push({ w, uuid, images, thumbnail, products, attribution, prevAttr, ft });
+      }
+
+      db.transaction(() => {
+        for (const p of prepared) {
+          const w = p.w;
+          if (p.skip) { S.touch.run(w.base.id); counters.modelsSkipped++; continue; }
+          const real = worksLib.realFolder(w.folderPath);
+          const creatorId = getOrCreateCreator(w.creator, plan.creatorFolders.get(w.creator) || w.creatorFolder || real);
+          const a = analysisFromFiles(w.files);
+          const sourceSite = detectSourceSite(real) || detectSourceSite(w.name) || (w.attr.source === 'gumroad' || w.attr.source === 'patreon' ? w.attr.source : null);
+          const base = w.base;
+          const { franchise, team } = p.ft; // franchise = genre; user edits win (see franchiseAndTeam)
+          const prevAutoUrl = p.prevAttr.sourceUrl;
+          const sourceUrl = !base || !base.source_url || (prevAutoUrl && base.source_url === prevAutoUrl) ? (w.attr.sourceUrl || (base ? base.source_url : null) || null) : base.source_url;
+          const vals = [
+            JSON.stringify(w.libraries || []), w.studio || null, w.character || null, w.group || null, JSON.stringify(w.editions || []),
+            w.attr.release_term || null, w.attr.release_label || null, w.attr.source || null, p.products, JSON.stringify(p.attribution), p.attribution.confidence,
+          ];
+          let id;
+          if (base) {
+            id = base.id;
+            S.update.run(w.name, creatorId, w.folderPath, sourceSite, sourceUrl,
+              w.files.length, a.hasStl ? 1 : 0, a.hasChitubox ? 1 : 0, a.hasLychee ? 1 : 0, a.hasPlate ? 1 : 0,
+              p.thumbnail, JSON.stringify(p.images), w.hash, franchise, team,
+              w.key, w.kind, w.library, ...vals, id);
+            counters.modelsUpdated++;
+            log('update', `    ↻ ${w.name} (${w.files.length} files)`);
+          } else {
+            id = S.insert.run(p.uuid, w.name, creatorId, w.folderPath, sourceSite, sourceUrl,
+              w.files.length, a.hasStl ? 1 : 0, a.hasChitubox ? 1 : 0, a.hasLychee ? 1 : 0, a.hasPlate ? 1 : 0,
+              p.thumbnail, JSON.stringify(p.images), w.hash, franchise, team,
+              w.key, w.kind, w.library, ...vals).lastInsertRowid;
+            counters.modelsAdded++;
+            log('add', `    + ${w.name} (${w.files.length} files${p.images.length ? `, ${p.images.length} img` : ''})`);
+          }
+          w.rowId = id;
+          // files: take them from their old owners, replace this row's files in scope
+          S.delModelScope.run(id, lo, hi);
+          for (const f of w.files) {
+            const prev = existingFiles.get(f.abs);
+            if (prev && prev.model_id !== id) S.delByPath.run(f.abs);
+            S.insFile.run(id, f.name, f.abs, fileType(f.name), f.size, releaseNameFor(f, real, w.creator), f.library || null,
+              f.variant || null, f.edition || null, f.product || null, f.matched_by || null, prev ? prev.printed_at : null);
+          }
+          if (scope) {
+            const st = S.fileStats.get(id);
+            db.prepare('UPDATE models SET file_count = ?, libraries = ? WHERE id = ?').run(st.n, JSON.stringify(String(st.libs || '').split(',').filter(Boolean)), id);
+          }
+        }
+      })();
+      await new Promise(resolve => setImmediate(resolve));
+    }
+
+    // ── fold old folder-based rows whose files now belong to works (never deleted) ──
+    const foldInto = new Map(); // work → [row]
+    for (const id of foldable) {
+      let best = emptyTarget.get(id) || null, bestN = 0;
+      if (!best) for (const w of plan.works) { const n = w.owners.get(id) || 0; if (n > bestN && w.rowId) { best = w; bestN = n; } }
+      if (best && !best.rowId) best = null;
+      if (best) { if (!foldInto.has(best)) foldInto.set(best, []); foldInto.get(best).push(id); }
+    }
+    db.transaction(() => {
+      for (const [w, ids] of foldInto) {
+        const target = S.full.get(w.rowId);
+        let tags = parseJSON(target.tags, []);
+        let fav = target.is_favorite ? 1 : 0;
+        let status = target.print_status || 'unprinted';
+        let notes = target.notes || '';
+        let images = parseJSON(target.images, []);
+        let thumb = target.thumbnail_path;
+        let name = target.name, locked = target.name_locked ? 1 : 0;
+        let srcUrl = null;
+        const lockedNames = [];
+        for (const id of ids) {
+          const kid = S.full.get(id);
+          if (!kid.hidden) {
+            for (const t of parseJSON(kid.tags, [])) if (!tags.includes(t)) tags.push(t);
+            if (kid.is_favorite) fav = 1;
+            if (status === 'unprinted' && kid.print_status && kid.print_status !== 'unprinted') status = kid.print_status;
+            if (kid.notes && !notes.includes(kid.notes)) notes = notes ? `${notes}\n${kid.notes}` : kid.notes;
+            for (const im of parseJSON(kid.images, [])) if (!images.includes(im)) images.push(im);
+            if (!thumb && kid.thumbnail_path) thumb = kid.thumbnail_path;
+            if (kid.name_locked) lockedNames.push(kid.name);
+            if (!srcUrl && kid.source_url) srcUrl = kid.source_url;
+            stmts.moveCollections.run(w.rowId, id);
+            stmts.moveQueue.run(w.rowId, id);
+          }
+          // folded rows keep their folder_path (renamed to "<path>#folded-<id>" only if a work needs it)
+          S.fold.run(JSON.stringify({ ...parseJSON(kid.attribution, {}), foldedInto: w.rowId }), target.creator_id, id);
+          counters.folded++;
+        }
+        if (lockedNames.length === 1 && !locked) { name = lockedNames[0]; locked = 1; }
+        else if (lockedNames.length > 1) {
+          const line = `Previous custom names: ${lockedNames.join('; ')}`;
+          if (!notes.includes(line)) notes = notes ? `${notes}\n${line}` : line;
+        }
+        S.mergeUser.run(JSON.stringify(tags), fav, status, notes || null, JSON.stringify(images), thumb || null, name, locked, srcUrl, w.rowId);
+        log('info', `    ⇲ Folded ${ids.length} earlier model(s) into ${w.name}`);
+      }
+    })();
+
+    const orphaned = db.prepare('DELETE FROM creators WHERE id NOT IN (SELECT DISTINCT creator_id FROM models WHERE creator_id IS NOT NULL)').run();
+    if (orphaned.changes > 0) log('info', `Cleaned up ${orphaned.changes} orphaned creator(s)`);
+    if (!scope && typeof db.setSetting === 'function') {
+      db.setSetting('layout_regroup_done', db.getSetting('layout_regroup_done') || new Date().toISOString());
+      db.setSetting('meta_sidecars', plan.sidecars || 0); // model.json files seen by the last full scan (/api/meta/status)
+    }
+
+    const { modelsFound, modelsAdded, modelsUpdated, modelsSkipped, folded } = counters;
+    stmts.finishLog.run('complete', modelsFound, modelsAdded, modelsUpdated, modelsSkipped, logId);
+    const scanMs = Date.now() - t0;
+    log('info', `Skipped ${modelsSkipped} unchanged card(s)${folded ? `, folded ${folded} earlier model(s)` : ''} — ${Math.round(scanMs / 100) / 10}s (meta ${metaMs} ms)`);
+    return { success: true, modelsFound, modelsAdded, modelsUpdated, modelsSkipped, folded, byKind, metaMs, scanMs, files: tree.fileCount };
+  } catch (err) {
+    stmts.errorLog.run('error', err.message, logId);
+    throw err;
+  }
+}
+
+async function scanLibrary(libraryPath, progressCallback, logger) {
+  if (layoutMode() === 'legacy') return scanLibraryLegacy(libraryPath, progressCallback, logger);
+  return scanLibraryLayout(libraryPath, progressCallback, logger);
+}
+
+/**
+ * scanSingleCreator — scan one creator folder (POST /api/scan/creator/:id).
+ * Layout mode re-groups only the files under that folder.
+ */
+async function scanSingleCreator(creatorPath, creatorId, creatorName, progressCallback, logger) {
+  if (layoutMode() === 'legacy') return scanSingleCreatorLegacy(creatorPath, creatorId, creatorName, progressCallback, logger);
+  const root = process.env.LIBRARY_PATH || LIBRARY_PATH;
+  const base = creatorPath === root || creatorPath.startsWith(root + path.sep) ? root : path.dirname(creatorPath);
+  return scanLibraryLayout(base, progressCallback, logger, { scope: creatorPath });
+}
+
 module.exports = {
-  scanLibrary, scanSingleCreator, LIBRARY_PATH, matchesHint, pickRenderArchives, analyzeFolder,
+  scanLibrary, scanSingleCreator, scanLibraryLegacy, LIBRARY_PATH, matchesHint, pickRenderArchives, analyzeFolder,
   inferReleaseName, discoverModelFolders, extractImagesFromArchive, VARIANT_DIR, isImageFile: isRenderImage,
+  layoutMode, rankImages, analysisFromFiles, realFolder: worksLib.realFolder, loadLibraryMeta, franchiseAndTeam,
 };
