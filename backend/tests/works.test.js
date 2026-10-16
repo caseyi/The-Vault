@@ -98,6 +98,10 @@ mk(`${L}/All_Busts_v2/All_Busts_v2/LeoOfColossus_Bust/No Supports/Leo.stl`);
 mk(`${L}/All_Busts_v2_2/All_Busts_v2/LeoOfColossus_Bust/Supported/Hollow/Leo.stl`);
 mk('STL Archive/Loot Studios/Goblin Mines/Goblin/32mm/goblin.stl');
 mk('STL Archive/Loot Studios/Goblin Mines/Goblin/75mm/goblin.stl');
+mk('STL Archive/Loot Studios/2022-06 - Dwarven Forge/All Objects/barrel.stl');
+mk('STL Archive/Loot Studios/2022-06 - Dwarven Forge/Env/tree.stl');
+mk('STL Archive/Loot Studios/2022-06 - Dwarven Forge/Dwarf King/All Busts/king_bust.stl');
+mk('STL Archive/Loot Studios/2022-06 - Dwarven Forge/Dwarf King/Model/king.stl');
 mk('STL Archive/Ari campaign/Mothman/32mm/Mothman_32mm_Supported.stl');
 mk('STL Archive/Ari campaign/Mothman/75mm/Mothman_75mm_Supported.stl');
 mk('STL Archive/Ari campaign/Bulette/bulette.stl');
@@ -273,6 +277,12 @@ describe('release and folder layouts', () => {
     const leo = plan.works.filter(x => /Leo Of Colossus/.test(x.name));
     expect(leo).toHaveLength(1);
     expect(leo[0].files).toHaveLength(2);
+  });
+  test('category-named items ("All Objects", "Env", "All Busts") take the pack or parent name', () => {
+    const items = plan.works.filter(x => x.kind === 'release-item' && x.releaseLabel === 'Dwarven Forge').map(x => x.name).sort();
+    expect(items.some(n => /^(all objects|env|all busts|objects|busts)$/i.test(n))).toBe(false);
+    expect(items).toEqual(expect.arrayContaining(['Dwarven Forge Objects', 'Dwarven Forge Env']));
+    expect(items.some(n => /^Dwarf King/.test(n))).toBe(true);
   });
   test('undated packs of a creator with dated releases are releases too', () => {
     const goblin = plan.works.find(x => x.name === 'Goblin');

@@ -76,3 +76,35 @@ test('scanner.extractImagesFromArchive uses the streaming reader (with a limit)'
   // ranked by the thumbnail scorer: "01 front" / "render_main" beat "back" and "evil"
   expect(urls.sort()).toEqual(['/images/uuid-z/01_front.png', '/images/uuid-z/render_main.png']);
 });
+
+test('IMAGE_MAX_MB caps image entries inside archives', async () => {
+  const big = path.join(ROOT, 'big.zip');
+  const z = new AdmZip();
+  z.addFile('small.png', PNG);
+  z.addFile('huge.png', Buffer.concat([PNG, Buffer.alloc(300 * 1024)]));
+  z.writeZip(big);
+  process.env.IMAGE_MAX_MB = '0.1';
+  try {
+    const saved = await zipLib.extractZipImages(big, path.join(ROOT, 'out-cap'));
+    expect(saved).toEqual(['small.png']);
+  } finally { delete process.env.IMAGE_MAX_MB; }
+});
+
+test('one corrupt entry does not abort the rest of the archive', async () => {
+  const file = path.join(ROOT, 'corrupt.zip');
+  const z = new AdmZip();
+  const body = (tag) => Buffer.concat([PNG, Buffer.from(tag.repeat(4000))]); // compressible → deflated
+  z.addFile('a.png', body('a'));
+  z.addFile('b.png', body('b'));
+  z.addFile('c.png', body('c'));
+  const buf = z.toBuffer();
+  // break b.png's deflate stream: find its local header and garble the data after it
+  const at = buf.indexOf(Buffer.from('b.png')) + 'b.png'.length;
+  for (let i = at; i < at + 24; i++) buf[i] = 0xff;
+  fs.writeFileSync(file, buf);
+  const errors = [];
+  const saved = await zipLib.extractZipImages(file, path.join(ROOT, 'out-corrupt'), { onError: (n) => errors.push(n) });
+  expect(saved.sort()).toEqual(['a.png', 'c.png']);
+  expect(errors).toEqual(['b.png']);
+  expect(fs.readdirSync(path.join(ROOT, 'out-corrupt')).sort()).toEqual(['a.png', 'c.png']); // no partial file left
+});

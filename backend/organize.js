@@ -634,9 +634,11 @@ router.post('/apply-franchise', (req, res) => {
 
   const getPath = db.prepare('SELECT folder_path FROM models WHERE id = ?');
   const [sepLo, sepHi] = [path.sep, String.fromCharCode(path.sep.charCodeAt(0) + 1)];
+  // the folder, everything below it, and cards that share it under a virtual "<folder>#<slug>"
+  // path (works in the same folder, folded rows "<folder>#folded-<id>")
   const rehomeModels = db.prepare(`
     UPDATE models SET folder_path = ? || substr(folder_path, ?), updated_at = datetime('now')
-    WHERE folder_path = ? OR (folder_path > ? AND folder_path < ?)
+    WHERE folder_path = ? OR (folder_path > ? AND folder_path < ?) OR (folder_path > ? AND folder_path < ?)
   `);
   const rehomeFiles = db.prepare(`
     UPDATE model_files SET filepath = ? || substr(filepath, ?)
@@ -644,7 +646,7 @@ router.post('/apply-franchise', (req, res) => {
   `);
   const moveInDb = db.transaction((from, to) => {
     const cut = from.length + 1; // substr is 1-based: keep everything after `from`
-    rehomeModels.run(to, cut, from, from + sepLo, from + sepHi);
+    rehomeModels.run(to, cut, from, from + sepLo, from + sepHi, from + '#', from + '$');
     rehomeFiles.run(to, cut, from + sepLo, from + sepHi);
   });
 

@@ -19,7 +19,7 @@ const { makeDiscovery, IGNORED_FOLDERS, isJunkFile, isPrintableName, isExtVarian
 
 const SKIP_DIR = /^(?:_Inbox|_Duplicates_Pending_Delete|_Meta|#recycle|@eaDir|\..*)$/i; // + hidden ".Archive Service Temp…" 
 // unfinished browser downloads are not files of a work
-const PARTIAL_FILE = /\.(?:crdownload|part|partial|download|tmp)$|^Unconfirmed \d+/i;
+const PARTIAL_FILE = /\.(?:crdownload|part|partial|download|tmp)$|^Unconfirmed \d+|^\./i; // + dotfiles (.smbdelete…, ._x)
 const TRANSPARENT = new Set(['_unsorted', '_dioramas', '_undated', '_bundles', 'wicked archive', 'gumroad downloads']);
 const DEFAULT_CONTAINERS = { 'wicked archive': 'Wicked' };
 const PASSTHROUGH_NAME = /^(gumroad|gumroad downloads?|downloads?|backups?|sync|syncthing|temp|tmp|unsorted|to[\s_-]?sort|imports?|stl[\s_-]?archive|3d[\s_-]?prints?|prints?|library)$/i;
@@ -551,6 +551,12 @@ function folderWorks(root, tree, ctx) {
         label = d.length > m.release.path.length ? path.basename(d) : m.release.label;
       }
       name = releaseItemName(label) || m.release.label;
+      // "All Objects" / "All Busts" / "Env" say what kind of items, not which: name after the pack or folder above
+      if (!isRoot && (/^all\b/i.test(name) || /^(?:env|environment|objects?|props?|busts?|heroes|enemies|allies|npcs?|scenery|terrain|bonus|extras?|minis)$/i.test(name))) {
+        let d = path.dirname(m.fullPath), up = '';
+        while (d.length > m.release.path.length) { const pn = releaseItemName(path.basename(d)); if (pn && !/^all\b/i.test(pn) && !naming.isGenericText(pn)) { up = pn; break; } d = path.dirname(d); }
+        name = `${up || releaseItemName(m.release.label) || m.release.label} ${name.replace(/^all\s+/i, '')}`.trim();
+      }
       // parent category (Supported/Thrikeen_Supports/Sword_Idle_Supports ≡ Unsupported/Thrikeen/Sword_Idle)
       let parent = '';
       if (!isRoot) {
@@ -622,13 +628,14 @@ function planWorks({ libraryPath, tree, meta, overrides = new Map(), log = () =>
   const isGenre = (name) => naming.canonicalGenre(name) || genreSet.get(String(name).trim().toLowerCase()) || null;
   const sidecarCache = new Map();
   let sidecars = 0;
+  const sidecarErrors = [];
   const sidecarFor = (dir, stop) => {
     let d = dir;
     for (;;) {
       if (sidecarCache.has(d)) { const v = sidecarCache.get(d); if (v) return v; }
       else {
         const n = tree.dirs.get(d);
-        const v = n && n.files.some(f => f.name === 'model.json') ? metaLib.readSidecar(path.join(d, 'model.json')) : null;
+        const v = n && n.files.some(f => f.name === 'model.json') ? metaLib.readSidecar(path.join(d, 'model.json'), sidecarErrors) : null;
         if (v) sidecars++;
         sidecarCache.set(d, v);
         if (v) return v;
@@ -643,8 +650,9 @@ function planWorks({ libraryPath, tree, meta, overrides = new Map(), log = () =>
   const ctx = { fix, parse, isGenre, sidecarFor, meta, overrides, skipDir };
   const cont = { ...DEFAULT_CONTAINERS };
   for (const c of containers || []) if (c && c.name) cont[String(c.name).toLowerCase()] = c.creator || 'Wicked';
-  if (meta?.vault?.containers) for (const c of meta.vault.containers) { if (typeof c === 'string') cont[c.toLowerCase()] = 'Wicked'; else if (c && c.name) cont[c.name.toLowerCase()] = c.creator || 'Wicked'; }
-  if (meta?.vault?.studioAliases) for (const [a, c] of Object.entries(meta.vault.studioAliases)) { naming.CREATOR_ALIASES[a.toLowerCase()] = c; naming.STUDIO_CREATORS.add(c); }
+  if (Array.isArray(meta?.vault?.containers)) for (const c of meta.vault.containers) { if (typeof c === 'string') cont[c.toLowerCase()] = 'Wicked'; else if (c && c.name) cont[c.name.toLowerCase()] = c.creator || 'Wicked'; }
+  if (meta?.vault?.studioAliases && typeof meta.vault.studioAliases === 'object') for (const [a, c] of Object.entries(meta.vault.studioAliases)) {
+    if (typeof c !== 'string') continue; naming.CREATOR_ALIASES[a.toLowerCase()] = c; naming.STUDIO_CREATORS.add(c); }
 
   let roots = resolveRoots(libraryPath, tree, { overrides, containers: cont, log });
   if (scope) roots = roots.filter(r => r.path === scope || r.path.startsWith(scope + path.sep) || scope.startsWith(r.path + path.sep));
@@ -655,11 +663,11 @@ function planWorks({ libraryPath, tree, meta, overrides = new Map(), log = () =>
     else works.push(...folderWorks(r, tree, ctx).map(w => ({ ...w, creatorFolder: r.path })));
   }
   works.push(...studioWorks(recs, ctx));
-  if (meta) meta.sidecars = sidecars;
+  if (meta) { meta.sidecars = sidecars; meta.sidecarErrors = sidecarErrors; }
   // Root folder per creator (for the creators table)
   const creatorFolders = new Map();
   for (const r of roots) if (!creatorFolders.has(r.creator)) creatorFolders.set(r.creator, r.path);
-  return { works, roots, creatorFolders, sidecars };
+  return { works, roots, creatorFolders, sidecars, sidecarErrors };
 }
 
 // ── attribution ──────────────────────────────────────────────────────────────
@@ -675,7 +683,7 @@ function attributeWork(w, meta) {
   for (const f of w.files) {
     f.product = null; f.matched_by = null;
     if (!meta || IMAGE_EXTS.has(extOf(f.name)) && !ARCHIVE_RE.test(f.name)) continue;
-    const m = metaLib.matchFile(meta, f.name, f.size);
+    const m = metaLib.matchFile(meta, f.name, f.size, { creator: w.creator, character: w.layout === 'studio' ? w.character : (w.character || w.name), edition: f.edition });
     if (!m) continue;
     f.product = m.product.name; f.matched_by = m.by; f._product = m.product;
     if (m.by === 'name') nameHits++; else strongHits++;

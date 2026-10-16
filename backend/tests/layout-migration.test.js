@@ -120,12 +120,17 @@ describe('legacy → layout', () => {
     expect(balrog.notes).toMatch(/printed the wings/);
     expect(db.prepare('SELECT COUNT(*) n FROM collection_models WHERE model_id = ?').get(balrog.id).n).toBe(1);
     expect(db.prepare('SELECT model_id FROM print_queue').get().model_id).toBe(balrog.id);
-    for (const n of ['Full Pieces', 'Base']) {
-      const old = before.find(m => m.name === n);
+    // each old row held half of the work's files and the work holds all of theirs: one of them
+    // becomes the work (same row), the other folds into it
+    const olds = ['Full Pieces', 'Base'].map(n => before.find(m => m.name === n));
+    expect(olds.map(o => o.id)).toContain(balrog.id);
+    for (const old of olds.filter(o => o.id !== balrog.id)) {
       const row = db.prepare('SELECT * FROM models WHERE id = ?').get(old.id);
       expect(row.hidden).toBe(1);
+      expect(row.folded_into).toBe(balrog.id);
       expect(JSON.parse(row.attribution).foldedInto).toBe(balrog.id);
     }
+    expect(balrog.hidden).toBe(0);
     expect(db.prepare('SELECT COUNT(*) n FROM model_files WHERE model_id = ?').get(balrog.id).n).toBe(2);
   });
   test('one locked custom name carries over; per-file printed_at survives', () => {

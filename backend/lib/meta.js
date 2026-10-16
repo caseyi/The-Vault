@@ -80,7 +80,20 @@ function loadMeta({ dirs = [], roots = [], log = () => {} } = {}) {
   for (const d of [...meta.dirs, ...roots]) {
     const f = path.join(d, 'vault.json');
     if (!fs.existsSync(f)) continue;
-    try { Object.assign(meta.vault, JSON.parse(fs.readFileSync(f, 'utf8'))); } catch (e) { err(f, e); }
+    try {
+      const v = JSON.parse(fs.readFileSync(f, 'utf8'));
+      if (!v || typeof v !== 'object' || Array.isArray(v)) throw new Error('expected an object');
+      // shape-check each key; a wrong type is reported and ignored
+      if (v.containers !== undefined) {
+        if (Array.isArray(v.containers)) meta.vault.containers = v.containers.filter(c => typeof c === 'string' || (c && typeof c === 'object' && typeof c.name === 'string'));
+        else err(f, new Error('"containers" must be an array'));
+      }
+      for (const k of ['studioAliases', 'libraryLabels']) {
+        if (v[k] === undefined) continue;
+        if (v[k] && typeof v[k] === 'object' && !Array.isArray(v[k])) meta.vault[k] = Object.fromEntries(Object.entries(v[k]).filter(([a, b]) => typeof b === 'string' && a));
+        else err(f, new Error(`"${k}" must be an object`));
+      }
+    } catch (e) { err(f, e); }
   }
 
   // filing_rules.csv → typo fixes first (they affect every key below)
@@ -115,9 +128,12 @@ function loadMeta({ dirs = [], roots = [], log = () => {} } = {}) {
       const f = path.join(d, name);
       let list;
       try { list = JSON.parse(fs.readFileSync(f, 'utf8')); } catch (e) { err(f, e); continue; }
-      if (!Array.isArray(list)) list = list?.products || [];
+      if (!Array.isArray(list)) list = list && Array.isArray(list.products) ? list.products : null;
+      if (!list) { err(f, new Error('expected a JSON array of products (or { "products": [...] })')); continue; }
+      let bad = 0;
       for (const p of list) {
-        if (!p || !p.product_name) continue;
+        try {
+        if (!p || typeof p !== 'object' || typeof p.product_name !== 'string' || !p.product_name.trim()) { bad++; continue; }
         const id = p.download_url || `${p.creator}|${p.product_name}`;
         let prod = byUrl.get(id);
         const unknown = /^unknown/i.test(String(p.product_name)) || /^unknown$/i.test(String(p.creator || ''));
@@ -134,16 +150,25 @@ function loadMeta({ dirs = [], roots = [], log = () => {} } = {}) {
           byUrl.set(id, prod);
         }
         const seen = new Set(prod.files.map(x => `${x.key}|${x.size}`));
-        for (const fl of p.files || []) {
-          const full = fl.extension ? `${fl.file_name}.${fl.extension}` : fl.file_name;
-          const rec = { name: full, key: fileKey(full), size: Number(fl.file_size) || 0, variant: naming.parseName(fl.file_name || '', { fix }).variant };
+        if (p.files !== undefined && !Array.isArray(p.files)) bad++;
+        for (const fl of Array.isArray(p.files) ? p.files : []) {
+          // two shapes: { file_name, extension, file_size } and the older { name, size: "895.1 MB", url }
+          const fname = fl && typeof fl === 'object' ? (typeof fl.file_name === 'string' && fl.file_name ? fl.file_name : (typeof fl.name === 'string' && fl.name ? fl.name : null)) : null;
+          if (!fname) { bad++; continue; }
+          const full = fl.extension ? `${fname}.${fl.extension}` : fname;
+          const rec = { name: full, key: fileKey(full), size: Number(fl.file_size) || 0, variant: naming.parseName(fname, { fix }).variant };
+          if (!rec.size && typeof fl.size === 'string') rec.approxSize = humanBytes(fl.size); // never used to match
           if (seen.has(`${rec.key}|${rec.size}`)) continue;
           seen.add(`${rec.key}|${rec.size}`);
           prod.files.push(rec);
         }
+        } catch (e) { bad++; }
       }
+      if (bad) err(f, new Error(`${bad} malformed product/file entr${bad === 1 ? 'y' : 'ies'} skipped`));
     }
   }
+  // products with no files carry nothing to match or own (pseudo-products)
+  for (const [id, prod] of byUrl) if (!prod.files.length) byUrl.delete(id);
   meta.products = [...byUrl.values()];
 
   // Indexes
@@ -266,6 +291,10 @@ function cleanProductName(n) {
     .replace(/\s+(?:\d\/\d+\s+)?(?:stls?\s+)?(?:3d\s+)?(?:tested\s+and\s+)?ready\s+for\s+(?:3d\s+)?printing\s*$/i, '')
     .replace(/\s+/g, ' ').trim();
 }
+function humanBytes(t) {
+  const m = String(t).trim().match(/^([\d.]+)\s*([KMGT]?)B$/i);
+  return m ? Math.round(parseFloat(m[1]) * 1024 ** ' KMGT'.indexOf((m[2] || ' ').toUpperCase())) : 0;
+}
 function stemKey(creator, key, edition) { return `${creator || ''}|${key || ''}|${edition || ''}`; }
 
 function termForLabel(label, labelDate) {
@@ -286,17 +315,40 @@ function trackerForProduct(meta, prod) {
  * Match one library file against the manifests.
  * @returns {{ product, file, by: 'exact'|'size'|'name' } | null}
  */
-function matchFile(meta, filename, size) {
+const LOOSE_PART = /\.(stl|obj|3mf|ply)$/i; // binary STL sizes collide (84 + 50·triangles bytes)
+
+/**
+ * @param {object} [ctx] the work being attributed: { creator, character, edition }
+ *   – several products with the same name+size → the one whose stem is the work's, else none
+ *   – a size-only match of a loose .stl only within the work's creator family; a name+size match of
+ *     a loose part name (not a studio-prefixed file name) too
+ */
+function matchFile(meta, filename, size, ctx = {}) {
   if (!meta || !meta.products.length) return null;
   const k = fileKey(filename);
   const named = meta.byName.get(k);
+  const family = (c) => { const k = naming.canonicalCreator(c) || c; return naming.studioOf(k) || k; };
   if (named && size) {
-    const hit = named.find(x => x.file.size === size);
-    if (hit) return { product: hit.product, file: hit.file, by: 'exact' };
+    const hits = named.filter(x => x.file.size === size);
+    const prods = [...new Set(hits.map(x => x.product))];
+    // a part name ("Base.stl", "Arm_L.stl") with a colliding binary-STL size is not evidence across studios
+    const foreignPart = (prod) => LOOSE_PART.test(filename) && ctx.creator && family(prod.creator) !== family(ctx.creator) && !isDistinctiveName(filename);
+    if (prods.length === 1) return foreignPart(prods[0]) ? null : { product: hits[0].product, file: hits[0].file, by: 'exact' };
+    // the same product listed under several download URLs (bought twice, bundle copies) is one product
+    const same = (a, b) => a.creator === b.creator && naming.normKey(a.name, meta.fix) === naming.normKey(b.name, meta.fix);
+    if (prods.length > 1 && prods.every(p => same(p, prods[0]))) return foreignPart(prods[0]) ? null : { product: hits[0].product, file: hits[0].file, by: 'exact' };
+    if (prods.length > 1) {
+      const key = ctx.character ? naming.normKey(ctx.character, meta.fix) : null;
+      const mine = hits.filter(x => key && stemLike(x.product.key, key) && (!ctx.creator || x.product.creator === ctx.creator));
+      const byEd = mine.filter(x => !ctx.edition || (x.product.isDiorama ? 'Diorama' : x.product.edition) === ctx.edition);
+      const pick = new Set((byEd.length ? byEd : mine).map(x => x.product));
+      if (pick.size === 1) { const h = (byEd.length ? byEd : mine)[0]; return { product: h.product, file: h.file, by: 'exact' }; }
+      return null;
+    }
   }
   if (size >= SIZE_MATCH_MIN) {
     const pf = meta.bySize.get(size);
-    if (pf) return { product: pf.product, file: pf.file, by: 'size' };
+    if (pf && !(LOOSE_PART.test(filename) && (!ctx.creator || family(pf.product.creator) !== family(ctx.creator)))) return { product: pf.product, file: pf.file, by: 'size' };
   }
   // Name alone only for distinctive names: "Cape_Full.stl", "R_Leg.stl", "Sword.chitubox" are
   // part names shared by many products and once matched a Star Wars product to Alan Scott
@@ -305,6 +357,25 @@ function matchFile(meta, filename, size) {
     if (prods.size === 1) return { product: named[0].product, file: named[0].file, by: 'name' };
   }
   return null;
+}
+
+/** Product key vs a work's key: equal, one inside the other ("grundy" / "solomon grundy"), or a typo away ("siniestro"). */
+function stemLike(a, b) {
+  if (!a || !b) return false;
+  if (a === b) return true;
+  const ca = a.replace(/\s+/g, ''), cb = b.replace(/\s+/g, '');
+  if (ca === cb) return true;
+  if (Math.min(ca.length, cb.length) >= 4 && (` ${b} `.includes(` ${a} `) || ` ${a} `.includes(` ${b} `))) return true;
+  return Math.min(ca.length, cb.length) >= 6 && levenshtein(ca, cb) <= 2;
+}
+function levenshtein(a, b) {
+  let prev = Array.from({ length: b.length + 1 }, (_, j) => j);
+  for (let i = 1; i <= a.length; i++) {
+    const cur = [i];
+    for (let j = 1; j <= b.length; j++) cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+    prev = cur;
+  }
+  return prev[b.length];
 }
 
 /** A file name that identifies a product on its own: a studio prefix or an edition word, not a part name. */
@@ -389,10 +460,10 @@ function metaStatus(meta) {
 }
 
 /** Read a model.json sidecar (never throws). */
-function readSidecar(file) {
+function readSidecar(file, errors) {
   try {
     const j = JSON.parse(fs.readFileSync(file, 'utf8'));
-    if (!j || typeof j !== 'object') return null;
+    if (!j || typeof j !== 'object' || Array.isArray(j)) throw new Error('expected a JSON object');
     const s = (v) => (typeof v === 'string' && v.trim() ? v.trim() : null);
     return {
       studio: s(j.studio), creator: naming.canonicalCreator(s(j.creator)) || s(j.creator), genre: s(j.genre),
@@ -400,7 +471,10 @@ function readSidecar(file) {
       release_term: /^\d{4}-\d{2}/.test(s(j.release_term) || '') ? s(j.release_term).slice(0, 7) : null,
       file,
     };
-  } catch { return null; }
+  } catch (e) {
+    if (Array.isArray(errors)) errors.push(`${file}: ${e.message}`); // shown in /api/meta/status
+    return null;
+  }
 }
 
 module.exports = {

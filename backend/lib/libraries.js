@@ -35,21 +35,51 @@ const SKIP_TOP = /^(?:[@#.]|_Meta$|_Inbox$|_Duplicates_Pending_Delete$)/;
  * @returns {{ name: string, folder: string, path: string, writable: boolean }[]}
  *   name = label (Dagobah), folder = top-level folder name, path = absolute path
  */
-function listLibraries(root = libraryRoot(), extraLabels) {
-  const labels = parseLabels(process.env.LIBRARY_LABELS, extraLabels);
-  let entries = [];
-  try { entries = fs.readdirSync(root, { withFileTypes: true }).filter(e => e.isDirectory() && !SKIP_TOP.test(e.name)); } catch { entries = []; }
+function pickLibraries(root, entries, labels) {
   const libs = [];
   for (const e of entries) {
+    if (!e.isDirectory() || SKIP_TOP.test(e.name)) continue;
     const full = path.join(root, e.name);
     if (labels.has(e.name) || MOUNT_NAME.test(e.name.trim())) libs.push({ name: labels.get(e.name) || e.name, folder: e.name, path: full });
   }
   if (!libs.length) libs.push({ name: labels.get(path.basename(root)) || path.basename(root) || 'Library', folder: '', path: root });
-  libs.sort((a, b) => a.path.localeCompare(b.path));
+  return libs.sort((a, b) => a.path.localeCompare(b.path));
+}
+
+function listLibraries(root = libraryRoot(), extraLabels) {
+  const labels = parseLabels(process.env.LIBRARY_LABELS, extraLabels);
+  let entries = [];
+  try { entries = fs.readdirSync(root, { withFileTypes: true }); } catch { entries = []; }
+  const libs = pickLibraries(root, entries, labels);
   for (const l of libs) {
     try { fs.accessSync(l.path, fs.constants.W_OK); l.writable = true; } catch { l.writable = false; }
   }
   return libs;
+}
+
+/**
+ * listLibraries() without blocking the event loop (a stalled SMB/NFS mount must not hang
+ * /api/health). Rejects after timeoutMs; the fs calls themselves keep running in libuv.
+ * @returns {Promise<{ libraries, rootWritable }>}
+ */
+function listLibrariesAsync(root = libraryRoot(), extraLabels, { timeoutMs = 3000 } = {}) {
+  const fsp = fs.promises;
+  const writable = (p) => fsp.access(p, fs.constants.W_OK).then(() => true, () => false);
+  const work = (async () => {
+    const labels = parseLabels(process.env.LIBRARY_LABELS, extraLabels);
+    let entries = [];
+    try { entries = await fsp.readdir(root, { withFileTypes: true }); } catch { entries = []; }
+    const libs = pickLibraries(root, entries, labels);
+    const [rootWritable, ...flags] = await Promise.all([writable(root), ...libs.map(l => writable(l.path))]);
+    libs.forEach((l, i) => { l.writable = flags[i]; });
+    return { libraries: libs, rootWritable };
+  })();
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`library folders did not answer within ${timeoutMs} ms`)), timeoutMs);
+    if (timer.unref) timer.unref();
+  });
+  return Promise.race([work, timeout]).finally(() => clearTimeout(timer));
 }
 
 /** Label of the library holding `p` (or null). */
@@ -63,4 +93,4 @@ function libraryOf(p, libs) {
   return best ? best.name : null;
 }
 
-module.exports = { listLibraries, libraryOf, parseLabels, libraryRoot };
+module.exports = { listLibraries, listLibrariesAsync, libraryOf, parseLabels, libraryRoot };

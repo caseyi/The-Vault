@@ -140,3 +140,95 @@ describe('matching', () => {
     expect(metaLib.readSidecar(f)).toBeNull();
   });
 });
+
+describe('reviewer fixes: malformed _Meta, ambiguous matches (S2, S4)', () => {
+  const R2 = fs.mkdtempSync(path.join(os.tmpdir(), 'vault-meta2-'));
+  const M2 = path.join(R2, '_Meta');
+  fs.mkdirSync(M2, { recursive: true });
+  const w2 = (name, body) => fs.writeFileSync(path.join(M2, name), typeof body === 'string' ? body : JSON.stringify(body));
+  afterAll(() => fs.rmSync(R2, { recursive: true, force: true }));
+
+  test('malformed manifests and vault.json never throw; bad entries are reported', () => {
+    w2('gumroad_manifest.json', [
+      { creator: 'Wicked', product_name: 'Wicked Movies Joker Sculpture', download_url: 'u-joker', files: {} },
+      { creator: 'Wicked', product_name: 'Wicked Movies Bane Sculpture', download_url: 'u-bane', files: [null, { file_name: 'Wicked - Bane Sculpture (One Piece)', extension: 'zip', file_size: 4444444 }] },
+      null, 7, 'x', { creator: 'Wicked', product_name: 42 },
+      { creator: 'Wicked', product_name: 'Wicked Movies Zero Files' , download_url: 'u-zero', files: [] },
+    ]);
+    w2('gumroad_manifest_two.json', '{"products": 5}');
+    w2('vault.json', '{"containers":5,"studioAliases":"x","libraryLabels":[1]}');
+    let meta;
+    expect(() => { meta = metaLib.loadMeta({ dirs: [M2], roots: [R2] }); }).not.toThrow();
+    expect(meta.products.map(p => p.libraryUrl)).toEqual(['u-bane']); // Joker: no usable files; zero-file products dropped
+    expect(meta.errors.some(e => /gumroad_manifest\.json: \d+ malformed/.test(e))).toBe(true);
+    expect(meta.vault.containers).toBeUndefined();
+    const st = metaLib.metaStatus(meta);
+    expect(st.counts.products).toBe(1);
+  });
+
+  test('corrupt model.json is reported, not fatal', () => {
+    const f = path.join(R2, 'model.json');
+    fs.writeFileSync(f, '{"studio": ');
+    const errors = [];
+    expect(metaLib.readSidecar(f, errors)).toBeNull();
+    fs.writeFileSync(f, '["not", "an object"]');
+    expect(metaLib.readSidecar(f, errors)).toBeNull();
+    expect(errors).toHaveLength(2);
+    expect(errors[0]).toMatch(/model\.json/);
+  });
+
+  test('name+size hits in several products: the work\'s own stem decides, else no match', () => {
+    w2('gumroad_manifest.json', [
+      { creator: 'Wicked', product_name: 'Wicked Marvel Thor Sculpture', download_url: 'u-thor', files: [{ file_name: 'Base', extension: 'stl', file_size: 3000084 }, { file_name: 'Wicked - Thor Sculpture (One Piece)', extension: 'zip', file_size: 1234567 }] },
+      { creator: 'Wicked', product_name: 'Wicked Marvel Loki Sculpture', download_url: 'u-loki', files: [{ file_name: 'Base', extension: 'stl', file_size: 3000084 }, { file_name: 'Wicked - Loki Sculpture (One Piece)', extension: 'zip', file_size: 7654321 }] },
+    ]);
+    fs.rmSync(path.join(M2, 'gumroad_manifest_two.json'), { force: true });
+    const meta = metaLib.loadMeta({ dirs: [M2], roots: [R2] });
+    expect(metaLib.matchFile(meta, 'Base.stl', 3000084)).toBeNull();
+    expect(metaLib.matchFile(meta, 'Base.stl', 3000084, { creator: 'Wicked', character: 'Loki' }).product.libraryUrl).toBe('u-loki');
+    expect(metaLib.matchFile(meta, 'Base.stl', 3000084, { creator: 'Wicked', character: 'Hulk' })).toBeNull();
+  });
+
+  test('size-only matches of loose .stl parts stay within the creator family', () => {
+    const meta = metaLib.loadMeta({ dirs: [M2], roots: [R2] });
+    // a unique size, but a loose part: not for another studio's file, nor without a creator
+    expect(metaLib.matchFile(meta, 'Arm_L.stl', 3000084)).toBeNull();
+    expect(metaLib.matchFile(meta, 'Torso.stl', 1234567, { creator: 'Loot Studios' })).toBeNull();
+    expect(metaLib.matchFile(meta, 'Torso.stl', 1234567, { creator: 'Wicked' }).by).toBe('size');
+    // archives still match on size alone (renamed downloads)
+    expect(metaLib.matchFile(meta, 'renamed.zip', 1234567).product.libraryUrl).toBe('u-thor');
+  });
+});
+
+test('a part name with a matching size from another studio is no match (S4)', () => {
+  const R3 = fs.mkdtempSync(path.join(os.tmpdir(), 'vault-meta3-'));
+  fs.writeFileSync(path.join(R3, 'gumroad_manifest.json'), JSON.stringify([
+    { creator: 'Star Wars 3D Models', product_name: 'Second Sister Bust - Star Wars 3D Models', download_url: 'u-ss', files: [{ file_name: 'Base', extension: 'stl', file_size: 2000084 }, { file_name: 'SW3D - Second Sister Bust', extension: 'zip', file_size: 5000001 }] },
+  ]));
+  const meta = metaLib.loadMeta({ dirs: [R3], roots: [] });
+  expect(metaLib.matchFile(meta, 'Base.stl', 2000084, { creator: 'ArchVillian Games' })).toBeNull();
+  expect(metaLib.matchFile(meta, 'Base.stl', 2000084, { creator: 'Star Wars 3D Models' }).by).toBe('exact');
+  expect(metaLib.matchFile(meta, 'Base.stl', 2000084).by).toBe('exact'); // no work context: unchanged
+  fs.rmSync(R3, { recursive: true, force: true });
+});
+
+test('one product under two download URLs is one product; typo stems still decide; the older file shape loads (S4)', () => {
+  const R4 = fs.mkdtempSync(path.join(os.tmpdir(), 'vault-meta4-'));
+  const grundy = (url) => ({ creator: 'B3DSERK Studios', product_name: 'B3DSERK September term 2022: Grundy Sculpture', download_url: url,
+    files: [{ file_name: 'B3DSERK - Solomon Grundy Statue 455mm (One Piece)', extension: 'zip', file_size: 174330534 }] });
+  const sini = (n, url) => ({ creator: 'B3DSERK Studios', product_name: `B3DSERK May Term 2022: Siniestro ${n}`, download_url: url,
+    files: [{ file_name: 'B3DSERK - Sinestro Bust 220mm (Images)', extension: 'zip', file_size: 62307120 }] });
+  fs.writeFileSync(path.join(R4, 'gumroad_manifest.json'), JSON.stringify([
+    grundy('u-g1'), grundy('u-g2'), sini('Bust', 'u-sb'), sini('Sculpture', 'u-ss'),
+    { creator: 'Wicked', product_name: 'Wicked Movies T-Rex Portrait Bust', download_url: 'u-trex', files: [{ name: 'Wicked - T-Rex Bust (One Piece)', size: '283.6 MB', url: 'https://x' }] },
+  ]));
+  const meta = metaLib.loadMeta({ dirs: [R4], roots: [] });
+  expect(meta.errors).toEqual([]);
+  expect(metaLib.matchFile(meta, 'B3DSERK - Solomon Grundy Statue 455mm (One Piece).zip', 174330534, { creator: 'B3DSERK', character: 'Solomon Grundy' }).by).toBe('exact');
+  expect(metaLib.matchFile(meta, 'B3DSERK - Sinestro Bust 220mm (Images).zip', 62307120, { creator: 'B3DSERK', character: 'Sinestro', edition: 'Bust' }).product.libraryUrl).toBe('u-sb');
+  expect(metaLib.matchFile(meta, 'B3DSERK - Sinestro Bust 220mm (Images).zip', 62307120, { creator: 'B3DSERK', character: 'Batman' })).toBeNull();
+  const trex = meta.products.find(p => p.libraryUrl === 'u-trex');
+  expect(trex.files[0]).toMatchObject({ size: 0, approxSize: 297376154 });
+  expect(metaLib.matchFile(meta, 'Wicked - T-Rex Bust (One Piece).zip', 297000000).by).toBe('name');
+  fs.rmSync(R4, { recursive: true, force: true });
+});

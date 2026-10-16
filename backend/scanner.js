@@ -196,7 +196,7 @@ async function extractImagesFromRar(rarPath, modelUuid) {
     if (!fs.existsSync(modelImgDir)) fs.mkdirSync(modelImgDir, { recursive: true });
     // Only decompress image entries (the STLs in the same archive are skipped).
     const list = extractor.extract({
-      files: (h) => !h.flags.directory && isRenderImage(h.name) && !(h.unpSize > MAX_IMAGE_ENTRY_BYTES),
+      files: (h) => !h.flags.directory && isRenderImage(h.name) && !(h.unpSize > imageMaxBytes()),
     });
     for (const file of list.files) {
       const safeName = path.basename(String(file.fileHeader.name).replace(/\\/g, '/')).replace(/[^a-zA-Z0-9._-]/g, '_');
@@ -370,9 +370,16 @@ const stmts = {
   `),
   modelUserData: db.prepare('SELECT tags, is_favorite, print_status, notes FROM models WHERE id = ?'),
   mergeUserData: db.prepare(`UPDATE models SET tags=?, is_favorite=?, print_status=?, notes=?, updated_at=datetime('now') WHERE id=?`),
+  // memberships MOVE: copy (deduped by UNIQUE(collection_id, model_id)), then dropCollections(from)
   moveCollections: db.prepare('INSERT OR IGNORE INTO collection_models (collection_id, model_id, sort_order) SELECT collection_id, ?, sort_order FROM collection_models WHERE model_id = ?'),
+  dropCollections: db.prepare('DELETE FROM collection_models WHERE model_id = ?'),
+  countCollections: db.prepare('SELECT COUNT(*) AS n FROM collection_models WHERE model_id = ?'),
+  countQueue:    db.prepare('SELECT COUNT(*) AS n FROM print_queue WHERE model_id = ?'),
+  collectionByName: db.prepare('SELECT id FROM collections WHERE name = ?'),
+  createCollection: db.prepare('INSERT INTO collections (name, description, pinned) VALUES (?, ?, ?)'),
+  addToCollection: db.prepare('INSERT OR IGNORE INTO collection_models (collection_id, model_id, sort_order) VALUES (?, ?, ?)'),
   moveQueue:     db.prepare('UPDATE OR IGNORE print_queue SET model_id = ? WHERE model_id = ?'),
-  hideModel:     db.prepare(`UPDATE models SET hidden = 1, folder_hash = NULL, updated_at = datetime('now') WHERE id = ?`),
+  hideModel:     db.prepare(`UPDATE models SET hidden = 1, folder_hash = NULL, folded_into = ?, updated_at = datetime('now') WHERE id = ?`),
 
   finishLog:     db.prepare(`
     UPDATE scan_log
@@ -557,8 +564,9 @@ function absorbStale(parentId, stale, log, modelName) {
     if (status === 'unprinted' && kid.print_status && kid.print_status !== 'unprinted') status = kid.print_status;
     if (kid.notes && !notes.includes(kid.notes)) notes = notes ? `${notes}\n${kid.notes}` : kid.notes;
     stmts.moveCollections.run(parentId, kid.id);
+    stmts.dropCollections.run(kid.id);
     stmts.moveQueue.run(parentId, kid.id);
-    stmts.hideModel.run(kid.id);
+    stmts.hideModel.run(parentId, kid.id);
   }
   stmts.mergeUserData.run(JSON.stringify(tags), fav, status, notes || null, parentId);
   log('info', `    ⇲ Merged ${stale.length} variant sub-folder model(s) into ${modelName}`);
@@ -769,13 +777,9 @@ const MAX_ARCHIVE_IMAGES = 12;   // best-ranked images taken from each archive
 const MAX_LOOSE_IMAGES = 24;
 
 /** Libraries (top-level folders) + the merged _Meta of every library. */
+const metaSummaryLib = require('./lib/meta-summary');
 function loadLibraryMeta(log = () => {}) {
-  const root = process.env.LIBRARY_PATH || LIBRARY_PATH;
-  let libs = librariesLib.listLibraries(root);
-  const dirs = [...new Set([path.join(root, '_Meta'), ...libs.map(l => path.join(l.path, '_Meta'))])];
-  const meta = metaLib.loadMeta({ dirs, roots: [...new Set([root, ...libs.map(l => l.path)])], log });
-  if (meta.vault && meta.vault.libraryLabels) libs = librariesLib.listLibraries(root, meta.vault.libraryLabels);
-  return { meta, libs };
+  return metaSummaryLib.loadLibraryMeta(process.env.LIBRARY_PATH || LIBRARY_PATH, log);
 }
 
 /** analyzeFolder()-shaped result from a list of model_files rows (works may share or span folders). */
@@ -912,11 +916,33 @@ function layoutStmts() {
       INSERT OR REPLACE INTO model_files (model_id, filename, filepath, filetype, filesize, release_name, library, variant, edition, product, matched_by, printed_at)
       VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`),
     fileStats: db.prepare(`SELECT COUNT(*) n, GROUP_CONCAT(DISTINCT library) libs FROM model_files WHERE model_id = ?`),
-    fold: db.prepare(`UPDATE models SET hidden = 1, folder_hash = NULL, work_key = NULL, attribution = ?, creator_id = COALESCE(?, creator_id), updated_at = datetime('now') WHERE id = ?`),
+    fold: db.prepare(`UPDATE models SET hidden = 1, folder_hash = NULL, work_key = NULL, folded_into = ?, attribution = ?, creator_id = COALESCE(?, creator_id), updated_at = datetime('now') WHERE id = ?`),
+    setHidden: db.prepare(`UPDATE models SET hidden = ?, updated_at = datetime('now') WHERE id = ?`),
+    setAttr: db.prepare('UPDATE models SET attribution = ? WHERE id = ?'),
     full: db.prepare('SELECT * FROM models WHERE id = ?'),
     mergeUser: db.prepare(`UPDATE models SET tags=?, is_favorite=?, print_status=?, notes=?, images=?, thumbnail_path=?, name=?, name_locked=?, source_url=COALESCE(NULLIF(source_url,''), ?), updated_at=datetime('now') WHERE id=?`),
   };
   return L;
+}
+
+/**
+ * Before the first layout scan of any scope regroups rows into works, write a snapshot.
+ * Without one the scan does not start: regrouping folds rows and moves user data.
+ */
+function preRegroupSnapshot(log) {
+  if (typeof db.getSetting !== 'function' || db.getSetting('layout_regroup_done')) return null;
+  const n = db.prepare('SELECT COUNT(*) AS n FROM models').get().n;
+  if (!n) return null;
+  const backup = require('./lib/backup');
+  let reason = '';
+  const file = backup.snapshot('pre-regroup', { db, log: { log: (m) => log('info', m), error: (m) => { reason = m; log('warn', m); } } });
+  if (!file) {
+    const why = String(reason).replace(/^\[backup\] snapshot "pre-regroup" failed: /, '') || 'unknown error';
+    throw new Error(`Could not write the backup taken before regrouping the library into works (${why}). ` +
+      `Fix BACKUP_DIR (currently ${backup.backupDir ? backup.backupDir() : process.env.BACKUP_DIR || 'next to the database'}; it must exist or be creatable, and be writable) and scan again. Nothing was changed.`);
+  }
+  log('info', `Backup written before regrouping into works: ${path.basename(file)}`);
+  return file;
 }
 
 /**
@@ -931,13 +957,7 @@ async function scanLibraryLayout(libraryPath, progressCallback, logger, { scope 
   cleanupJunkCreators(log);
   const S = layoutStmts();
   try {
-    if (!scope && typeof db.getSetting === 'function' && !db.getSetting('layout_regroup_done')) {
-      const n = db.prepare('SELECT COUNT(*) AS n FROM models').get().n;
-      if (n > 0) {
-        const file = require('./lib/backup').snapshot('pre-regroup', { db, log: { log: (m) => log('info', m), error: (m) => log('warn', m) } });
-        if (file) log('info', `Backup written before regrouping into works: ${path.basename(file)}`);
-      }
-    }
+    preRegroupSnapshot(log);
     const tm = Date.now();
     const { meta, libs } = loadLibraryMeta(log);
     const metaMs = Date.now() - tm;
@@ -962,65 +982,57 @@ async function scanLibraryLayout(libraryPath, progressCallback, logger, { scope 
     const inScope = (p) => p > lo && p < hi;
     const existingFiles = new Map();
     const ownedTotal = new Map();
-    for (const r of db.prepare('SELECT model_id, filepath, printed_at FROM model_files').all()) {
+    const printedByNameSize = new Map(); // "<filename>|<size>" → printed_at, for files that moved or reappeared
+    for (const r of db.prepare('SELECT model_id, filename, filesize, filepath, printed_at FROM model_files').all()) {
       ownedTotal.set(r.model_id, (ownedTotal.get(r.model_id) || 0) + 1);
       if (inScope(r.filepath)) existingFiles.set(r.filepath, r);
+      if (r.printed_at) {
+        const k = `${String(r.filename || '').toLowerCase()}|${r.filesize}`;
+        if (!printedByNameSize.has(k) || printedByNameSize.get(k) < r.printed_at) printedByNameSize.set(k, r.printed_at);
+      }
     }
-    const rows = new Map(db.prepare('SELECT id, uuid, work_key, folder_path, hidden, name, name_locked, folder_hash, images, thumbnail_path, render_zip_hint, creator_id, attribution, franchise, team, group_name, source_url FROM models').all().map(r => [r.id, r]));
+    const rows = new Map(db.prepare('SELECT id, uuid, work_key, folder_path, folded_into, hidden, name, name_locked, folder_hash, images, thumbnail_path, render_zip_hint, creator_id, attribution, franchise, team, group_name, source_url FROM models').all().map(r => [r.id, r]));
     const byKey = new Map();
     const byFolder = new Map();
     for (const r of rows.values()) {
-      r.folded = /#folded-\d+$/.test(r.folder_path || '') || !!parseJSON(r.attribution, {}).foldedInto;
+      r.folded = r.folded_into != null || /#folded-\d+$/.test(r.folder_path || '') || !!parseJSON(r.attribution, {}).foldedInto;
       if (r.work_key && !r.folded && (!byKey.has(r.work_key) || byKey.get(r.work_key).hidden)) byKey.set(r.work_key, r);
       byFolder.set(r.folder_path, r);
     }
     const produced = new Set(plan.works.map(w => w.key));
+    // a row from before this regroup: the folder scanner's, or a layout row whose work no longer exists
+    const isLegacy = (r) => !r.folded && (!r.work_key || !produced.has(r.work_key));
+
+    // Files a row held that this walk did not see (deleted, or now skipped: ".ArchiveServiceTemp…",
+    // "*.crdownload", dotfiles) say nothing about where the row went.
     const walked = new Set();
     for (const w of plan.works) for (const f of w.files) walked.add(f.abs);
-
-    // ── bases: the row each work updates (same work_key, else a stale/legacy row in its folder) ──
-    const claimed = new Map(); // row id → work
+    const gone = new Map(); // row id → [filepath]
+    for (const [fp, e] of existingFiles) if (!walked.has(fp)) { if (!gone.has(e.model_id)) gone.set(e.model_id, []); gone.get(e.model_id).push(fp); }
+    const liveTotal = (id) => (ownedTotal.get(id) || 0) - ((gone.get(id) || []).length);
     for (const w of plan.works) {
       const owners = new Map();
       for (const f of w.files) { const e = existingFiles.get(f.abs); if (e) owners.set(e.model_id, (owners.get(e.model_id) || 0) + 1); }
       w.owners = owners;
-      let base = byKey.get(w.key);
-      if (base && claimed.has(base.id)) base = null;
-      if (!base) {
-        const real = worksLib.realFolder(w.folderPath);
-        for (const fp of [w.folderPath, real]) {
-          const r = byFolder.get(fp);
-          if (r && !claimed.has(r.id) && !r.folded && (!r.work_key || !produced.has(r.work_key))) { base = r; break; }
-        }
-      }
-      if (base) claimed.set(base.id, w);
-      w.base = base || null;
+      w.kids = [];    // rows folded into this work that carry their user data over
+      w.spread = [];  // rows whose files spread over more than 2 works (user data → a "Was: …" collection)
     }
-    // Rows left without files once the works take theirs → folded at the end. That covers
-    // folder models whose files were re-grouped and the empty rows the folder scanner left
-    // (sub-folders whose files a parent model had claimed).
-    const moved = new Map();
-    for (const w of plan.works) for (const [id, n] of w.owners) moved.set(id, (moved.get(id) || 0) + n);
-    const emptyFolders = new Map(); // real folder → row ids with no files at all
-    const foldable = new Set();
+
+    // Rows without any files (the folder scanner left them when a parent claimed their files):
+    // which works hold the files under their folder, or under its nearest ancestor below the creator.
+    // Hidden ones too: a card the user hid keeps its tags/collections (and stays hidden when it is the work).
+    const emptyFolders = new Map(); // real folder → rows
     for (const r of rows.values()) {
-      if (claimed.has(r.id) || r.folded || (r.work_key && produced.has(r.work_key))) continue;
-      const total = ownedTotal.get(r.id) || 0;
-      if (total && moved.get(r.id) === total) foldable.add(r.id);
-      else if (!total && !r.hidden) {
-        const rf = worksLib.realFolder(r.folder_path || '');
-        if (rf && inScope(rf + path.sep)) { if (!emptyFolders.has(rf)) emptyFolders.set(rf, []); emptyFolders.get(rf).push(r.id); }
-      }
+      if (!isLegacy(r) || liveTotal(r.id) > 0) continue;
+      const rf = worksLib.realFolder(r.folder_path || '');
+      if (rf && inScope(rf + path.sep)) { if (!emptyFolders.has(rf)) emptyFolders.set(rf, []); emptyFolders.get(rf).push(r); }
     }
-    const emptyTarget = new Map(); // row id → work holding most files under its folder
+    const counts = new Map(); // folder → Map(work → files under it)
     if (emptyFolders.size) {
-      // the folder itself, else its nearest ancestor below the creator (a row left inside a
-      // skipped ".ArchiveServiceTemp…" folder belongs with the work around it)
       const wanted = new Set();
       for (const folder of emptyFolders.keys()) {
         for (let d = folder, i = 0; i < 4 && d.length > scopeRoot.length; i++, d = path.dirname(d)) wanted.add(d);
       }
-      const counts = new Map(); // folder → Map(work → n)
       for (const w of plan.works) {
         for (const f of w.files) {
           for (let d = f.dir; d.length >= scopeRoot.length; d = path.dirname(d)) {
@@ -1029,14 +1041,86 @@ async function scanLibraryLayout(libraryPath, progressCallback, logger, { scope 
           }
         }
       }
-      for (const [folder, ids] of emptyFolders) {
-        let m = null;
-        for (let d = folder, i = 0; !m && i < 4 && d.length > scopeRoot.length; i++, d = path.dirname(d)) m = counts.get(d) || null;
-        if (!m) continue; // nothing left there: kept for /api/organize/integrity
-        const best = [...m.entries()].sort((a, b) => b[1] - a[1])[0][0];
-        for (const id of ids) { foldable.add(id); emptyTarget.set(id, best); }
+    }
+    const sumOf = (m) => { let n = 0; for (const v of m.values()) n += v; return n; };
+
+    // ── bases: the row each work updates ──
+    // Same work_key first. Otherwise a legacy row only when they are the same thing: the work holds
+    // >= 50% of the row's files (an empty row: of the files under its folder) AND the row held >= 50%
+    // of the work's previously known files. Anything else is folded, so a parent row ("DC") never
+    // becomes one of its parts.
+    const claimed = new Map(); // row id → work
+    for (const w of plan.works) {
+      const base = byKey.get(w.key);
+      if (base && !claimed.has(base.id)) { claimed.set(base.id, w); w.base = base; w.baseByKey = true; } else w.base = null;
+    }
+    const candidates = [];
+    for (const w of plan.works) {
+      if (w.base) continue;
+      // the work's files that some row held before (files added since then say nothing about identity)
+      let known = 0;
+      for (const n of w.owners.values()) known += n;
+      const nw = known || w.files.length || 1;
+      for (const [id, n] of w.owners) {
+        const r = rows.get(id);
+        if (!r || !isLegacy(r) || claimed.has(id)) continue;
+        const total = liveTotal(id);
+        if (total > 0 && n / total >= 0.5 && n / nw >= 0.5) candidates.push({ w, r, score: (n / total) * (n / nw), n });
+      }
+      for (const fp of new Set([worksLib.realFolder(w.folderPath)])) {
+        for (const r of emptyFolders.get(fp) || []) {
+          if (claimed.has(r.id)) continue;
+          const m = counts.get(fp);
+          const n = (m && m.get(w)) || 0;
+          const total = m ? sumOf(m) : 0;
+          if (n && n / total >= 0.5 && n / (w.files.length || 1) >= 0.5) candidates.push({ w, r, score: (n / total) * (n / nw) - 0.01, n });
+        }
       }
     }
+    candidates.sort((a, b) => b.score - a.score || b.n - a.n || (a.r.folder_path === a.w.folderPath ? -1 : 0) - (b.r.folder_path === b.w.folderPath ? -1 : 0) || a.r.id - b.r.id);
+    for (const c of candidates) {
+      if (c.w.base || claimed.has(c.r.id)) continue;
+      claimed.set(c.r.id, c.w); c.w.base = c.r; c.w.baseByKey = false;
+    }
+
+    // ── which rows fold, and into what ──
+    // Rows left without files once the works take theirs: folder models whose files were re-grouped,
+    // parents split into parts, and empty rows. A row whose files went to 1-2 works hands its user data
+    // to the work that got most of them; one spread over more works keeps it in a "Was: <name>" collection.
+    const moved = new Map();
+    for (const w of plan.works) for (const [id, n] of w.owners) moved.set(id, (moved.get(id) || 0) + n);
+    const foldable = new Map(); // row id → { r, receivers: [work…] (most files first), spread }
+    for (const r of rows.values()) {
+      if (claimed.has(r.id) || !isLegacy(r)) continue;
+      const total = liveTotal(r.id);
+      if (total <= 0 || moved.get(r.id) !== total) continue;
+      const receivers = plan.works.filter(w => w.owners.get(r.id)).sort((a, b) => b.owners.get(r.id) - a.owners.get(r.id));
+      foldable.set(r.id, { r, receivers, spread: receivers.length > 2, withFiles: true });
+    }
+    for (const [folder, list] of emptyFolders) {
+      // its own folder, else (rows that never had files: left inside a skipped ".ArchiveServiceTemp…"
+      // folder or under a parent that claimed them) the nearest ancestor below the creator
+      const pick = (levels) => {
+        for (let d = folder, i = 0; i < levels && d.length > scopeRoot.length; i++, d = path.dirname(d)) {
+          const m = counts.get(d);
+          if (m) return { best: [...m.entries()].sort((a, b) => b[1] - a[1])[0][0], near: i === 0 };
+        }
+        return null;
+      };
+      const own = pick(1), up = own || pick(4);
+      for (const r of list) {
+        if (claimed.has(r.id)) continue;
+        // a row whose files are all gone only folds into what is in its own folder now
+        const hit = (ownedTotal.get(r.id) || 0) > 0 ? own : up;
+        if (hit) foldable.set(r.id, { r, receivers: [hit.best], spread: false, withFiles: false, near: hit.near });
+        // else nothing left there: kept for /api/organize/integrity
+      }
+    }
+    for (const fd of foldable.values()) {
+      if (fd.spread) for (const w of fd.receivers) w.spread.push(fd);
+      else fd.receivers[0].kids.push(fd);
+    }
+
     // ── folder_path collisions with rows that are not moving ──
     db.transaction(() => {
       for (const [id, w] of claimed) {
@@ -1064,28 +1148,41 @@ async function scanLibraryLayout(libraryPath, progressCallback, logger, { scope 
         const prevAttr = base ? parseJSON(base.attribution, {}) : {};
         const products = JSON.stringify(w.attr.products);
         const attribution = { ...w.attr.attribution, autoFranchise: w.attr.genre || null, sourceUrl: w.attr.sourceUrl || null };
+        if (Array.isArray(prevAttr.foldedFrom) && prevAttr.foldedFrom.length) attribution.foldedFrom = prevAttr.foldedFrom;
         const attrSig = JSON.stringify([products, w.attr.attribution, w.attr.genre, w.attr.release_term, w.attr.release_label, w.group || null, w.editions || [], w.libraries, w.name]);
         attribution.sig = crypto.createHash('sha1').update(attrSig).digest('hex').slice(0, 12);
         const filesOwned = base && w.owners.size === 1 && w.owners.get(base.id) === w.files.length;
         const ft = franchiseAndTeam(w, base, prevAttr, meta);
         const sameLabels = base && (base.franchise || null) === ft.franchise && (base.team || null) === ft.team;
         if (base && base.folder_hash === w.hash && filesOwned && prevAttr.sig === attribution.sig && base.folder_path === w.folderPath && sameLabels) {
+          w.rowId = base.id;
           prepared.push({ w, skip: true });
           continue;
         }
         const uuid = base ? base.uuid : uuidv4();
         const creatorRow = stmts.getCreator.get(w.creator);
         const hint = (base && base.render_zip_hint) || (creatorRow && creatorRow.render_zip_hint) || null;
+        // Renders already on disk are reused: the base's, then those of rows folded in for good
+        // (their /images/<uuid>/ dirs stay; folded rows are never deleted). Archives are opened only
+        // for a card without any, or when a work's files changed since the last layout scan.
         let images = base ? parseJSON(base.images, []) : [];
-        const needImages = !base || base.folder_hash !== w.hash || !images.length;
+        let kidThumb = null;
+        for (const k of w.kids) {
+          if (k.r.hidden || !(k.withFiles || k.near)) continue; // renders only from rows that were this work
+          for (const im of parseJSON(k.r.images, [])) if (!images.includes(im)) images.push(im);
+          if (!kidThumb && k.r.thumbnail_path) kidThumb = k.r.thumbnail_path;
+        }
+        const needImages = !images.length || (w.baseByKey && base.folder_hash !== w.hash);
         if (needImages) {
           try {
             const fresh = await workImages(w, uuid, hint, log);
             if (fresh.length) images = [...new Set([...fresh, ...images])];
+            counters.extracted = (counters.extracted || 0) + 1;
           } catch (e) { log('warn', `    images for ${w.name}: ${e.message}`); }
         }
         images = rankImages(images);
-        const thumbnail = base && base.thumbnail_path && images.includes(base.thumbnail_path) ? base.thumbnail_path : (images[0] || null);
+        const thumbnail = base && base.thumbnail_path && images.includes(base.thumbnail_path) ? base.thumbnail_path
+          : (kidThumb && images.includes(kidThumb) ? kidThumb : (images[0] || null));
         prepared.push({ w, uuid, images, thumbnail, products, attribution, prevAttr, ft });
       }
 
@@ -1128,8 +1225,9 @@ async function scanLibraryLayout(libraryPath, progressCallback, logger, { scope 
           for (const f of w.files) {
             const prev = existingFiles.get(f.abs);
             if (prev && prev.model_id !== id) S.delByPath.run(f.abs);
+            const printed = prev ? prev.printed_at : (printedByNameSize.get(`${String(f.name).toLowerCase()}|${f.size}`) || null);
             S.insFile.run(id, f.name, f.abs, fileType(f.name), f.size, releaseNameFor(f, real, w.creator), f.library || null,
-              f.variant || null, f.edition || null, f.product || null, f.matched_by || null, prev ? prev.printed_at : null);
+              f.variant || null, f.edition || null, f.product || null, f.matched_by || null, printed);
           }
           if (scope) {
             const st = S.fileStats.get(id);
@@ -1140,16 +1238,14 @@ async function scanLibraryLayout(libraryPath, progressCallback, logger, { scope 
       await new Promise(resolve => setImmediate(resolve));
     }
 
-    // ── fold old folder-based rows whose files now belong to works (never deleted) ──
-    const foldInto = new Map(); // work → [row]
-    for (const id of foldable) {
-      let best = emptyTarget.get(id) || null, bestN = 0;
-      if (!best) for (const w of plan.works) { const n = w.owners.get(id) || 0; if (n > bestN && w.rowId) { best = w; bestN = n; } }
-      if (best && !best.rowId) best = null;
-      if (best) { if (!foldInto.has(best)) foldInto.set(best, []); foldInto.get(best).push(id); }
-    }
+    // ── fold old rows into the works that hold their files now (never deleted) ──
+    const addLine = (text, line) => (text && text.includes(line) ? text : (text ? `${text}\n${line}` : line));
+    const moveMemberships = (to, from) => { stmts.moveCollections.run(to, from); stmts.dropCollections.run(from); };
+    const foldedFromOf = new Map(); // work row id → [{ id, name, collection? }]
+    const noteFoldedFrom = (rowId, entry) => { if (!foldedFromOf.has(rowId)) foldedFromOf.set(rowId, []); foldedFromOf.get(rowId).push(entry); };
     db.transaction(() => {
-      for (const [w, ids] of foldInto) {
+      for (const w of plan.works) {
+        if (!w.rowId || !w.kids.length) continue;
         const target = S.full.get(w.rowId);
         let tags = parseJSON(target.tags, []);
         let fav = target.is_favorite ? 1 : 0;
@@ -1160,46 +1256,113 @@ async function scanLibraryLayout(libraryPath, progressCallback, logger, { scope 
         let name = target.name, locked = target.name_locked ? 1 : 0;
         let srcUrl = null;
         const lockedNames = [];
-        for (const id of ids) {
-          const kid = S.full.get(id);
-          if (!kid.hidden) {
-            for (const t of parseJSON(kid.tags, [])) if (!tags.includes(t)) tags.push(t);
+        const hiddenNames = [];
+        // hidden only when every row that held these files was hidden (rows without files don't count)
+        const contributors = [];
+        if (w.base) contributors.push(!!w.base.hidden);
+        for (const k of w.kids) if (k.withFiles) contributors.push(!!k.r.hidden);
+        const hide = contributors.length ? contributors.every(Boolean) : !!target.hidden;
+        for (const k of w.kids) {
+          const kid = S.full.get(k.r.id);
+          for (const t of parseJSON(kid.tags, [])) if (!tags.includes(t)) tags.push(t);
+          if (status === 'unprinted' && kid.print_status && kid.print_status !== 'unprinted') status = kid.print_status;
+          if (kid.notes) notes = addLine(notes, kid.notes);
+          if (kid.hidden) {
+            // an empty hidden row without data of its own is a leftover of the folder scanner's variant merge
+            const ownData = parseJSON(kid.tags, []).length || kid.notes || kid.is_favorite || (kid.print_status && kid.print_status !== 'unprinted') || stmts.countCollections.get(kid.id).n || stmts.countQueue.get(kid.id).n;
+            if (k.withFiles || ownData) hiddenNames.push(kid.name);
+          } else {
             if (kid.is_favorite) fav = 1;
-            if (status === 'unprinted' && kid.print_status && kid.print_status !== 'unprinted') status = kid.print_status;
-            if (kid.notes && !notes.includes(kid.notes)) notes = notes ? `${notes}\n${kid.notes}` : kid.notes;
-            for (const im of parseJSON(kid.images, [])) if (!images.includes(im)) images.push(im);
-            if (!thumb && kid.thumbnail_path) thumb = kid.thumbnail_path;
+            if (k.withFiles || k.near) {
+              for (const im of parseJSON(kid.images, [])) if (!images.includes(im)) images.push(im);
+              if (!thumb && kid.thumbnail_path) thumb = kid.thumbnail_path;
+            }
             if (kid.name_locked) lockedNames.push(kid.name);
             if (!srcUrl && kid.source_url) srcUrl = kid.source_url;
-            stmts.moveCollections.run(w.rowId, id);
-            stmts.moveQueue.run(w.rowId, id);
           }
+          moveMemberships(w.rowId, kid.id);
+          stmts.moveQueue.run(w.rowId, kid.id);
           // folded rows keep their folder_path (renamed to "<path>#folded-<id>" only if a work needs it)
-          S.fold.run(JSON.stringify({ ...parseJSON(kid.attribution, {}), foldedInto: w.rowId }), target.creator_id, id);
+          S.fold.run(w.rowId, JSON.stringify({ ...parseJSON(kid.attribution, {}), foldedInto: w.rowId }), target.creator_id, kid.id);
+          noteFoldedFrom(w.rowId, { id: kid.id, name: kid.name, ...(kid.hidden ? { hidden: true } : {}) });
           counters.folded++;
         }
         if (lockedNames.length === 1 && !locked) { name = lockedNames[0]; locked = 1; }
-        else if (lockedNames.length > 1) {
-          const line = `Previous custom names: ${lockedNames.join('; ')}`;
-          if (!notes.includes(line)) notes = notes ? `${notes}\n${line}` : line;
-        }
+        else if (lockedNames.length > 1) notes = addLine(notes, `Previous custom names: ${lockedNames.join('; ')}`);
+        if (!hide) for (const n of hiddenNames) notes = addLine(notes, `Hidden before regroup: ${n}`);
         S.mergeUser.run(JSON.stringify(tags), fav, status, notes || null, JSON.stringify(images), thumb || null, name, locked, srcUrl, w.rowId);
-        log('info', `    ⇲ Folded ${ids.length} earlier model(s) into ${w.name}`);
+        if (hide !== !!target.hidden) S.setHidden.run(hide ? 1 : 0, w.rowId);
+        log('info', `    ⇲ Folded ${w.kids.length} earlier model(s) into ${w.name}`);
+      }
+
+      // Parents spread over more than 2 works: their tags/favorite/status/notes go to a
+      // "Was: <name>" collection holding every receiving work; nothing (images included) is
+      // copied onto one arbitrary part.
+      const spreadDone = new Set();
+      for (const w of plan.works) {
+        for (const fd of w.spread) {
+          if (spreadDone.has(fd.r.id)) continue;
+          spreadDone.add(fd.r.id);
+          const receivers = fd.receivers.filter(x => x.rowId);
+          if (!receivers.length) continue;
+          const kid = S.full.get(fd.r.id);
+          const tags = parseJSON(kid.tags, []);
+          const status = kid.print_status && kid.print_status !== 'unprinted' ? kid.print_status : null;
+          const memberships = stmts.countCollections.get(kid.id).n;
+          const queued = stmts.countQueue.get(kid.id).n;
+          const hasUserData = tags.length || kid.is_favorite || status || kid.notes || kid.name_locked || memberships || queued;
+          let collectionId = null;
+          if (hasUserData) {
+            const desc = [
+              `Was one card "${kid.name}" before the library was regrouped into works (now ${receivers.length} cards).`,
+              tags.length ? `Tags: ${tags.join(', ')}` : null,
+              kid.is_favorite ? 'Favorite: yes' : null,
+              status ? `Status: ${status}` : null,
+              kid.notes ? `Notes: ${kid.notes}` : null,
+              kid.hidden ? 'It was hidden.' : null,
+            ].filter(Boolean).join('\n');
+            let cname = `Was: ${kid.name}`;
+            if (stmts.collectionByName.get(cname)) cname = `Was: ${kid.name} (#${kid.id})`;
+            const existing = stmts.collectionByName.get(cname);
+            collectionId = existing ? existing.id : stmts.createCollection.run(cname, desc, kid.is_favorite ? 1 : 0).lastInsertRowid;
+            receivers.forEach((x, i) => stmts.addToCollection.run(collectionId, x.rowId, i));
+          }
+          for (const x of receivers) stmts.moveCollections.run(x.rowId, kid.id);
+          stmts.dropCollections.run(kid.id);
+          stmts.moveQueue.run(receivers[0].rowId, kid.id);
+          S.fold.run(receivers[0].rowId, JSON.stringify({ ...parseJSON(kid.attribution, {}), foldedInto: receivers[0].rowId, spreadTo: receivers.map(x => x.rowId), ...(collectionId ? { collection: collectionId } : {}) }), null, kid.id);
+          for (const x of receivers) noteFoldedFrom(x.rowId, { id: kid.id, name: kid.name, spread: receivers.length, ...(collectionId ? { collection: collectionId } : {}) });
+          counters.folded++;
+          log('info', `    ⇲ ${kid.name} spread over ${receivers.length} cards${collectionId ? ` → collection "Was: ${kid.name}"` : ''}`);
+        }
+      }
+      for (const [rowId, list] of foldedFromOf) {
+        const cur = S.full.get(rowId);
+        const attr = parseJSON(cur.attribution, {});
+        const prev = Array.isArray(attr.foldedFrom) ? attr.foldedFrom : [];
+        const seen = new Set(prev.map(e => e.id));
+        attr.foldedFrom = [...prev, ...list.filter(e => !seen.has(e.id))];
+        S.setAttr.run(JSON.stringify(attr), rowId);
       }
     })();
 
     const orphaned = db.prepare('DELETE FROM creators WHERE id NOT IN (SELECT DISTINCT creator_id FROM models WHERE creator_id IS NOT NULL)').run();
     if (orphaned.changes > 0) log('info', `Cleaned up ${orphaned.changes} orphaned creator(s)`);
-    if (!scope && typeof db.setSetting === 'function') {
+    if (typeof db.setSetting === 'function') {
       db.setSetting('layout_regroup_done', db.getSetting('layout_regroup_done') || new Date().toISOString());
-      db.setSetting('meta_sidecars', plan.sidecars || 0); // model.json files seen by the last full scan (/api/meta/status)
+      if (!scope) {
+        db.setSetting('meta_sidecars', plan.sidecars || 0); // model.json files seen by the last full scan (/api/meta/status)
+        db.setSetting('meta_sidecar_errors', JSON.stringify((plan.sidecarErrors || []).slice(0, 200)));
+      }
     }
 
     const { modelsFound, modelsAdded, modelsUpdated, modelsSkipped, folded } = counters;
     stmts.finishLog.run('complete', modelsFound, modelsAdded, modelsUpdated, modelsSkipped, logId);
     const scanMs = Date.now() - t0;
     log('info', `Skipped ${modelsSkipped} unchanged card(s)${folded ? `, folded ${folded} earlier model(s)` : ''} — ${Math.round(scanMs / 100) / 10}s (meta ${metaMs} ms)`);
-    return { success: true, modelsFound, modelsAdded, modelsUpdated, modelsSkipped, folded, byKind, metaMs, scanMs, files: tree.fileCount };
+    return { success: true, modelsFound, modelsAdded, modelsUpdated, modelsSkipped, folded, extracted: counters.extracted || 0, byKind, metaMs, scanMs, files: tree.fileCount,
+      // plain _Meta summary for the server's /api/meta and /api/attribution routes (not sent to clients)
+      metaSummary: (() => { try { return metaSummaryLib.summarize(meta); } catch { return null; } })() };
   } catch (err) {
     stmts.errorLog.run('error', err.message, logId);
     throw err;

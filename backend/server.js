@@ -14,7 +14,8 @@ try {
 } catch {}
 
 const db = require('./db');
-const { LIBRARY_PATH, pickRenderArchives, analyzeFolder, extractImagesFromArchive, analysisFromFiles, realFolder, loadLibraryMeta } = require('./scanner');
+const { LIBRARY_PATH, pickRenderArchives, analyzeFolder, extractImagesFromArchive, analysisFromFiles, realFolder } = require('./scanner');
+const metaSummaryLib = require('./lib/meta-summary');
 const metaLib = require('./lib/meta');
 const librariesLib = require('./lib/libraries');
 const zipLib = require('./lib/zip');
@@ -51,15 +52,31 @@ app.use('/images', express.static(IMAGES_DIR));
 app.use('/api/organize', organizeRouter);
 
 // ── Library metadata (_Meta) cache ────────────────────────────────────────────
-// The scan worker loads its own copy; the server keeps one for /api/meta/* and
-// /api/attribution/gaps, reloaded on demand and after every scan.
-let metaCache = null;
-function getMeta({ reload = false } = {}) {
-  if (!metaCache || reload) {
-    try { metaCache = loadLibraryMeta().meta; }
-    catch (e) { metaCache = metaLib.emptyMeta(); metaCache.errors.push(e.message); metaCache.loadedAt = new Date().toISOString(); }
-  }
-  return metaCache;
+// /api/meta/* and /api/attribution/* use a plain summary of _Meta (lib/meta-summary.js).
+// Every scan sends a fresh one; otherwise meta-worker.js builds it off the main thread.
+const META_LOAD_TIMEOUT_MS = 60000;
+let metaSummary = null;
+let metaLoading = null;
+function loadMetaSummary() {
+  if (metaLoading) return metaLoading;
+  metaLoading = new Promise((resolve) => {
+    let settled = false;
+    const done = (v) => { if (!settled) { settled = true; clearTimeout(timer); resolve(v); } };
+    let w;
+    try {
+      w = new Worker(path.join(__dirname, 'meta-worker.js'), { workerData: { root: LIBRARY_PATH }, env: { ...process.env } });
+    } catch (e) { done(metaSummaryLib.failed(`_Meta could not be loaded: ${e.message}`)); return; }
+    const timer = setTimeout(() => { done(metaSummaryLib.failed(`_Meta took longer than ${META_LOAD_TIMEOUT_MS / 1000}s to load`)); w.terminate(); }, META_LOAD_TIMEOUT_MS);
+    if (timer.unref) timer.unref();
+    w.once('message', done);
+    w.once('error', (e) => done(metaSummaryLib.failed(`_Meta could not be loaded: ${e.message}`)));
+    w.once('exit', (code) => done(metaSummaryLib.failed(`_Meta loader exited (${code})`)));
+  }).then((sum) => { metaSummary = sum; metaLoading = null; return sum; });
+  return metaLoading;
+}
+async function getMetaSummary({ reload = false } = {}) {
+  if (metaSummary && !reload) return metaSummary;
+  return loadMetaSummary();
 }
 const parseJSON = (s, d) => { try { const v = JSON.parse(s); return v == null ? d : v; } catch { return d; } };
 
@@ -118,10 +135,12 @@ function startScanWorker(workerData, startLogLines) {
       if (m.msg) scanProgress.last = String(m.msg).trim();
     } else if (m.type === 'done') {
       if (m.success) {
-        const r = m.result || {};
+        const { metaSummary: freshMeta, ...r } = m.result || {};
         pushLog('success', `✓ Scan complete — ${r.modelsFound ?? 0} found · ${r.modelsAdded ?? 0} added · ${r.modelsUpdated ?? 0} updated · ${r.modelsSkipped ?? 0} skipped`);
         scanSummary = { type: 'done', success: true, ...r };
-        metaCache = null; // _Meta may have changed; reload lazily
+        metaSummary = freshMeta || null; // the scan's own _Meta; null → reloaded off-thread on demand
+        gapsCache = null;
+        refreshHealthCache();
       } else {
         pushLog('error', `✗ Error: ${m.error}`);
         scanSummary = { type: 'done', success: false, error: m.error };
@@ -262,7 +281,8 @@ function addLayoutFilters(q, where, params) {
   if (kinds.length) {
     where.push(`COALESCE(m.kind, 'model') IN (${kinds.map(() => '?').join(',')})`);
     params.push(...kinds);
-  } else if (q.includeTools !== '1' && q.includeTools !== 'true') {
+  } else if (q.includeTools !== '1' && q.includeTools !== 'true' && q.favorite !== '1') {
+    // a favorite tool stays reachable: the favorites filter lists it
     where.push(`COALESCE(m.kind, 'model') != 'tool'`);
   }
   if (q.library) {
@@ -305,17 +325,19 @@ app.get('/api/models', (req, res) => {
   let where = ['1=1'];
   const params = [];
 
-  // Hide hidden models by default; show_hidden=1 to include them
+  // Hide hidden models by default; show_hidden=1 to include them. Rows folded into a work by the
+  // regroup are never listed (show_folded=1 for diagnostics): their files and data live on the work.
   if (!show_hidden || show_hidden === '0') {
     where.push('(m.hidden IS NULL OR m.hidden = 0)');
   }
+  if (req.query.show_folded !== '1') where.push('m.folded_into IS NULL');
 
   // Thumbnail filter
   if (has_thumbnail === '1') {
     where.push('m.thumbnail_path IS NOT NULL');
   }
 
-  // Favorites filter
+  // Favorites filter (favorite tools are listed too: see addLayoutFilters)
   if (favorite === '1') {
     where.push('m.is_favorite = 1');
   }
@@ -428,8 +450,14 @@ app.patch('/api/models/:id(\\d+)', (req, res) => {
   if (thumbnail_path !== undefined && thumbnail_path !== null && thumbnail_path !== '' && !isSafeImageUrl(thumbnail_path)) {
     return res.status(400).json({ error: 'thumbnail_path must be an /images/... path' });
   }
-  const model = db.prepare('SELECT id, print_status FROM models WHERE id = ?').get(req.params.id);
+  const model = db.prepare('SELECT id, print_status, folded_into FROM models WHERE id = ?').get(req.params.id);
   if (!model) return res.status(404).json({ error: 'Not found' });
+  if (hidden !== undefined && !hidden && model.folded_into != null) {
+    return res.status(409).json({
+      error: `This card was folded into card #${model.folded_into} when the library was regrouped into works; its files and your tags, notes and collections are on that card now. Open it instead of unhiding this one.`,
+      folded_into: model.folded_into,
+    });
+  }
 
   const updates = [];
   const params = [];
@@ -614,7 +642,8 @@ app.get('/api/stats', (req, res) => {
   // Tools (_Tools: slicer projects, printer files…) are not models: left out of the stats
   const VIS = `(hidden IS NULL OR hidden = 0) AND COALESCE(kind, 'model') != 'tool'`;
   const total = db.prepare(`SELECT COUNT(*) as n FROM models WHERE ${VIS}`).get().n;
-  const totalHidden = db.prepare('SELECT COUNT(*) as n FROM models WHERE hidden = 1').get().n;
+  // hidden by the user; rows folded into works by the regroup are not "hidden models"
+  const totalHidden = db.prepare('SELECT COUNT(*) as n FROM models WHERE hidden = 1 AND folded_into IS NULL').get().n;
   const byStatus = db.prepare(`
     SELECT print_status, COUNT(*) as n FROM models WHERE ${VIS} GROUP BY print_status
   `).all();
@@ -740,11 +769,14 @@ app.post('/api/models/bulk', (req, res) => {
     updated = result.changes;
   }
 
+  let skippedFolded = 0;
   if (hidden !== undefined) {
+    // rows folded into a work stay hidden (PATCH answers 409 for them)
     const result = db.prepare(
-      `UPDATE models SET hidden = ?, updated_at = datetime('now') WHERE id IN (${placeholders})`
+      `UPDATE models SET hidden = ?, updated_at = datetime('now') WHERE id IN (${placeholders}) AND folded_into IS NULL`
     ).run(hidden ? 1 : 0, ...ids);
     updated = result.changes;
+    if (!hidden) skippedFolded = ids.length - result.changes;
   }
 
   if (tags_add && tags_add.length > 0) {
@@ -769,7 +801,7 @@ app.post('/api/models/bulk', (req, res) => {
     updated = models.length;
   }
 
-  res.json({ success: true, updated });
+  res.json({ success: true, updated, ...(skippedFolded > 0 ? { skippedFolded } : {}) });
 });
 
 // ── Export ────────────────────────────────────────────────────────────────────
@@ -784,6 +816,7 @@ app.get('/api/export', (req, res) => {
   if (!show_hidden || show_hidden === '0') {
     where.push('(m.hidden IS NULL OR m.hidden = 0)');
   }
+  where.push('m.folded_into IS NULL');
   if (has_thumbnail === '1') {
     where.push('m.thumbnail_path IS NOT NULL');
   }
@@ -1874,14 +1907,15 @@ app.get('/api/models/:id(\\d+)/tag-suggestions', (req, res) => {
 
 app.get('/api/collections', (req, res) => {
   const cols = db.prepare(`
-    SELECT c.id, c.name, c.color, c.created_at, c.pinned,
-           COUNT(cm.id) AS model_count,
+    SELECT c.id, c.name, c.color, c.created_at, c.pinned, c.description,
+           COUNT(mm.id) AS model_count,
            (SELECT m.thumbnail_path FROM collection_models cm2
               JOIN models m ON m.id = cm2.model_id
-              WHERE cm2.collection_id = c.id AND m.thumbnail_path IS NOT NULL
+              WHERE cm2.collection_id = c.id AND m.thumbnail_path IS NOT NULL AND m.folded_into IS NULL
               ORDER BY cm2.sort_order, cm2.id LIMIT 1) AS cover
     FROM collections c
     LEFT JOIN collection_models cm ON cm.collection_id = c.id
+    LEFT JOIN models mm ON mm.id = cm.model_id AND mm.folded_into IS NULL
     GROUP BY c.id ORDER BY c.pinned DESC, c.name ASC
   `).all();
   res.json(cols);
@@ -1916,7 +1950,7 @@ app.get('/api/collections/:id/models', (req, res) => {
   const page = clampInt(req.query.page, 1, 1, 1e6);
   const limit = clampInt(req.query.limit, 48, 1, 500);
   const offset = (page - 1) * limit;
-  const total = db.prepare('SELECT COUNT(*) as n FROM collection_models WHERE collection_id = ?').get(req.params.id).n;
+  const total = db.prepare('SELECT COUNT(*) as n FROM collection_models cm JOIN models m ON m.id = cm.model_id WHERE cm.collection_id = ? AND m.folded_into IS NULL').get(req.params.id).n;
   const models = db.prepare(`
     SELECT m.id, m.name, m.thumbnail_path, m.print_status, m.tags, m.franchise,
            m.has_stl, m.has_chitubox, m.has_lychee, m.file_count,
@@ -1924,7 +1958,7 @@ app.get('/api/collections/:id/models', (req, res) => {
     FROM collection_models cm
     JOIN models m ON m.id = cm.model_id
     LEFT JOIN creators c ON c.id = m.creator_id
-    WHERE cm.collection_id = ?
+    WHERE cm.collection_id = ? AND m.folded_into IS NULL
     ORDER BY cm.sort_order ASC, cm.added_at ASC
     LIMIT ? OFFSET ?
   `).all(req.params.id, limit, offset);
@@ -1955,21 +1989,39 @@ app.get('/api/models/:id(\\d+)/collections', (req, res) => {
 
 // ── Health ────────────────────────────────────────────────────────────────────
 
-function libraryWritable() {
-  try { fs.accessSync(LIBRARY_PATH, fs.constants.W_OK); return true; } catch { return false; }
+// Libraries and writability are cached (startup, after scans, then at most once a minute in the
+// background): /api/health is polled and must never block on a slow or stalled library mount.
+const HEALTH_TTL_MS = 60000;
+const HEALTH_FS_TIMEOUT_MS = 3000;
+const healthCache = { libraries: null, libraryWritable: null, at: 0, error: null, pending: null };
+function refreshHealthCache() {
+  if (healthCache.pending) return healthCache.pending;
+  healthCache.pending = librariesLib.listLibrariesAsync(LIBRARY_PATH, metaSummary?.libraryLabels, { timeoutMs: HEALTH_FS_TIMEOUT_MS })
+    .then(({ libraries, rootWritable }) => {
+      healthCache.libraries = libraries.map(l => ({ name: l.name, path: l.path, writable: !!l.writable }));
+      healthCache.libraryWritable = rootWritable;
+      healthCache.error = null;
+    })
+    .catch((e) => { healthCache.error = e.message; })
+    .finally(() => { healthCache.at = Date.now(); healthCache.pending = null; });
+  return healthCache.pending;
 }
-app.get('/api/health', (req, res) => {
-  let libraries = [];
-  try { libraries = librariesLib.listLibraries(LIBRARY_PATH, metaCache?.vault?.libraryLabels).map(l => ({ name: l.name, path: l.path, writable: !!l.writable })); } catch {}
+refreshHealthCache();
+
+app.get('/api/health', async (req, res) => {
+  if (!healthCache.at && healthCache.pending) await healthCache.pending; // first call: bounded by HEALTH_FS_TIMEOUT_MS
+  else if (Date.now() - healthCache.at > HEALTH_TTL_MS) refreshHealthCache(); // answer from cache, refresh behind
   res.json({
     ok: true,
     libraryPath: LIBRARY_PATH,
     ...APP_VERSION,
     gitSha: process.env.GIT_SHA || 'dev',
     buildDate: process.env.BUILD_DATE || '',
-    libraryWritable: libraryWritable(),
+    libraryWritable: healthCache.libraryWritable,
     layoutMode: (process.env.LAYOUT_MODE || 'layout').toLowerCase() === 'legacy' ? 'legacy' : 'layout',
-    libraries,
+    libraries: healthCache.libraries || [],
+    ...(healthCache.error ? { libraryError: healthCache.error } : {}),
+    librariesCheckedAt: healthCache.at ? new Date(healthCache.at).toISOString() : null,
   });
 });
 
@@ -1999,36 +2051,78 @@ app.get('/api/facets', (req, res) => {
   res.json(out);
 });
 
-/** _Meta status; model.json sidecars are counted by the scanner (it walks the library, the server does not). */
-function metaStatusBody(meta) {
-  const st = metaLib.metaStatus(meta);
+/**
+ * _Meta status. model.json sidecars are read by the scanner (it walks the library, the server
+ * does not): their count and the unreadable ones come from the last full scan.
+ */
+function metaStatusBody(sum) {
+  const st = JSON.parse(JSON.stringify(sum.status));
   const sc = parseInt(db.getSetting ? db.getSetting('meta_sidecars') : '', 10);
   if (Number.isFinite(sc)) st.counts.sidecars = sc;
+  const bad = parseJSON(db.getSetting ? db.getSetting('meta_sidecar_errors') : null, []);
+  if (Array.isArray(bad) && bad.length) {
+    st.errors = [...st.errors, ...bad.slice(0, 50)];
+    st.counts.sidecarErrors = bad.length;
+  }
   return st;
 }
-app.get('/api/meta/status', (req, res) => res.json(metaStatusBody(getMeta())));
-app.post('/api/meta/reload', (req, res) => res.json(metaStatusBody(getMeta({ reload: true }))));
+// Express 4 does not catch rejected promises: async routes go through this
+const asyncRoute = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+app.get('/api/meta/status', asyncRoute(async (req, res) => res.json(metaStatusBody(await getMetaSummary()))));
+app.post('/api/meta/reload', asyncRoute(async (req, res) => { gapsCache = null; res.json(metaStatusBody(await getMetaSummary({ reload: true }))); }));
 
-/** Owned manifest products with no file on any library (by file match or by card). */
-function attributionGaps(creatorFilter) {
-  const meta = getMeta();
-  const owned = new Set();
-  for (const r of db.prepare(`SELECT products FROM models WHERE products IS NOT NULL AND products != '[]'`).all()) {
-    for (const p of parseJSON(r.products, [])) owned.add(p.libraryUrl || p.name);
+/**
+ * Owned manifest products with no file in any library. A product is present when any of its
+ * files (name key + size) is in model_files on any card, or a card/file was attributed to it.
+ * Listed once per creator + name (a product bought twice has two download URLs).
+ */
+let gapsCache = null; // { sum, fp, owned }
+function ownedKeys(sum) {
+  const fp = db.prepare('SELECT COUNT(*) AS n, MAX(id) AS mx FROM model_files').get();
+  const fpKey = `${fp.n}|${fp.mx}`;
+  if (gapsCache && gapsCache.sum === sum && gapsCache.fp === fpKey) return gapsCache;
+  const wanted = new Set();
+  for (const p of sum.products) for (const k of p.keys) wanted.add(k);
+  const sizes = new Set([...wanted].map(k => k.slice(k.lastIndexOf('|') + 1)));
+  const files = new Set();
+  for (const r of db.prepare('SELECT filename, filesize FROM model_files WHERE filesize IS NOT NULL').iterate()) {
+    if (!sizes.has(String(r.filesize))) continue; // fileKey() only for candidate sizes
+    const k = `${metaLib.fileKey(r.filename)}|${r.filesize}`;
+    if (wanted.has(k)) files.add(k);
   }
-  for (const r of db.prepare('SELECT DISTINCT product FROM model_files WHERE product IS NOT NULL').all()) owned.add(r.product);
+  const products = new Set();
+  for (const r of db.prepare(`SELECT products FROM models WHERE products IS NOT NULL AND products != '[]'`).all()) {
+    for (const p of parseJSON(r.products, [])) products.add(p.libraryUrl || p.name);
+  }
+  for (const r of db.prepare('SELECT DISTINCT product FROM model_files WHERE product IS NOT NULL').all()) products.add(r.product);
+  gapsCache = { sum, fp: fpKey, files, products };
+  return gapsCache;
+}
+async function attributionGaps(creatorFilter) {
+  const sum = await getMetaSummary();
+  const { files, products } = ownedKeys(sum);
   const want = creatorFilter ? String(creatorFilter).toLowerCase() : null;
-  return meta.products
-    .filter(p => !p.unknown && !owned.has(p.libraryUrl || p.name) && !owned.has(p.name))
-    .filter(p => !want || [p.creator, p.rawCreator, p.studio].some(x => x && String(x).toLowerCase() === want))
-    .map(p => ({
+  const missing = new Map();
+  for (const p of sum.products) {
+    if (products.has(p.libraryUrl || p.name) || products.has(p.name) || p.keys.some(k => files.has(k))) continue;
+    if (want && ![p.creator, p.rawCreator, p.studio].some(x => x && String(x).toLowerCase() === want)) continue;
+    const id = `${String(p.creator || '').toLowerCase()}|${String(p.name).toLowerCase()}`;
+    const prev = missing.get(id);
+    if (prev && prev.files >= p.files) continue;
+    missing.set(id, {
       creator: p.creator, name: p.name, term: p.term || null, libraryUrl: p.libraryUrl, productUrl: p.productUrl || null,
-      files: p.files.length, sizeGB: Math.round(p.files.reduce((t, f) => t + (f.size || 0), 0) / 1e7) / 100,
-    }))
+      files: p.files, sizeGB: Math.round(p.bytes / 1e7) / 100,
+    });
+  }
+  // a product (creator + name) present under another download URL is not missing
+  for (const p of sum.products) {
+    if (products.has(p.libraryUrl || p.name) || p.keys.some(k => files.has(k))) missing.delete(`${String(p.creator || '').toLowerCase()}|${String(p.name).toLowerCase()}`);
+  }
+  return [...missing.values()]
     .sort((a, b) => String(a.creator).localeCompare(String(b.creator)) || String(b.term || '').localeCompare(String(a.term || '')) || a.name.localeCompare(b.name));
 }
 
-app.get('/api/attribution/summary', (req, res) => {
+app.get('/api/attribution/summary', asyncRoute(async (req, res) => {
   const rows = db.prepare(`
     SELECT m.libraries, m.library, m.studio, m.confidence FROM models m
     WHERE (m.hidden IS NULL OR m.hidden = 0) AND COALESCE(m.kind, 'model') != 'tool'
@@ -2047,13 +2141,13 @@ app.get('/api/attribution/summary', (req, res) => {
     total: rows.length, byConfidence,
     byLibrary: [...lib.values()].sort((a, b) => b.total - a.total),
     byStudio: [...studio.values()].sort((a, b) => b.total - a.total),
-    gaps: attributionGaps().length,
+    gaps: (await attributionGaps()).length,
   });
-});
+}));
 
-app.get('/api/attribution/gaps', (req, res) => {
-  res.json({ products: attributionGaps(req.query.creator) });
-});
+app.get('/api/attribution/gaps', asyncRoute(async (req, res) => {
+  res.json({ products: await attributionGaps(req.query.creator) });
+}));
 
 // ── Library roots ───────────────────────────────────────────────────────────
 // Lists the top-level folders mounted under LIBRARY_PATH (one per docker-compose

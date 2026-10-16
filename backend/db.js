@@ -266,6 +266,18 @@ const MIGRATIONS = [
       )
     `);
   },
+  // 4 — rows folded into a work by the regroup point at it (excluded from hidden lists,
+  //     collections and counts; cannot be unhidden). Collections get a description
+  //     ("Was: <old card>" collections keep the old card's tags/status/notes there).
+  () => {
+    addColumn('models', 'folded_into INTEGER');
+    addColumn('collections', 'description TEXT');
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_models_folded_into ON models(folded_into)`);
+    try {
+      db.exec(`UPDATE models SET folded_into = CAST(json_extract(attribution, '$.foldedInto') AS INTEGER)
+               WHERE folded_into IS NULL AND attribution LIKE '%"foldedInto"%' AND json_valid(attribution)`);
+    } catch { /* JSON1 missing: rows are re-marked by the next scan */ }
+  },
 ];
 
 db.getSetting = (key) => {

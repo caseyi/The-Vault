@@ -15,7 +15,12 @@ const path = require('path');
 const yauzl = require('yauzl');
 
 const IMAGE_EXTS = new Set(['.jpg', '.jpeg', '.png', '.webp', '.gif']);
-const MAX_IMAGE_ENTRY_BYTES = 50 * 1024 * 1024; // skip absurd "images" (zip bombs)
+const MAX_IMAGE_ENTRY_BYTES = 50 * 1024 * 1024; // default cap for one image entry (zip bombs)
+/** IMAGE_MAX_MB (default 50) caps one extracted image, from a folder or from an archive. */
+function imageMaxBytes() {
+  const mb = parseFloat(process.env.IMAGE_MAX_MB);
+  return Number.isFinite(mb) && mb > 0 ? mb * 1024 * 1024 : MAX_IMAGE_ENTRY_BYTES;
+}
 
 function zipMaxBytes() {
   const z = parseFloat(process.env.ZIP_MAX_MB);
@@ -92,7 +97,7 @@ const safeName = (entryName) => path.basename(String(entryName).replace(/\\/g, '
 async function extractZipImages(file, destDir, opts = {}) {
   const zf = await openZip(file);
   try {
-    let images = (await readEntries(zf)).filter(e => !e.isDirectory && IMAGE_EXTS.has(path.extname(e.name).toLowerCase()) && e.size <= MAX_IMAGE_ENTRY_BYTES);
+    let images = (await readEntries(zf)).filter(e => !e.isDirectory && IMAGE_EXTS.has(path.extname(e.name).toLowerCase()) && e.size <= imageMaxBytes());
     if (Array.isArray(opts.select) && opts.select.length) {
       const want = new Set(opts.select);
       images = images.filter(e => want.has(e.name));
@@ -110,11 +115,16 @@ async function extractZipImages(file, destDir, opts = {}) {
       const name = safeName(e.name);
       if (!name || name === '.' || name === '..') continue;
       const dest = path.join(destDir, name);
-      if (!fs.existsSync(dest)) await writeEntry(zf, e._entry, dest);
-      saved.push(name);
+      try {
+        if (!fs.existsSync(dest)) await writeEntry(zf, e._entry, dest);
+        saved.push(name);
+      } catch (err) {
+        // one corrupt entry must not cost the rest of the archive
+        if (typeof opts.onError === 'function') opts.onError(e.name, err);
+      }
     }
     return saved;
   } finally { try { zf.close(); } catch {} }
 }
 
-module.exports = { listZip, extractZipImages, zipTooBig, zipMaxBytes, safeName, IMAGE_EXTS, MAX_IMAGE_ENTRY_BYTES };
+module.exports = { listZip, extractZipImages, zipTooBig, zipMaxBytes, imageMaxBytes, safeName, IMAGE_EXTS, MAX_IMAGE_ENTRY_BYTES };
