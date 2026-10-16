@@ -77,6 +77,8 @@ function VaultApp() {
   }, [theme]);
   const [showScan, setShowScan] = useState(false);
   const [showOrganize, setShowOrganize] = useState(false);
+  const [organizeTab, setOrganizeTab] = useState(null);
+  const [pendingSuggestions, setPendingSuggestions] = useState(0);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const isMobile = useMediaQuery(MOBILE_QUERY);
   const [drawerOpen, setDrawerOpen] = useState(false);
@@ -108,6 +110,13 @@ function VaultApp() {
     fetch('/api/wishlist').then(r => r.json()).then(w => setWishlistCount(w.filter(i => i.status === 'want').length)).catch(() => {});
   }, []);
 
+  const fetchSuggestions = useCallback(() => {
+    fetch('/api/suggestions/summary')
+      .then(r => (r && r.ok === false ? null : r.json()))
+      .then(d => setPendingSuggestions(d && typeof d.pending === 'number' ? d.pending : 0))
+      .catch(() => setPendingSuggestions(0));
+  }, []);
+
   const fetchCollections = useCallback(() => {
     fetch('/api/collections').then(r => r.json()).then(setCollections).catch(() => {});
   }, []);
@@ -132,7 +141,7 @@ function VaultApp() {
       .catch(() => setFacets(null));
   }, []);
 
-  useEffect(() => { fetchStats(); fetchQueueCount(); fetchCollections(); fetchWishlistCount(); }, [fetchStats, fetchQueueCount, fetchCollections, fetchWishlistCount]);
+  useEffect(() => { fetchStats(); fetchQueueCount(); fetchCollections(); fetchWishlistCount(); fetchSuggestions(); }, [fetchStats, fetchQueueCount, fetchCollections, fetchWishlistCount, fetchSuggestions]);
 
   // Poll background scan progress so a running scan is visible app-wide (even
   // with the Scan window closed), and auto-refresh the gallery when it finishes.
@@ -192,7 +201,8 @@ function VaultApp() {
   const openQueue = () => { closeDrawer(); setSelectedModel(null); setView('queue'); };
   const openWishlist = () => { closeDrawer(); setSelectedModel(null); setView('wishlist'); };
   const openScan = () => { closeDrawer(); setShowScan(true); };
-  const openOrganize = () => { closeDrawer(); setShowOrganize(true); };
+  const openOrganize = () => { closeDrawer(); setOrganizeTab(null); setShowOrganize(true); };
+  const openReview = () => { closeDrawer(); setShowScan(false); setOrganizeTab('review'); setShowOrganize(true); };
 
   const sidebarExpanded = isMobile ? true : sidebarOpen;
   const appClass = [
@@ -221,6 +231,8 @@ function VaultApp() {
         onFilterChange={setFilters}
         onScanClick={openScan}
         onOrganizeClick={openOrganize}
+        pendingSuggestions={pendingSuggestions}
+        onReviewClick={openReview}
         onHomeClick={goHome}
         showHidden={showHidden}
         onToggleHidden={() => setShowHidden(h => !h)}
@@ -262,6 +274,8 @@ function VaultApp() {
             refreshKey={refreshKey}
             collections={collections}
             onRefreshCollections={fetchCollections}
+            onOpenReview={openReview}
+            onSuggestionsChange={fetchSuggestions}
           />
         )}
         {view === 'detail' && selectedModel && (
@@ -272,6 +286,8 @@ function VaultApp() {
             onQueueChange={fetchQueueCount}
             collections={collections}
             onCollectionsChange={fetchCollections}
+            onOpenModel={openModel}
+            onSuggestionsChange={fetchSuggestions}
           />
         )}
         {view === 'queue' && (
@@ -291,11 +307,16 @@ function VaultApp() {
         <ScanModal
           onClose={() => { setShowScan(false); fetchStats(); setRefreshKey(k => k + 1); }}
           onScanComplete={() => { fetchStats(); setRefreshKey(k => k + 1); }}
+          filters={filters}
+          onOpenReview={openReview}
+          onEnrichDone={fetchSuggestions}
         />
       )}
       {showOrganize && (
         <OrganizeModal
-          onClose={() => { setShowOrganize(false); fetchStats(); }}
+          onClose={() => { setShowOrganize(false); fetchStats(); fetchSuggestions(); setRefreshKey(k => k + 1); }}
+          initialTab={organizeTab || undefined}
+          onSuggestionsChange={(s) => setPendingSuggestions(s && typeof s.pending === 'number' ? s.pending : 0)}
           libraryWritable={health ? health.libraryWritable : undefined}
           libraryPath={health?.libraryPath}
         />

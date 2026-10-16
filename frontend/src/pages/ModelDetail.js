@@ -5,7 +5,9 @@ import TaskLog from '../components/TaskLog';
 import ReleaseFileList from '../components/ReleaseFileList';
 import RenderHintPanel from '../components/RenderHintPanel';
 import Modal from '../components/Modal';
-import AttributionPanel, { hasAttributionData } from '../components/AttributionPanel';
+import AttributionPanel, { hasAttributionData, AiMark } from '../components/AttributionPanel';
+import { decideSummary, isTermLabel } from '../enrich';
+import { formatTerm } from '../library';
 import { asList } from '../library';
 import { useNotify } from '../components/Notices';
 import { apiSend, errorMessage } from '../api';
@@ -262,7 +264,7 @@ function useNarrow() {
   return narrow;
 }
 
-export default function ModelDetail({ modelId, onBack, onSaved, onQueueChange, collections, onCollectionsChange }) {
+export default function ModelDetail({ modelId, onBack, onSaved, onQueueChange, collections, onCollectionsChange, onOpenModel, onSuggestionsChange }) {
   const notify = useNotify();
   const narrow = useNarrow();
   const [model, setModel] = useState(null);
@@ -362,6 +364,45 @@ export default function ModelDetail({ modelId, onBack, onSaved, onQueueChange, c
     fetch('/api/queue').then(r => r.json())
       .then(q => setInQueue(Array.isArray(q) && q.some(i => i.model_id === modelId)))
       .catch(() => {});
+  };
+
+  // Quiet reload (no spinner) after attribution edits or AI decisions
+  const refreshModel = async () => {
+    try {
+      const r = await fetch(`/api/models/${modelId}`);
+      const m = await r.json();
+      if (m && m.id) { setModel(m); setName(m.name || ''); setTags(m.tags || []); }
+    } catch {}
+  };
+
+  const saveAttributionField = async (fields) => {
+    try {
+      await apiSend(`/api/models/${modelId}`, 'PATCH', fields);
+      notify('Saved. Scans and AI will keep your value.', { type: 'success' });
+      await refreshModel();
+      if (onSaved) onSaved();
+      if (onSuggestionsChange) onSuggestionsChange();
+      return true;
+    } catch (e) { notify(`Couldn't save: ${errorMessage(e)}`); return false; }
+  };
+
+  const decideSuggestion = async (ids, decision, item) => {
+    try {
+      const r = await apiSend('/api/suggestions/decide', 'POST', { ids, decision });
+      const errs = (r && r.errors) || [];
+      if (errs.length) { notify(`Couldn't ${decision}: ${errs[0].error}`); return; }
+      if (onSuggestionsChange) onSuggestionsChange();
+      if (item && item.type === 'merge' && decision === 'accept' && r && r.merged) {
+        const intoOther = item.model && item.model.id === model.id && item.target;
+        notify(`Merged "${item.model?.name}" into "${item.target?.name}". Tags, notes and collections were kept.`, { type: 'success' });
+        if (onSaved) onSaved();
+        if (intoOther && onOpenModel) { onOpenModel(item.target); return; }
+      } else {
+        notify(decideSummary(r), { type: 'success' });
+        if (onSaved) onSaved();
+      }
+      await refreshModel();
+    } catch (e) { notify(`Couldn't ${decision} the suggestion: ${errorMessage(e)}`); }
   };
 
   const toggleQueue = async () => {
@@ -506,6 +547,23 @@ export default function ModelDetail({ modelId, onBack, onSaved, onQueueChange, c
         </div>
       </div>
 
+      {Array.isArray(model.siblings) && model.siblings.length > 0 && (
+        <nav className="detail-siblings" aria-label="Other releases of this character">
+          <span className="detail-siblings-label">Other releases</span>
+          {model.siblings.map(sib => {
+            const rel = sib.release_label && !isTermLabel(sib.release_label) ? sib.release_label : (sib.release_term ? formatTerm(sib.release_term) : sib.release_label);
+            return (
+              <button key={sib.id} type="button" className="sibling-link" onClick={() => onOpenModel && onOpenModel(sib)}
+                title={sib.release_label || undefined} disabled={!onOpenModel}>
+                <span className="sibling-name">{sib.name}</span>
+                {rel && <span className="sibling-rel">{rel}</span>}
+                {Array.isArray(sib.editions) && sib.editions.length > 0 && <span className="sibling-eds">{sib.editions.join(' · ')}</span>}
+              </button>
+            );
+          })}
+        </nav>
+      )}
+
       <div className="detail-scroll">
         {/* Main layout — expands to 3 cols when assistant is open, 1 col on phones */}
         <div className={`detail-layout ${showAssistant ? 'with-assistant' : ''}`}>
@@ -583,7 +641,7 @@ export default function ModelDetail({ modelId, onBack, onSaved, onQueueChange, c
               </div>
             )}
 
-            {narrow && <div style={{ marginBottom: 16 }}><AttributionPanel model={model} /></div>}
+            {narrow && <div style={{ marginBottom: 16 }}><AttributionPanel model={model} onSaveField={saveAttributionField} onDecide={decideSuggestion} /></div>}
 
             {/* Image tools */}
             <div className="detail-card" style={{ marginBottom: 16 }}>
@@ -711,7 +769,7 @@ export default function ModelDetail({ modelId, onBack, onSaved, onQueueChange, c
 
           {/* Middle: metadata panel */}
           <div className="detail-panel">
-            {!narrow && <AttributionPanel model={model} />}
+            {!narrow && <AttributionPanel model={model} onSaveField={saveAttributionField} onDecide={decideSuggestion} />}
             <div className="detail-card">
               <div className="detail-card-title">Info</div>
               {!showAttribution && <div className="meta-row"><span className="meta-label">Creator</span><span className="meta-val">{model.creator_name || '—'}</span></div>}
@@ -739,7 +797,7 @@ export default function ModelDetail({ modelId, onBack, onSaved, onQueueChange, c
             </div>
 
             <div className="detail-card">
-              <div className="detail-card-title"><label htmlFor={`tag-input-${modelId}`}>Tags</label></div>
+              <div className="detail-card-title"><label htmlFor={`tag-input-${modelId}`}>Tags</label> <AiMark attribution={model.attribution} enrichment={model.enrichment} field="tags" /></div>
               <div className="tags-input" onClick={e => { const i = e.currentTarget.querySelector('input'); if (i && e.target === e.currentTarget) i.focus(); }}>
                 {tags.map(t => (
                   <span key={t} className="tag-chip">{t}<button onClick={() => removeTag(t)} aria-label={`Remove tag ${t}`}>×</button></span>

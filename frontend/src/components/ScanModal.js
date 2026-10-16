@@ -1,6 +1,9 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, Suspense } from 'react';
 import TaskLog from './TaskLog';
 import Modal, { useUniqueId } from './Modal';
+
+// Enrich metadata (AI) lives in its own chunk; it is also used for "Enrich selected".
+const EnrichPanel = React.lazy(() => import('./EnrichPanel'));
 
 const RECONNECT_BASE_MS = 1000;
 const RECONNECT_MAX_MS = 15000;
@@ -19,7 +22,7 @@ async function fetchScanStatus(timeoutMs = 5000) {
   }
 }
 
-export default function ScanModal({ onClose, onScanComplete }) {
+export default function ScanModal({ onClose, onScanComplete, filters, onOpenReview, onEnrichDone }) {
   const [path, setPath] = useState('/library');
   const [force, setForce] = useState(false);
   const [running, setRunning] = useState(false);
@@ -30,13 +33,7 @@ export default function ScanModal({ onClose, onScanComplete }) {
   const [roots, setRoots] = useState(null); // mounted library roots (read-only)
   const [libraryPath, setLibraryPath] = useState(''); // backend LIBRARY_PATH (scan-everything target)
   const [rootFilter, setRootFilter] = useState('');
-  const [aiModel, setAiModel] = useState(() => localStorage.getItem('vault_ai_model') || '');
-  const [aiModels, setAiModels] = useState([]);
-  const [estimate, setEstimate] = useState(null);
-  const [visionTagging, setVisionTagging] = useState(false);
-  const visionEsRef = useRef(null);
-  const [tagging, setTagging] = useState(false);
-  const [, setTagResult] = useState(null);
+  const [enriching, setEnriching] = useState(false);
   const [findingImages, setFindingImages] = useState(false);
   const [apiKey, setApiKey] = useState(() => localStorage.getItem('claude_api_key') || '');
   const [showKey, setShowKey] = useState(false);
@@ -201,40 +198,6 @@ export default function ScanModal({ onClose, onScanComplete }) {
       .catch(() => setRoots([]));
   }, []);
 
-  // Load available AI models for the tagging model selector
-  useEffect(() => {
-    fetch('/api/ai/models')
-      .then(r => r.json())
-      .then(d => { setAiModels(d.models || []); setAiModel(m => m || d.default || ''); })
-      .catch(() => {});
-  }, []);
-
-  const fetchEstimate = async (vision = false) => {
-    const params = new URLSearchParams();
-    if (aiModel) params.set('model', aiModel);
-    if (vision) params.set('vision', '1');
-    try { const r = await fetch(`/api/ai/tag-estimate?${params.toString()}`); setEstimate({ ...(await r.json()), vision }); } catch {}
-  };
-
-  const visionTags = (trial = true) => {
-    setVisionTagging(true);
-    const params = new URLSearchParams();
-    if (apiKey) params.set('key', apiKey);
-    if (aiModel) params.set('model', aiModel);
-    if (!trial) params.set('trial', '0');
-    const es = new EventSource(`/api/ai/vision-tags?${params.toString()}`);
-    visionEsRef.current = es;
-    es.onmessage = (e) => {
-      const data = JSON.parse(e.data);
-      if (data.type === 'done') { setVisionTagging(false); es.close(); if (onScanComplete) onScanComplete(); }
-      else setLines(l => [...l, data]);
-    };
-    es.onerror = () => {
-      setLines(l => [...l, { level: 'error', msg: 'Vision tagging connection lost', ts: new Date().toISOString() }]);
-      setVisionTagging(false); es.close();
-    };
-  };
-
   // Cleanup SSE on unmount
   useEffect(() => () => esRef.current?.close(), []);
 
@@ -316,37 +279,6 @@ export default function ScanModal({ onClose, onScanComplete }) {
     }
   };
 
-  const tagEsRef = useRef(null);
-
-  const generateTags = () => {
-    setTagging(true);
-    setTagResult(null);
-
-    const tagParams = new URLSearchParams();
-    if (apiKey) tagParams.set('key', apiKey);
-    if (aiModel) tagParams.set('model', aiModel);
-    const es = new EventSource(`/api/ai/generate-tags?${tagParams.toString()}`);
-    tagEsRef.current = es;
-
-    es.onmessage = (e) => {
-      const data = JSON.parse(e.data);
-      if (data.type === 'done') {
-        setTagging(false);
-        setTagResult(data);
-        es.close();
-        if (onScanComplete) onScanComplete(); // refresh gallery
-      } else {
-        setLines(l => [...l, data]);
-      }
-    };
-
-    es.onerror = () => {
-      setLines(l => [...l, { level: 'error', msg: 'Tag generation connection lost — check the server logs', ts: new Date().toISOString() }]);
-      setTagging(false);
-      es.close();
-    };
-  };
-
   const [imgResult, setImgResult] = useState(null); // stores last find-images result for "continue all"
 
   const findImages = (trial = true) => {
@@ -379,9 +311,9 @@ export default function ScanModal({ onClose, onScanComplete }) {
   };
 
   // Cleanup SSE connections on unmount
-  useEffect(() => () => { imgEsRef.current?.close(); tagEsRef.current?.close(); visionEsRef.current?.close(); }, []);
+  useEffect(() => () => { imgEsRef.current?.close(); }, []);
 
-  const busyAi = tagging || findingImages || visionTagging;
+  const busyAi = enriching || findingImages;
 
   if (checking) {
     return (
@@ -536,29 +468,13 @@ export default function ScanModal({ onClose, onScanComplete }) {
           )}
         </div>
 
-        {/* AI model + cost estimate */}
-        <div style={{ marginTop: 12, display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-          <label htmlFor="scan-ai-model" style={{ fontSize: 10, fontFamily: 'var(--font-mono)', color: 'var(--text-faint)', letterSpacing: 1 }}>AI MODEL</label>
-          <select
-            id="scan-ai-model"
-            value={aiModel}
-            onChange={e => { setAiModel(e.target.value); localStorage.setItem('vault_ai_model', e.target.value); setEstimate(null); }}
-            style={{ background: 'var(--bg3)', border: '1px solid var(--border)', borderRadius: 4, color: 'var(--text)', padding: '5px 8px', fontSize: 11, fontFamily: 'var(--font-mono)' }}
-          >
-            {aiModels.length === 0 && <option value="">(default)</option>}
-            {aiModels.map(m => <option key={m.id} value={m.id}>{m.label}</option>)}
-          </select>
-          <button onClick={() => fetchEstimate(false)}
-            style={{ background: 'var(--bg3)', border: '1px solid var(--border)', borderRadius: 4, color: 'var(--text-muted)', padding: '5px 10px', cursor: 'pointer', fontSize: 11, fontFamily: 'var(--font-mono)' }}
-            title="Rough cost estimate for tagging the whole library">
-            Estimate cost
-          </button>
-          {estimate && (
-            <span style={{ fontSize: 11, fontFamily: 'var(--font-mono)', color: 'var(--text-muted)' }}>
-              ~{estimate.models} models{estimate.vision ? ' (vision)' : ''} · <span style={{ color: 'var(--accent)' }}>~${estimate.estCostUsd}</span> <span style={{ color: 'var(--text-faint)' }}>(rough)</span>
-            </span>
-          )}
-        </div>
+        {/* AI: enrich metadata (replaces the old Generate Tags / Tags from Images) */}
+        <Suspense fallback={<div className="modal-hint">Loading AI tools…</div>}>
+          <EnrichPanel apiKey={apiKey} filters={filters} disabled={running || findingImages}
+            onRunningChange={setEnriching}
+            onOpenReview={onOpenReview}
+            onDone={(r) => { if (onScanComplete) onScanComplete(); if (onEnrichDone) onEnrichDone(r); }} />
+        </Suspense>
 
         {reconnecting && (
           <div className="scan-reconnecting" role="status">
@@ -578,7 +494,7 @@ export default function ScanModal({ onClose, onScanComplete }) {
         )}
 
         <div className="modal-actions" style={{ flexWrap: 'wrap' }}>
-          <button className="btn-cancel" onClick={onClose} disabled={tagging || findingImages || visionTagging}
+          <button className="btn-cancel" onClick={onClose} disabled={busyAi}
             title={running ? 'Hide this window — the scan keeps running in the background' : undefined}>
             {running ? '▸ Minimize (keep scanning)' : done ? 'Close' : 'Cancel'}
           </button>
@@ -589,28 +505,12 @@ export default function ScanModal({ onClose, onScanComplete }) {
               ■ Stop Scan
             </button>
           )}
-          <button className="btn-primary" onClick={() => { setDone(false); startScan(); }} disabled={running || tagging || findingImages || visionTagging}>
+          <button className="btn-primary" onClick={() => { setDone(false); startScan(); }} disabled={running || busyAi}>
             {reconnecting ? 'Reconnecting…' : running ? 'Scanning…' : done ? 'Rescan' : 'Start Scan'}
           </button>
           <button
-            onClick={generateTags}
-            disabled={running || tagging || findingImages || visionTagging || !apiKey}
-            className="btn-primary btn-ai btn-ai-purple"
-            title={apiKey ? 'Uses Claude API credits — auto-generate tags for all models from names, creators, and folder structure' : 'Add a Claude API key above to enable'}
-          >
-            {tagging ? 'Tagging…' : '$ Generate Tags'}
-          </button>
-          <button
-            onClick={() => visionTags(true)}
-            disabled={running || tagging || findingImages || visionTagging || !apiKey}
-            className="btn-primary btn-ai btn-ai-purple"
-            title={apiKey ? 'Uses Claude API credits (vision — costs more) — analyses each render image to identify and tag the model' : 'Add a Claude API key above to enable'}
-          >
-            {visionTagging ? 'Looking…' : '$ 👁 Tags from Images (trial 10)'}
-          </button>
-          <button
             onClick={() => findImages(true)}
-            disabled={running || tagging || findingImages || visionTagging || !apiKey}
+            disabled={running || busyAi || !apiKey}
             className="btn-primary btn-ai btn-ai-blue"
             title={apiKey ? 'Uses Claude API credits — finds missing thumbnails online (trial: 10 best candidates first)' : 'Add a Claude API key above to enable'}
           >
@@ -619,7 +519,7 @@ export default function ScanModal({ onClose, onScanComplete }) {
           {imgResult && imgResult.remaining > 0 && (
             <button
               onClick={() => findImages(false)}
-              disabled={running || tagging || findingImages || visionTagging || !apiKey}
+              disabled={running || busyAi || !apiKey}
               className="btn-primary btn-ai btn-ai-blue strong"
               title={apiKey ? `Uses Claude API credits — process all ${imgResult.remaining} remaining models` : 'Add a Claude API key above to enable'}
             >

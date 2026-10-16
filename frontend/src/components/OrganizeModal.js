@@ -6,6 +6,9 @@ import { useNotify } from './Notices';
 import { apiGet, apiSend, errorMessage } from '../api';
 // Only the Health → Attribution section needs it; keep it out of the main bundle.
 const AttributionHealth = React.lazy(() => import('./AttributionHealth'));
+// The Review tab (AI suggestions) is its own chunk too.
+const ReviewTab = React.lazy(() => import('./ReviewTab'));
+const OrganizerExport = React.lazy(() => import('./OrganizerExport'));
 
 const READ_ONLY_TIP = 'Library is mounted read-only';
 
@@ -27,6 +30,7 @@ function TabBar({ tabs, active, onChange, label }) {
           onClick={() => onChange(t.id)}
         >
           {t.icon} {t.label}
+          {t.badge > 0 && <span className="org-tab-badge" aria-label={`${t.badge} pending`}>{t.badge > 999 ? '999+' : t.badge}</span>}
         </button>
       ))}
     </div>
@@ -690,6 +694,7 @@ function HealthTab({ onAnnotateThese, libraryPath }) {
     { id: 'duplicates',   label: 'Similar Names',   icon: '⧉', count: data?.summary?.duplicatePairs },
     ...(data?.summary?.fileDuplicates !== undefined ? [{ id: 'fileDuplicates', label: 'Duplicate Files', icon: '⧉', count: data.summary.fileDuplicates }] : []),
     ...(data?.summary?.conflictFolders !== undefined ? [{ id: 'conflicts', label: 'Conflict Copies', icon: '⚠', count: data.summary.conflictFolders }] : []),
+    { id: 'export',       label: 'Organizer Export', icon: '⇪', noBadge: true },
     { id: 'integrity',    label: 'Integrity',        icon: '🔍', count: integrityData?.summary?.missingFolders },
     { id: 'emptyFolders', label: 'Empty Folders',   icon: '📂', count: data?.summary?.emptyFolders },
     { id: 'noThumbnail',  label: 'No Thumbnail',    icon: '🖼', count: data?.summary?.noThumbnail },
@@ -751,6 +756,12 @@ function HealthTab({ onAnnotateThese, libraryPath }) {
   function renderSection() {
     if (!data) return null;
     switch (activeSection) {
+      case 'export':
+        return (
+          <React.Suspense fallback={<div className="org-hint-inline">Loading…</div>}>
+            <div className="attr-health"><OrganizerExport /></div>
+          </React.Suspense>
+        );
       case 'attribution':
         return attrSummary
           ? (
@@ -890,7 +901,7 @@ function HealthTab({ onAnnotateThese, libraryPath }) {
                 className={`org-health-section-btn ${activeSection === s.id ? 'active' : ''}`}
                 onClick={() => setActiveSection(s.id)}>
                 {s.icon} {s.label}
-                <span className={`org-health-badge ${s.count > 0 ? 'warn' : 'ok'}`}>{s.count ?? '…'}</span>
+                {!s.noBadge && <span className={`org-health-badge ${s.count > 0 ? 'warn' : 'ok'}`}>{s.count ?? '…'}</span>}
               </button>
             ))}
           </div>
@@ -1677,15 +1688,27 @@ function AdvancedTab({ libraryWritable }) {
 }
 
 const TABS = [
+  { id: 'review',    label: 'Review',    icon: '✓' },
   { id: 'annotate',  label: 'Annotate',  icon: '✦' },
   { id: 'health',    label: 'Health',    icon: '⚕' },
   { id: 'franchise', label: 'Franchise', icon: '🗂' },
   { id: 'advanced',  label: 'Advanced',  icon: '⚙' },
 ];
 
-export default function OrganizeModal({ onClose, libraryWritable, libraryPath }) {
+export default function OrganizeModal({ onClose, libraryWritable, libraryPath, initialTab, onSuggestionsChange }) {
   const titleId = useUniqueId('org-title');
-  const [tab, setTab] = useState('annotate');
+  const [tab, setTab] = useState(initialTab || 'annotate');
+  const [pending, setPending] = useState(null);
+  const onSuggestionsChangeRef = useRef(onSuggestionsChange);
+  onSuggestionsChangeRef.current = onSuggestionsChange;
+  const updateSummary = useCallback((s) => {
+    setPending(s && typeof s.pending === 'number' ? s.pending : null);
+    if (onSuggestionsChangeRef.current) onSuggestionsChangeRef.current(s);
+  }, []);
+  useEffect(() => {
+    apiGet('/api/suggestions/summary').then(updateSummary).catch(() => setPending(null));
+  }, [updateSummary]);
+  const tabs = TABS.map(t => (t.id === 'review' ? { ...t, badge: pending || 0 } : t));
   // Shared target for health → annotate "Annotate These" flow
   const [annotateTarget, setAnnotateTarget] = useState(null); // { modelIds, label }
 
@@ -1699,7 +1722,7 @@ export default function OrganizeModal({ onClose, libraryWritable, libraryPath })
       <div className="org-header">
         <div>
           <div className="org-title" id={titleId}>🗂 ORGANIZE LIBRARY</div>
-          <div className="org-subtitle">Annotate with AI · Health & fixes · Franchises · Advanced tools</div>
+          <div className="org-subtitle">Review AI suggestions · Annotate with AI · Health & fixes · Franchises · Advanced tools</div>
         </div>
         <button className="org-close" onClick={onClose} aria-label="Close Organize Library">✕</button>
       </div>
@@ -1708,8 +1731,13 @@ export default function OrganizeModal({ onClose, libraryWritable, libraryPath })
         <div className="org-readonly-banner" role="note">🔒 {READ_ONLY_TIP}: tools that would move files generate a script for you to run instead.</div>
       )}
 
-      <TabBar tabs={TABS} active={tab} onChange={setTab} label="Organize sections" />
+      <TabBar tabs={tabs} active={tab} onChange={setTab} label="Organize sections" />
 
+      {tab === 'review' && (
+        <React.Suspense fallback={<div className="org-tab-body"><div className="org-hint-inline">Loading…</div></div>}>
+          <ReviewTab onSummary={updateSummary} />
+        </React.Suspense>
+      )}
       {tab === 'annotate'  && <AnnotateTab target={annotateTarget} onClearTarget={() => setAnnotateTarget(null)} />}
       {tab === 'health'    && <HealthTab onAnnotateThese={handleAnnotateThese} libraryPath={libraryPath} />}
       {tab === 'franchise' && <FranchiseTab onAnnotateThese={handleAnnotateThese} />}
