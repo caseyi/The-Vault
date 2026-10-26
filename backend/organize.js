@@ -935,7 +935,7 @@ router.post('/fix-thumbnails', async (req, res) => {
         if (imgs.length) break;
       }
       if (imgs.length) {
-        db.prepare(`UPDATE models SET images = ?, thumbnail_path = ?, updated_at = datetime('now') WHERE id = ?`)
+        db.prepare(`UPDATE models SET images = ?, thumbnail_path = ?, thumb_source = 'archive', updated_at = datetime('now') WHERE id = ?`)
           .run(JSON.stringify(imgs), imgs[0], m.id);
         extracted++;
       }

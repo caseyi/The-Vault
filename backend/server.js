@@ -31,6 +31,8 @@ const enrich = require('./lib/enrich');
 const organizerExport = require('./lib/organizer-export');
 const folderRolesLib = require('./lib/folder-roles');
 const { folderRolesRouter } = require('./folder-roles-routes');
+const thumbs = require('./lib/thumbs');
+const pictures = require('./lib/pictures');
 
 const app = wrapAsyncRoutes(express());
 const PORT = process.env.PORT || 3001;
@@ -53,7 +55,9 @@ try { APP_VERSION = JSON.parse(fs.readFileSync(path.join(__dirname, 'version.jso
 app.disable('x-powered-by');
 app.use(originPolicy());
 app.use(express.json({ limit: '10mb' }));
-app.use('/images', express.static(IMAGES_DIR));
+// names can be reused (re-extract), so a week + ETag rather than immutable; /thumbs URLs carry a version
+app.use('/images', express.static(IMAGES_DIR, { maxAge: 7 * 24 * 3600 * 1000, etag: true }));
+app.get('/thumbs/*', thumbs.serveThumb);
 app.use('/api/organize', organizeRouter);
 // folder roles (docs/folder-roles.md): marks from _Meta/folder_roles.csv and the app
 app.use('/api/folder-roles', folderRolesRouter({ db, root: LIBRARY_PATH, getLibraries: () => librariesFor() }));
@@ -86,6 +90,19 @@ async function getMetaSummary({ reload = false } = {}) {
   return loadMetaSummary();
 }
 const parseJSON = (s, d) => { try { const v = JSON.parse(s); return v == null ? d : v; } catch { return d; } };
+
+/**
+ * New pictures appended after a card's existing ones (scrape, zip picker). The thumbnail stays
+ * unless the card had none or only a mesh render; a user-chosen thumbnail always stays.
+ */
+function appendPictures(model, saved, source) {
+  const prev = parseJSON(model.images || '[]', []);
+  const m = pictures.mergeImages(model, saved, source);
+  // keep the old order (existing first), except that a mesh render goes last
+  const renders = prev.filter(i => m.images.indexOf(i) >= 0 && model.thumb_source === 'stl' && i.endsWith('/' + pictures.PREVIEW_NAME));
+  const images = [...new Set([...prev.filter(i => !renders.includes(i)), ...saved, ...renders])];
+  return { images, thumbnail_path: m.thumbnail_path || images[0] || null, thumb_source: m.thumb_source };
+}
 
 /** Libraries (top-level folders) with their labels: the health cache, else read now. */
 function librariesSync() {
@@ -182,6 +199,7 @@ function startScanWorker(workerData, startLogLines) {
         metaSummary = freshMeta || null; // the scan's own _Meta; null → reloaded off-thread on demand
         gapsCache = null;
         refreshHealthCache();
+        afterScanPictures();
       } else {
         pushLog('error', `✗ Error: ${m.error}`);
         scanSummary = { type: 'done', success: false, error: m.error };
@@ -345,11 +363,17 @@ function addLayoutFilters(q, where, params) {
 
 /** List item: existing fields + parsed layout fields; heavy JSON (products) only on the detail route. */
 function shapeModel(m) {
-  const { products, attribution, enrichment, ...rest } = m;
+  const { products, attribution, enrichment, thumb_attempt, ...rest } = m;
+  const images = parseJSON(m.images || '[]', []);
+  const cardImgs = thumbs.cardImages(images, m.thumbnail_path);
+  const thumbUrls = cardImgs.map(i => thumbs.thumbUrl(i, 480)).filter(Boolean);
   return {
     ...rest,
     tags: parseJSON(m.tags || '[]', []),
-    images: parseJSON(m.images || '[]', []),
+    images,
+    thumb_url: m.thumbnail_path ? thumbs.thumbUrl(m.thumbnail_path, 480) : (thumbUrls[0] || null),
+    thumb_urls: thumbUrls,
+    thumb_source: m.thumb_source || null,
     kind: m.kind || 'model',
     libraries: parseJSON(m.libraries, m.library ? [m.library] : []),
     editions: parseJSON(m.editions, []),
@@ -483,8 +507,10 @@ app.get('/api/models/:id(\\d+)', (req, res) => {
   const siblings = relBase ? db.prepare(`SELECT id, name, release_term, release_label, editions FROM models
       WHERE work_key LIKE ? ESCAPE '\\' AND id != ? AND folded_into IS NULL ORDER BY release_term, name`)
     .all(`${likeEscape(relBase)}|r:%`, model.id).map(r => ({ ...r, editions: parseJSON(r.editions, []) })) : [];
+  const shaped = shapeModel(model);
   res.json({
-    ...shapeModel(model),
+    ...shaped,
+    thumb_urls: shaped.images.map(i => thumbs.thumbUrl(i, 1280)),
     siblings,
     enrichment: en && en.at ? { at: en.at, model: en.model || null, runId: en.runId || null } : null,
     suggestions: enrich.suggestionsFor(db, model.id),
@@ -533,7 +559,11 @@ app.patch('/api/models/:id(\\d+)', (req, res) => {
     if (name_locked === undefined) updates.push('name_locked = 1');
   }
   if (name_locked !== undefined) { updates.push('name_locked = ?'); params.push(name_locked ? 1 : 0); }
-  if (thumbnail_path !== undefined) { updates.push('thumbnail_path = ?'); params.push(thumbnail_path || null); }
+  if (thumbnail_path !== undefined) {
+    // a thumbnail the user picked is theirs: scans and picture finding never replace it
+    updates.push('thumbnail_path = ?'); params.push(thumbnail_path || null);
+    updates.push('thumb_source = ?'); params.push(thumbnail_path ? 'user' : null);
+  }
   if (hidden !== undefined) { updates.push('hidden = ?'); params.push(hidden ? 1 : 0); }
   if (franchise !== undefined) { updates.push('franchise = ?'); params.push(franchise || null); }
   if (team !== undefined) { updates.push('team = ?'); params.push(team || null); }
@@ -690,11 +720,10 @@ async function reextractCreator(req, res) {
     }
 
     if (freshImages.length > 0) {
-      let existing = [];
-      try { existing = JSON.parse(model.images || '[]'); } catch {}
-      const merged = [...new Set([...freshImages, ...existing])];
-      db.prepare(`UPDATE models SET images=?, thumbnail_path=?, folder_hash=NULL, updated_at=datetime('now') WHERE id=?`)
-        .run(JSON.stringify(merged), merged[0], model.id);
+      thumbs.removeThumbs(model.uuid);
+      const m = pictures.mergeImages(model, [...new Set(freshImages)], 'archive', { replaceThumb: true });
+      db.prepare(`UPDATE models SET images=?, thumbnail_path=?, thumb_source=?, folder_hash=NULL, updated_at=datetime('now') WHERE id=?`)
+        .run(JSON.stringify(m.images), m.thumbnail_path, m.thumb_source, model.id);
       send('img', `     → ${freshImages.length} image(s) saved`);
       updated++;
     } else {
@@ -981,10 +1010,9 @@ app.get('/api/models/:id(\\d+)/scrape-stream', async (req, res) => {
 
     send('success', `✓ Downloaded ${savedPaths.length} image(s)`);
 
-    const existingImages = JSON.parse(model.images || '[]');
-    const allImages = [...new Set([...existingImages, ...savedPaths])];
-    db.prepare(`UPDATE models SET images=?, thumbnail_path=?, source_url=?, updated_at=datetime('now') WHERE id=?`)
-      .run(JSON.stringify(allImages), allImages[0], finalUrl, model.id);
+    const pm = appendPictures(model, savedPaths, 'web');
+    db.prepare(`UPDATE models SET images=?, thumbnail_path=?, thumb_source=?, source_url=?, updated_at=datetime('now') WHERE id=?`)
+      .run(JSON.stringify(pm.images), pm.thumbnail_path, pm.thumb_source, finalUrl, model.id);
     if (sourceSite && sourceSite !== 'unknown') {
       db.prepare(`UPDATE models SET source_site=? WHERE id=?`).run(sourceSite, model.id);
     }
@@ -1033,12 +1061,9 @@ app.post('/api/models/:id(\\d+)/scrape', async (req, res) => {
 
     sendLog('success', `✓ Downloaded ${savedPaths.length} image(s)`);
 
-    const existingImages = JSON.parse(model.images || '[]');
-    const allImages = [...new Set([...existingImages, ...savedPaths])];
-    const thumbnail = allImages[0];
-
-    db.prepare(`UPDATE models SET images = ?, thumbnail_path = ?, source_url = ?, updated_at = datetime('now') WHERE id = ?`)
-      .run(JSON.stringify(allImages), thumbnail, finalUrl, model.id);
+    const pm = appendPictures(model, savedPaths, 'web');
+    db.prepare(`UPDATE models SET images = ?, thumbnail_path = ?, thumb_source = ?, source_url = ?, updated_at = datetime('now') WHERE id = ?`)
+      .run(JSON.stringify(pm.images), pm.thumbnail_path, pm.thumb_source, finalUrl, model.id);
     if (sourceSite && sourceSite !== 'unknown') {
       db.prepare(`UPDATE models SET source_site = ? WHERE id = ?`).run(sourceSite, model.id);
     }
@@ -1125,19 +1150,122 @@ app.post('/api/files/:fileId/extract-images', async (req, res) => {
     if (!names.length) return res.status(422).json({ error: 'No image files found in this ZIP' });
     const savedPaths = [...new Set(names)].map(n => `/images/${model.uuid}/${n}`);
 
-    // Merge with existing images
-    const existingImages = JSON.parse(model.images || '[]');
-    const allImages = [...new Set([...existingImages, ...savedPaths])];
-    const thumbnail = allImages[0];
-
+    // Merge with existing images (the user's thumbnail stays; new pictures replace a mesh render)
+    const pm = appendPictures(model, savedPaths, 'archive');
+    const allImages = pm.images;
     db.prepare(`
-      UPDATE models SET images = ?, thumbnail_path = ?, updated_at = datetime('now') WHERE id = ?
-    `).run(JSON.stringify(allImages), thumbnail, model.id);
+      UPDATE models SET images = ?, thumbnail_path = ?, thumb_source = ?, updated_at = datetime('now') WHERE id = ?
+    `).run(JSON.stringify(allImages), pm.thumbnail_path, pm.thumb_source, model.id);
 
     res.json({ success: true, extracted: savedPaths.length, images: savedPaths, total: allImages.length });
   } catch (e) {
     res.status(500).json({ error: `Extraction failed: ${e.message}` });
   }
+});
+
+// ── Thumbnails and pictures (docs/thumbnails.md) ─────────────────────────────
+
+// Off-main-thread jobs (thumb-worker.js). One fill job at a time; a background fill (queued after
+// a scan) gives way to one the user starts.
+let fillJob = null; // { worker, background, startedAt, scope, steps, listeners:Set, last }
+const thumbsAutomatic = () => process.env.THUMBS_AUTO === '1' || (process.env.THUMBS_AUTO !== '0' && !process.env.JEST_WORKER_ID);
+
+function startFillJob({ scope = 'missing', steps = ['peek', 'render'], renderOnly = false, background = false }) {
+  const worker = new Worker(path.join(__dirname, 'thumb-worker.js'), { workerData: { mode: 'fill', scope, steps, renderOnly }, env: { ...process.env } });
+  const job = { worker, background, scope, steps: renderOnly ? ['render'] : steps, startedAt: new Date().toISOString(), listeners: new Set(), last: null, finished: false };
+  const emit = (m) => { for (const fn of job.listeners) { try { fn(m); } catch {} } };
+  const finish = (m) => {
+    if (job.finished) return;
+    job.finished = true;
+    if (fillJob === job) fillJob = null;
+    emit(m);
+    if (thumbsAutomatic()) { try { thumbs.fillMissing(db); } catch {} }
+  };
+  worker.on('message', (m) => {
+    if (m.type === 'done') {
+      const r = m.result || {};
+      return finish(m.success ? { type: 'done', success: true, done: r.done || 0, total: r.total || 0, found: r.found || {}, failed: r.failed || 0 } : { type: 'done', success: false, error: m.error });
+    }
+    if (m.type === 'progress') job.last = m;
+    emit(m.type === 'log' ? { level: m.level, msg: m.msg, ts: new Date().toISOString() } : m);
+  });
+  worker.on('error', (e) => finish({ type: 'done', success: false, error: e.message }));
+  worker.on('exit', () => finish({ type: 'done', success: false, error: 'Stopped' }));
+  fillJob = job;
+  return job;
+}
+function stopFillJob() {
+  const job = fillJob;
+  if (!job) return Promise.resolve();
+  fillJob = null;
+  return job.worker.terminate().catch(() => {});
+}
+
+/** After a scan: card-size thumbs for new pictures, and a mesh render for cards still without one. */
+function afterScanPictures() {
+  if (!thumbsAutomatic()) return;
+  try { thumbs.fillMissing(db); } catch (e) { console.warn('[thumbs]', e.message); }
+  if (fillJob || process.env.THUMBS_RENDER_AFTER_SCAN === '0') return;
+  try { startFillJob({ scope: 'missing', renderOnly: true, background: true }); } catch (e) { console.warn('[thumbs] render job:', e.message); }
+}
+
+app.get('/api/thumbs/status', (req, res) => {
+  const st = thumbs.status(db);
+  st.job = fillJob ? { scope: fillJob.scope, steps: fillJob.steps, background: fillJob.background, startedAt: fillJob.startedAt, progress: fillJob.last } : null;
+  res.json(st);
+});
+
+app.post('/api/thumbs/rebuild', (req, res) => {
+  res.json({ ok: true, queued: thumbs.rebuild(db) });
+});
+
+app.get('/api/thumbs/fill', async (req, res) => {
+  const scope = req.query.scope === 'all' ? 'all' : 'missing';
+  const steps = String(req.query.steps || 'peek,render').split(',').map(x => x.trim()).filter(x => x === 'peek' || x === 'render');
+  if (fillJob && !fillJob.background) {
+    return res.status(409).json({ error: `Finding pictures is already running (started ${fillJob.startedAt}).`, running: { scope: fillJob.scope, steps: fillJob.steps, startedAt: fillJob.startedAt } });
+  }
+  if (fillJob) await stopFillJob(); // the background render after a scan gives way
+  const sse = openSSE(req, res);
+  let job;
+  try { job = startFillJob({ scope, steps }); } catch (e) { return sse.end({ type: 'done', success: false, error: e.message }); }
+  sse.send({ level: 'info', msg: `Finding pictures for ${scope === 'all' ? 'all cards without a real picture' : 'cards without a picture'}…`, ts: new Date().toISOString() });
+  job.listeners.add((m) => { if (m.type === 'done') sse.end(m); else sse.send(m); });
+  sse.onAbort(() => { if (fillJob === job) stopFillJob(); });
+});
+
+/** A card's files, confined to the library. */
+function cardFiles(id) {
+  return db.prepare('SELECT filename, filepath, filesize FROM model_files WHERE model_id = ?').all(id).filter(f => tryConfine(f.filepath));
+}
+
+app.get('/api/models/:id(\\d+)/meshes', async (req, res) => {
+  const model = db.prepare('SELECT id FROM models WHERE id = ?').get(req.params.id);
+  if (!model) return res.status(404).json({ error: 'Not found' });
+  const { loose, inZip } = await pictures.meshCandidates(cardFiles(model.id));
+  const files = [...loose, ...inZip].map(c => ({ path: c.id, label: c.label, size: c.size, triangles: null, kind: pictures.meshKind(c.name) }));
+  res.json({ files });
+});
+
+app.post('/api/models/:id(\\d+)/thumbnail/render', async (req, res) => {
+  const model = db.prepare('SELECT id FROM models WHERE id = ?').get(req.params.id);
+  if (!model) return res.status(404).json({ error: 'Not found' });
+  const file = req.body && req.body.file;
+  if (file !== undefined && file !== null && (typeof file !== 'string' || !file.trim() || file.includes('\0'))) return res.status(400).json({ error: 'file must be a path' });
+  if (file) {
+    const fsPath = file.split('::')[0];
+    try { confinePath(fsPath); } catch (e) { if (sendPathError(res, e)) return; throw e; }
+  }
+  const result = await new Promise((resolve) => {
+    const w = new Worker(path.join(__dirname, 'thumb-worker.js'), { workerData: { mode: 'render', id: model.id, file: file || null }, env: { ...process.env } });
+    let settled = false;
+    const done = (v) => { if (!settled) { settled = true; resolve(v); } };
+    w.on('message', (m) => { if (m.type === 'done') done(m.success ? m.result : { ok: false, status: 500, error: m.error }); });
+    w.on('error', (e) => done({ ok: false, status: 500, error: e.message }));
+    w.on('exit', () => done({ ok: false, status: 500, error: 'Render stopped' }));
+  });
+  if (!result.ok) return res.status(result.status || 500).json({ error: result.error });
+  res.json({ ok: true, images: result.images, thumbnail_path: result.thumbnail_path, thumb_url: thumbs.thumbUrl(result.thumbnail_path, 480), thumb_source: 'stl', triangles: result.triangles, ms: result.ms });
 });
 
 // ── Claude AI Assistant ───────────────────────────────────────────────────────
@@ -1802,10 +1930,9 @@ Return ONLY the most likely URL. No explanation, just the URL. If you cannot fin
       }, { signal: sse.signal });
 
       if (savedPaths.length > 0) {
-        const existingImages = JSON.parse(model.images || '[]');
-        const allImages = [...new Set([...existingImages, ...savedPaths])];
-        db.prepare(`UPDATE models SET images=?, thumbnail_path=?, source_url=?, updated_at=datetime('now') WHERE id=?`)
-          .run(JSON.stringify(allImages), allImages[0], sourceUrl, model.id);
+        const pm = appendPictures(model, savedPaths, 'web');
+        db.prepare(`UPDATE models SET images=?, thumbnail_path=?, thumb_source=?, source_url=?, updated_at=datetime('now') WHERE id=?`)
+          .run(JSON.stringify(pm.images), pm.thumbnail_path, pm.thumb_source, sourceUrl, model.id);
         if (sourceSite && sourceSite !== 'unknown') {
           db.prepare(`UPDATE models SET source_site=? WHERE id=?`).run(sourceSite, model.id);
         }
@@ -2343,6 +2470,11 @@ function startServer() {
   // Daily DB snapshot: first check 60s after start (never delays the
   // healthcheck), then hourly; writes one file per day.
   try { require('./lib/backup').startDailyBackups({ db, delayMs: 60 * 1000 }); } catch (e) { console.error('[backup]', e.message); }
+  // Card-size thumbs for any card image without one: once, a little after start (one at a time)
+  if (thumbsAutomatic()) {
+    const t = setTimeout(() => { try { const n = thumbs.fillMissing(db); if (n) console.log(`[thumbs] making ${n} card thumbnail(s) in the background`); } catch (e) { console.warn('[thumbs]', e.message); } }, 20 * 1000);
+    t.unref();
+  }
 
   function shutdown(signal, code = 0) {
     if (shuttingDown) return;
@@ -2360,6 +2492,8 @@ function startServer() {
         markRunningScans('interrupted', `Server shutdown (${signal})`);
         try { await scanWorker.terminate(); } catch {}
       }
+      thumbs.stopFiller();
+      await stopFillJob();
       try { db.exec('PRAGMA wal_checkpoint(TRUNCATE)'); } catch (e) { console.error('[shutdown] checkpoint failed:', e.message); }
       try { db.close(); } catch {}
       console.log('[shutdown] database closed');

@@ -1,0 +1,186 @@
+/**
+ * lib/mesh-render.js + mesh selection in lib/pictures.js (docs/thumbnails.md §2.4):
+ * STL (binary, ASCII), OBJ and 3MF parsing, a non-blank centred render, multi-part folders,
+ * zip entries, and the render time of a 1M-triangle mesh.
+ */
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const AdmZip = require('adm-zip');
+const fx = require('./mesh-fixtures');
+
+const ROOT = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'vault-mesh-')));
+process.env.IMAGES_DIR = path.join(ROOT, 'images');
+const mr = require('../lib/mesh-render');
+
+afterAll(() => fs.rmSync(ROOT, { recursive: true, force: true }));
+
+const file = (name, data) => { const p = path.join(ROOT, name); fs.mkdirSync(path.dirname(p), { recursive: true }); fs.writeFileSync(p, data); return p; };
+async function collect(src) {
+  const tris = [];
+  const n = await mr.forEachTriangle(src, (...v) => tris.push(v));
+  return { n, tris };
+}
+/** Model pixels: the clay is warm (R >= B); the background is a cool grey (B = R + 3). */
+function analyse(png) {
+  const { width, height, data } = mr.decodePng(png);
+  let n = 0, sx = 0, sy = 0, minx = width, maxx = 0, miny = height, maxy = 0;
+  for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) {
+    const o = (y * width + x) * 3;
+    if (data[o] >= data[o + 2]) { n++; sx += x; sy += y; if (x < minx) minx = x; if (x > maxx) maxx = x; if (y < miny) miny = y; if (y > maxy) maxy = y; }
+  }
+  return { width, height, n, cx: sx / n, cy: sy / n, minx, maxx, miny, maxy, share: n / (width * height) };
+}
+
+describe('parsers', () => {
+  const cube = fx.boxTris(0, 0, 0, 10, 20, 30);
+
+  test('binary STL', async () => {
+    const { n, tris } = await collect({ kind: 'file', path: file('cube-bin.stl', fx.binaryStl(cube)) });
+    expect(n).toBe(12);
+    expect(tris[0].map(v => Math.round(v))).toEqual(cube[0]);
+  });
+
+  test('binary STL whose header starts with "solid" is still binary (size matches)', async () => {
+    const buf = fx.binaryStl(cube);
+    buf.write('solid SolidWorks export', 0, 'latin1');
+    expect((await collect({ kind: 'file', path: file('cube-solid-header.stl', buf) })).n).toBe(12);
+  });
+
+  test('ASCII STL', async () => {
+    const { n, tris } = await collect({ kind: 'file', path: file('cube-ascii.stl', fx.asciiStl(cube)) });
+    expect(n).toBe(12);
+    expect(tris[5]).toEqual(cube[5]);
+  });
+
+  test('OBJ (v/vt/vn face syntax, fans quads)', async () => {
+    const { n } = await collect({ kind: 'file', path: file('cube.obj', fx.obj(cube)) });
+    expect(n).toBe(12);
+    const quad = 'v 0 0 0\nv 1 0 0\nv 1 1 0\nv 0 1 0\nf 1 2 3 4\nf -4 -3 -2\n';
+    expect((await collect({ kind: 'file', path: file('quad.obj', quad) })).n).toBe(3);
+  });
+
+  test('3MF applies the build item transform', async () => {
+    const { n, tris } = await collect({ kind: 'file', path: file('cube.3mf', fx.threeMf(cube, AdmZip, { translate: [100, 0, 0] })) });
+    expect(n).toBe(12);
+    expect(Math.min(...tris.flatMap(t => [t[0], t[3], t[6]]))).toBeCloseTo(100);
+  });
+
+  test('STL streamed from a zip entry, and a 3MF inside a zip', async () => {
+    const z = new AdmZip();
+    z.addFile('Parts/cube.stl', fx.binaryStl(cube));
+    z.addFile('Parts/cube.3mf', fx.threeMf(cube, AdmZip));
+    const zp = file('parts.zip', z.toBuffer());
+    expect((await collect({ kind: 'zip', zipPath: zp, entry: 'Parts/cube.stl' })).n).toBe(12);
+    expect((await collect({ kind: 'zip', zipPath: zp, entry: 'Parts/cube.3mf' })).n).toBe(12);
+  });
+
+  test('an empty STL renders nothing (error, not a blank picture)', async () => {
+    await expect(mr.renderMeshes([{ kind: 'file', path: file('empty.stl', 'solid x\nendsolid x\n') }])).rejects.toThrow(/no triangles/);
+  });
+});
+
+describe('render', () => {
+  test('produces a non-blank 640x640 PNG with the model centred', async () => {
+    const p = file('torus.stl', fx.binaryStl(fx.torusTris(80, 40)));
+    const r = await mr.renderMeshes([{ kind: 'file', path: p }]);
+    expect(r.png.slice(1, 4).toString()).toBe('PNG');
+    const a = analyse(r.png);
+    expect(a.width).toBe(640);
+    expect(a.share).toBeGreaterThan(0.15);
+    expect(a.share).toBeLessThan(0.9);
+    expect(Math.abs(a.cx - 320)).toBeLessThan(40);
+    expect(Math.abs(a.cy - 320)).toBeLessThan(40);
+    // auto-framing: the model fills most of the frame but keeps a margin
+    expect(Math.max(a.maxx - a.minx, a.maxy - a.miny)).toBeGreaterThan(480);
+    expect(a.minx).toBeGreaterThan(10);
+    expect(a.miny).toBeGreaterThan(10);
+    // shading varies across the model (not a flat silhouette)
+    const { data } = mr.decodePng(r.png);
+    const lum = new Set();
+    for (let i = 0; i < data.length; i += 3) if (data[i] >= data[i + 2]) lum.add(data[i] >> 3);
+    expect(lum.size).toBeGreaterThan(10);
+  });
+
+  test('a model far from the origin is still framed and centred', async () => {
+    const tris = fx.boxTris(1000, 2000, 50, 1040, 2030, 110);
+    const a = analyse((await mr.renderMeshes([{ kind: 'file', path: file('far.stl', fx.binaryStl(tris)) }])).png);
+    expect(Math.abs(a.cx - 320)).toBeLessThan(40);
+    expect(a.share).toBeGreaterThan(0.1);
+  });
+
+  test('meshes over the in-memory cap are streamed twice and give the same picture', async () => {
+    const p = file('torus2.stl', fx.binaryStl(fx.torusTris(300, 150)));
+    const a = await mr.renderMeshes([{ kind: 'file', path: p }]);
+    const b = await mr.renderMeshes([{ kind: 'file', path: p }], { memTriangles: 1000 });
+    expect(b.triangles).toBe(a.triangles);
+    expect(Buffer.compare(a.png, b.png)).toBe(0);
+  });
+
+  test('Y-up meshes are stood up (much taller in Y)', async () => {
+    const r = await mr.renderMeshes([{ kind: 'file', path: file('yup.stl', fx.binaryStl(fx.boxTris(0, 0, 0, 10, 80, 10))) }]);
+    expect(r.upAxis).toBe('y');
+    const a = analyse(r.png);
+    expect(a.maxy - a.miny).toBeGreaterThan(a.maxx - a.minx);
+    const flat = await mr.renderMeshes([{ kind: 'file', path: file('flat.stl', fx.binaryStl(fx.boxTris(0, 0, 0, 80, 80, 5))) }]);
+    expect(flat.upAxis).toBe('z');
+  });
+
+  test('multi-part folder: parts are drawn together in place', async () => {
+    const left = file('kit/left_arm.stl', fx.binaryStl(fx.boxTris(-60, 0, 0, -40, 20, 40)));
+    const right = file('kit/right_arm.stl', fx.asciiStl(fx.boxTris(40, 0, 0, 60, 20, 40)));
+    const both = analyse((await mr.renderMeshes([{ kind: 'file', path: left }, { kind: 'file', path: right }])).png);
+    const one = analyse((await mr.renderMeshes([{ kind: 'file', path: left }])).png);
+    // two blocks far apart: the middle column of the picture is background
+    const { data, width } = mr.decodePng((await mr.renderMeshes([{ kind: 'file', path: left }, { kind: 'file', path: right }])).png);
+    let mid = 0;
+    for (let y = 0; y < 640; y++) { const o = (y * width + 320) * 3; if (data[o] >= data[o + 2]) mid++; }
+    expect(mid).toBe(0);
+    expect(both.maxx - both.minx).toBeGreaterThan(400);
+    expect(one.share).toBeGreaterThan(both.share); // a single part fills the frame on its own
+  });
+
+  test('1M triangles render in bounded time (reported)', async () => {
+    const p = path.join(ROOT, 'big.stl');
+    const n = fx.writeTorusStl(fs, p, 1000, 500);
+    expect(n).toBe(1000000);
+    const t = Date.now();
+    const r = await mr.renderMeshes([{ kind: 'file', path: p }]);
+    const ms = Date.now() - t;
+    // eslint-disable-next-line no-console
+    console.log(`[mesh-render] 1,000,000 triangles: ${ms} ms (read ${r.ms.read}, raster ${r.ms.raster}, shade ${r.ms.shade}, encode ${r.ms.encode}), coverage ${(r.coverage * 100).toFixed(1)}%`);
+    expect(r.triangles).toBe(1000000);
+    expect(ms).toBeLessThan(30000);
+    fs.unlinkSync(p);
+  }, 60000);
+});
+
+describe('which mesh to render (lib/pictures.js)', () => {
+  const pictures = require('../lib/pictures');
+  const c = (p, size) => ({ id: p, name: path.basename(p), dir: path.dirname(p), size, source: { kind: 'file', path: p } });
+
+  test('support, test and base-only files are skipped', () => {
+    expect(pictures.meshKind('supports.stl')).toBe('skip');
+    expect(pictures.meshKind('bust_supports.stl')).toBe('skip');
+    expect(pictures.meshKind('tolerance test.stl')).toBe('skip');
+    expect(pictures.meshKind('Base.stl')).toBe('skip');
+    expect(pictures.meshKind('base_2.obj')).toBe('skip');
+    expect(pictures.meshKind('bust_supported.stl')).toBe('mesh');
+    expect(pictures.meshKind('baseball bat.stl')).toBe('mesh');
+  });
+
+  test('parts of one folder render together; unsupported folders win', () => {
+    const pick = pictures.chooseMeshes([
+      c('/l/M/Supported/body_sup.stl', 9e6), c('/l/M/Supported/head_sup.stl', 3e6),
+      c('/l/M/Unsupported/body.stl', 8e6), c('/l/M/Unsupported/head.stl', 2e6), c('/l/M/Unsupported/supports.stl', 5e6),
+    ]);
+    expect(pick.mode).toBe('parts');
+    expect(pick.parts.map(p => p.name).sort()).toEqual(['body.stl', 'head.stl']);
+  });
+
+  test('too many triangles for a group: the largest single mesh', () => {
+    const pick = pictures.chooseMeshes([c('/l/M/a.stl', 150e6), c('/l/M/b.stl', 140e6)]);
+    expect(pick.mode).toBe('single');
+    expect(pick.parts[0].name).toBe('a.stl');
+  });
+});

@@ -7,6 +7,8 @@ import RenderHintPanel from '../components/RenderHintPanel';
 import Modal from '../components/Modal';
 import AttributionPanel, { hasAttributionData, AiMark } from '../components/AttributionPanel';
 import FolderBreadcrumb from '../components/FolderBreadcrumb';
+import MeshRenderPicker from '../components/MeshRenderPicker';
+import { detailImage, isMeshPreview } from '../thumbs';
 import { decideToasts, splitDecideErrors, isTermLabel } from '../enrich';
 import { useConfirm } from '../components/ConfirmDialog';
 import { formatTerm } from '../library';
@@ -282,6 +284,7 @@ export default function ModelDetail({ modelId, onBack, onSaved, onQueueChange, c
   const [showScrapeInput, setShowScrapeInput] = useState(false);
   const [showZipPicker, setShowZipPicker] = useState(false);
   const [showRenderHint, setShowRenderHint] = useState(false);
+  const [showMeshRender, setShowMeshRender] = useState(false);
   const [showAssistant, setShowAssistant] = useState(false);
   const [viewingStl, setViewingStl] = useState(null);
   const [apiKey, setApiKey] = useState(getStoredApiKey);
@@ -597,8 +600,8 @@ export default function ModelDetail({ modelId, onBack, onSaved, onQueueChange, c
                 {images.length > 0 ? (
                   <>
                     <button className="detail-main-img-btn" onClick={() => setZoomOpen(true)} aria-label="View image full size">
-                      <img className="detail-main-img" src={images[activeImg]} alt={name || model.name}
-                        style={{ cursor: 'zoom-in' }} title="Click to view full size" />
+                      <img className="detail-main-img" src={detailImage(model, activeImg, 1280)} alt={name || model.name}
+                        decoding="async" style={{ cursor: 'zoom-in' }} title="Click to view full size" />
                     </button>
                     {zoomOpen && (
                       <Modal onClose={() => setZoomOpen(false)} label={`Image ${activeImg + 1} of ${images.length}: ${name || model.name}`}
@@ -625,7 +628,8 @@ export default function ModelDetail({ modelId, onBack, onSaved, onQueueChange, c
                           return (
                             <div key={i} style={{ position: 'relative', display: 'inline-block', flexShrink: 0 }}>
                               <button className="thumb-btn" onClick={() => setActiveImg(i)} aria-label={`Show image ${i + 1}`} aria-pressed={activeImg === i}>
-                                <img className={`detail-thumb ${activeImg === i ? 'active' : ''}`} src={img} alt="" />
+                                <img className={`detail-thumb ${activeImg === i ? 'active' : ''}`} src={detailImage(model, i, 480)} alt=""
+                                  width={60} height={60} loading="lazy" decoding="async" />
                               </button>
                               <button
                                 title={isThumb ? 'Current thumbnail' : 'Set as gallery thumbnail'}
@@ -661,25 +665,51 @@ export default function ModelDetail({ modelId, onBack, onSaved, onQueueChange, c
               <div className="detail-card-title">
                 Images
                 <span style={{ marginLeft: 8, color: 'var(--text-faint)', fontWeight: 'normal' }}>{images.length} found</span>
+                {isMeshPreview(model) && images.length > 0 && (
+                  <span className="detail-3d-note" title="The card picture was rendered from the 3D model">3D preview</span>
+                )}
               </div>
               <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-                <button onClick={() => { setShowZipPicker(s => !s); setShowScrapeInput(false); setShowRenderHint(false); }}
+                <button onClick={() => { setShowZipPicker(s => !s); setShowScrapeInput(false); setShowRenderHint(false); setShowMeshRender(false); }}
                   aria-expanded={showZipPicker}
                   className={`tool-btn ${showZipPicker ? 'active' : ''}`} style={{ flex: 1 }}>
                   📦 Extract from ZIP
                 </button>
-                <button onClick={() => { setShowScrapeInput(s => !s); setShowZipPicker(false); setShowRenderHint(false); }}
+                <button onClick={() => { setShowScrapeInput(s => !s); setShowZipPicker(false); setShowRenderHint(false); setShowMeshRender(false); }}
                   aria-expanded={showScrapeInput}
                   className={`tool-btn ${showScrapeInput ? 'active' : ''}`} style={{ flex: 1 }}>
                   🌐 Fetch from site
                 </button>
-                <button onClick={() => { setShowRenderHint(s => !s); setShowZipPicker(false); setShowScrapeInput(false); }}
+                <button onClick={() => { setShowRenderHint(s => !s); setShowZipPicker(false); setShowScrapeInput(false); setShowMeshRender(false); }}
                   title="Set which ZIP to auto-extract renders from on next scan"
                   aria-label="Render ZIP settings" aria-expanded={showRenderHint}
                   className={`tool-btn ${showRenderHint ? 'active' : ''}`} style={{ fontSize: 14, padding: '7px 10px' }}>
                   ⚙
                 </button>
               </div>
+
+              <button onClick={() => { setShowMeshRender(s => !s); setShowZipPicker(false); setShowScrapeInput(false); setShowRenderHint(false); }}
+                aria-expanded={showMeshRender}
+                title={images.length ? 'Draw a new picture from one of the model files' : 'This card has no picture: draw one from the model files'}
+                className={`tool-btn ${showMeshRender ? 'active' : ''}`} style={{ width: '100%', marginTop: 8 }}>
+                🧊 Render preview from model
+              </button>
+
+              {showMeshRender && (
+                <div style={{ marginTop: 12 }}>
+                  <MeshRenderPicker
+                    modelId={modelId}
+                    onClose={() => setShowMeshRender(false)}
+                    onRendered={(r) => {
+                      setShowMeshRender(false);
+                      const idx = r && Array.isArray(r.images) ? r.images.indexOf(r.thumbnail_path) : -1;
+                      setActiveImg(idx > 0 ? idx : 0);
+                      loadModel();
+                      if (onSaved) onSaved();
+                    }}
+                  />
+                </div>
+              )}
 
               {showRenderHint && (
                 <div style={{ marginTop: 12 }}>
