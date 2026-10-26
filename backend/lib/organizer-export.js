@@ -8,6 +8,7 @@
  *   filing_rules.csv     kind,key,value (fix|group|genre) file_inbox.py rules; keys like its key()
  *   model_json.ndjson    {library, rel, model}         sidecar pass (organizer model.json schema)
  *   moves.csv            library,from_rel,to_rel,reason,confidence   gold layout proposals
+ *   folder_roles.csv     library,path,role,genre,group,tags,note       app folder marks (docs/folder-roles.md)
  *
  * Only trustworthy values leave the app: provenance sidecar, path, manifest, user (userFields),
  * ai-reviewed, and ai when it was auto-applied with confidence >= 0.9. A studio work's character
@@ -331,11 +332,34 @@ function moves(db, { since, libraries } = {}) {
   return { rows: kept, dropped: rows.length - kept.length, text: toCSV(['library', 'from_rel', 'to_rel', 'reason', 'confidence'], kept) };
 }
 
+/**
+ * folder_roles.csv: the app's folder marks in the _Meta/folder_roles.csv format, with a leading
+ * library column so the organizer can merge each row into that library's file. Marks outside
+ * every library are left out.
+ */
+function folderRolesFile(db, { since, libraries } = {}) {
+  let list;
+  try {
+    list = db.prepare(`SELECT path, role, genre, grp, tags, note, COALESCE(updated_at, created_at) AS at FROM folder_overrides ORDER BY path`).all();
+  } catch { list = []; }
+  const rows = [];
+  for (const r of list) {
+    if (since && r.at && r.at < String(since).replace('T', ' ').replace(/\.\d+Z?$|Z$/, '')) continue;
+    const lr = libRel(r.path, libraries);
+    if (!lr || !lr.rel) continue;
+    const tags = parseJSON(r.tags, []);
+    const row = [lr.library, lr.rel, r.role, r.genre || '', r.grp || '', Array.isArray(tags) ? tags.join('|') : '', r.note || ''];
+    if (!unsafeRow(row)) rows.push(row);
+  }
+  return { rows, text: toCSV(['library', 'path', 'role', 'genre', 'group', 'tags', 'note'], rows) };
+}
+
 const FILES = {
   'genre_map.csv': { fn: genreMap, type: 'text/csv; charset=utf-8' },
   'filing_rules.csv': { fn: filingRules, type: 'text/csv; charset=utf-8' },
   'model_json.ndjson': { fn: modelJson, type: 'application/x-ndjson; charset=utf-8' },
   'moves.csv': { fn: moves, type: 'text/csv; charset=utf-8' },
+  'folder_roles.csv': { fn: folderRolesFile, type: 'text/csv; charset=utf-8' },
 };
 
-module.exports = { FILES, genreMap, filingRules, modelJson, moves, toCSV, csvCell, key, trust, goldPath, characterSeg, studioRoots, teamGroups, AI_EXPORT_MIN };
+module.exports = { FILES, genreMap, filingRules, modelJson, moves, folderRolesFile, toCSV, csvCell, key, trust, goldPath, characterSeg, studioRoots, teamGroups, AI_EXPORT_MIN };

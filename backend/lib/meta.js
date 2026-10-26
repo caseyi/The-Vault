@@ -10,6 +10,7 @@
  *   genre_map.csv                 character → genre (also read from each library root)
  *   filing_rules.csv              organizer rules: fix / genre / group / guess
  *   vault.json                    optional: { studioAliases, containers, libraryLabels }
+ *   folder_roles.csv              path,role,genre,group,tags,note (docs/folder-roles.md)
  *
  * Read-only: The Vault never writes to the library. loadMeta() never throws; every
  * problem lands in status.errors.
@@ -57,7 +58,7 @@ function emptyMeta() {
   return {
     dirs: [], loadedAt: null, ms: 0, errors: [],
     products: [], productFiles: 0, tracker: [], driveFiles: 0, genreMap: new Map(), rules: { fix: {}, genre: {}, group: {}, guess: {}, members: {}, folder: {} },
-    ruleCount: 0, sidecars: 0, vault: {},
+    ruleCount: 0, sidecars: 0, vault: {}, folderRoles: [], folderRoleFiles: [],
     bySize: new Map(), byName: new Map(), byStem: new Map(), byCompact: new Map(), driveByName: new Map(), driveByStem: new Map(),
     trackerByStem: new Map(), fix: naming.makeFixer(),
   };
@@ -95,6 +96,14 @@ function loadMeta({ dirs = [], roots = [], log = () => {} } = {}) {
       }
     } catch (e) { err(f, e); }
   }
+
+  // folder_roles.csv (docs/folder-roles.md §2): paths are relative to the folder holding _Meta
+  try {
+    const fr = require('./folder-roles').loadFileRoles(meta.dirs);
+    meta.folderRoles = fr.entries;
+    meta.folderRoleFiles = fr.files;
+    for (const f of fr.files) for (const e of f.errors) meta.errors.push(`${path.basename(path.dirname(f.dir))}/_Meta/folder_roles.csv: ${e}`);
+  } catch (e) { meta.errors.push(`folder_roles.csv: ${e.message}`); }
 
   // filing_rules.csv → typo fixes first (they affect every key below)
   for (const d of meta.dirs) {
@@ -448,12 +457,13 @@ function isKnownGenre(meta, name) {
 
 /** Public status for /api/meta/status. */
 function metaStatus(meta) {
-  if (!meta) return { dirs: [], loadedAt: null, counts: { products: 0, productFiles: 0, tracker: 0, driveFiles: 0, genreMap: 0, rules: 0, sidecars: 0 }, errors: [] };
+  if (!meta) return { dirs: [], loadedAt: null, counts: { products: 0, productFiles: 0, tracker: 0, driveFiles: 0, genreMap: 0, rules: 0, sidecars: 0, folderRoles: 0 }, errors: [] };
   return {
     dirs: meta.dirs, loadedAt: meta.loadedAt, ms: meta.ms,
     counts: {
       products: meta.products.length, productFiles: meta.productFiles, tracker: meta.tracker.length,
       driveFiles: meta.driveFiles, genreMap: meta.genreMap.size, rules: meta.ruleCount, sidecars: meta.sidecars || 0,
+      folderRoles: (meta.folderRoles || []).length,
     },
     errors: meta.errors.slice(0, 50),
   };

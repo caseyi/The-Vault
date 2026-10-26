@@ -25,6 +25,9 @@ const naming = require('./naming');
 const similar = require('./similar');
 const worksLib = require('./works');
 const { foldInto } = require('./fold');
+const fs = require('fs');
+const folderRoles = require('./folder-roles');
+const { VARIANT_DIR, isExtVariantName } = require('./discovery');
 
 const PROMPT_VERSION = 'enrich-v1';
 const BATCH_SIZE = 40;
@@ -33,7 +36,7 @@ const EDITIONS = ['Sculpture', 'Bust', 'Accessory', 'Diorama'];
 const TEXT_FIELDS = ['character', 'franchise', 'group_name', 'editions', 'name', 'tags'];
 const COLUMNS = { character: 'character', franchise: 'franchise', group_name: 'group_name', editions: 'editions', name: 'name', tags: 'tags' };
 /** Provenances never overwritten automatically (§2): model.json, the genre folder, the creator's manifest, organizer rules, Drive. */
-const PROTECTED = new Set(['sidecar', 'path', 'manifest', 'rules', 'drive', 'user', 'ai-reviewed']);
+const PROTECTED = new Set(['sidecar', 'path', 'manifest', 'rules', 'drive', 'role', 'user', 'ai-reviewed']);
 /** …and these are not even proposed again: explicit metadata, or a value the user set or accepted. */
 const NO_SUGGEST = new Set(['sidecar', 'user', 'ai-reviewed']);
 // Approximations, on the safe side: JSON is token-dense (quotes, braces, ids)
@@ -118,9 +121,15 @@ function filesByModel(db, ids) {
   if (!ids.length) return out;
   for (let i = 0; i < ids.length; i += 500) {
     const part = ids.slice(i, i + 500);
-    for (const r of db.prepare(`SELECT model_id, filename FROM model_files WHERE model_id IN (${part.map(() => '?').join(',')})`).all(...part)) {
-      if (!out.has(r.model_id)) out.set(r.model_id, []);
-      out.get(r.model_id).push(r.filename);
+    for (const r of db.prepare(`SELECT model_id, filename, filepath FROM model_files WHERE model_id IN (${part.map(() => '?').join(',')})`).all(...part)) {
+      if (!out.has(r.model_id)) {
+        const list = [];
+        Object.defineProperty(list, 'dirs', { value: new Map(), enumerable: false }); // folder → files (folder-role evidence)
+        out.set(r.model_id, list);
+      }
+      const list = out.get(r.model_id);
+      list.push(r.filename);
+      if (r.filepath) { const d = path.dirname(r.filepath); list.dirs.set(d, (list.dirs.get(d) || 0) + 1); }
     }
   }
   return out;
@@ -228,6 +237,34 @@ function pathSegments(card, libraryRoot) {
 }
 
 /**
+ * The card's real folder, its sub-folders holding files and its file count, when the card looks
+ * like a category or a mix of things (docs/folder-roles.md §5). Null otherwise (keeps evidence
+ * signatures of ordinary cards unchanged).
+ */
+function folderEvidence(card, files, ctx = {}) {
+  const dirs = files && files.dirs;
+  const real = worksLib.realFolder(card.folder_path || '');
+  // studio works span folders by design (one character's sculpture, bust and variants)
+  if (!dirs || !dirs.size || !real || card.kind === 'work' || card.kind === 'diorama') return null;
+  const subs = new Map();
+  let n = 0;
+  for (const [d, c] of dirs) {
+    n += c;
+    if (!d.startsWith(real + path.sep)) continue;
+    const s = d.slice(real.length + 1).split(path.sep)[0];
+    if (VARIANT_DIR.test(s.trim()) || isExtVariantName(s)) continue; // supports, scales, renders: parts of one model
+    subs.set(s, (subs.get(s) || 0) + c);
+  }
+  const named = folderRoles.CATEGORY_NAME.test(path.basename(real).trim()) || folderRoles.CATEGORY_NAME.test(String(card.name || '').trim()) || !!naming.canonicalGenre(path.basename(real));
+  if (!(named && (subs.size >= 2 || n >= 4)) && subs.size < 5) return null;
+  const rel = ctx.libraryRoot && real.startsWith(ctx.libraryRoot + path.sep) ? path.relative(ctx.libraryRoot, real).split(path.sep).join('/') : path.basename(real);
+  const out = { path: rel.slice(-160), subs: [...subs.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).slice(0, 8).map(([k]) => k.slice(0, 60)), nsubs: subs.size, files: n };
+  const cur = ctx.roleOf ? ctx.roleOf(real) : null;
+  if (cur) out.role = cur;
+  return out;
+}
+
+/**
  * Compact evidence for one card (§3). `prov` per field: user | sidecar | path | manifest | drive |
  * rules | parse | ai | ai-reviewed | scan. Keys with no value are left out to save tokens.
  */
@@ -263,6 +300,8 @@ function buildEvidence(card, files, ctx = {}) {
   }
   const sim = ctx.similar && ctx.similar.get(card.id);
   if (sim && sim.length) ev.similar = sim.map(s => ({ id: s.id, name: s.name }));
+  const fe = folderEvidence(card, files, ctx);
+  if (fe) ev.folder = fe;
   const rel = releaseOf(card.work_key);
   if (rel.release) {
     ev.release = rel.release;
@@ -353,6 +392,7 @@ Return ONLY a JSON array, one object per card, no prose:
  "name":{"v":"better display name","c":..},
  "tags":{"v":["theme:...","type:...","scale:...","tech:...", "plain tag"],"c":..},
  "merge":{"into":<id from similar>,"c":..},
+ "folderRole":{"path":"<folder.path or a folder above it>","role":"category|model|passthrough|creator|ignore","c":..},
  "needs_vision":true|false,
  "why":"one short reason"}
 Rules:
@@ -367,6 +407,7 @@ ${groupLines || '- (none yet)'}
 - tags: up to 6 lowercase theme/descriptive tags; facets type:, theme:, scale:, tech: are welcome. No creator names, no genre names.
 - merge: only when this card and a "similar" card are the SAME character and edition set from the same creator (a typo or a split folder). Point to the better-named card. Different versions (1966 vs 1989, Zombie, Red Son) are NOT merges.
 - release / siblings: the creator released this character more than once; each release is its own card ("Daredevil (2025)", "Daredevil (Netflix)"). Never merge releases, never rename the "(…)" part away, and keep the character the same across siblings.
+- folderRole: only when the card has "folder" evidence and that folder is not one thing: a grouping of different models (Heroes, Terrain, Misc, a franchise) is "category"; one model whose parts were split into many tiny cards is "model". Leave it out when folder.role is already right.
 - needs_vision: true when only the render could tell what this is.
 - Known typo fixes: ${(pc.fixes || []).join(', ') || 'none'}.${tagsOnly ? '\nThis run only uses "tags"; other fields may be left out.' : ''}`;
 }
@@ -481,6 +522,18 @@ function validateResponse(text, batch) {
       else if (!Number.isFinite(c) || c < 0 || c > 1) errors.push(`${id}.merge: confidence out of range`);
       else out.merge = { into, c };
     }
+    if (raw.folderRole != null && typeof raw.folderRole === 'object') {
+      const fr = raw.folderRole;
+      const role = folderRoles.normalizeRole(fr.role);
+      const c = Number(fr.c ?? fr.confidence);
+      const ev = ids.get(id);
+      const p = typeof fr.path === 'string' ? fr.path.trim().replace(/^\/+|\/+$/g, '') : '';
+      if (!role) errors.push(`${id}.folderRole: unknown role ${fr.role}`);
+      else if (!Number.isFinite(c) || c < 0 || c > 1) errors.push(`${id}.folderRole: confidence out of range`);
+      else if (ev && !ev.folder) errors.push(`${id}.folderRole: the card has no folder evidence`);
+      else if (p && ev && ev.folder && !(ev.folder.path === p || ev.folder.path.startsWith(p + '/'))) errors.push(`${id}.folderRole: ${p} is not the card's folder or above it`);
+      else out.folderRole = { role, c, up: p && ev && ev.folder ? ev.folder.path.slice(p.length).split('/').filter(Boolean).length : 0 };
+    }
     if (raw.needs_vision === true) out.needs_vision = true;
     const whyRaw = raw.why ?? raw.reason;
     const why = typeof whyRaw === 'string' && whyRaw.trim() ? whyRaw.trim().replace(/\s+/g, ' ').slice(0, 300) : null;
@@ -558,6 +611,15 @@ function planActions(card, ans, ctx) {
   if (!ctx.tagsOnly && ans.merge && ans.merge.c >= ctx.suggest && !ctx.rejected('merge', null, null, ans.merge.into)) {
     suggest.push({ type: 'merge', field: null, current: null, proposed: null, targetId: ans.merge.into, confidence: ans.merge.c, reason: why, source });
   }
+  // a folder role: never applied automatically, always a proposal
+  if (!ctx.tagsOnly && ans.folderRole && ans.folderRole.c >= ctx.suggest && card.folder_path) {
+    let dir = worksLib.realFolder(card.folder_path);
+    for (let i = 0; i < (ans.folderRole.up || 0); i++) dir = path.dirname(dir);
+    const current = ctx.roleOf ? ctx.roleOf(dir) || null : null;
+    if (current !== ans.folderRole.role && !ctx.rejected('role', 'folder_role', ans.folderRole.role, null, dir)) {
+      suggest.push({ type: 'role', field: 'folder_role', current, proposed: ans.folderRole.role, path: dir, confidence: ans.folderRole.c, reason: why, source });
+    }
+  }
   return { apply, suggest };
 }
 
@@ -572,7 +634,7 @@ function combineAnswers(text, vision) {
   if (!vision) return { ans: text, sources: {} };
   const out = { ...(text || {}), id: (text || vision).id };
   const sources = {};
-  for (const f of [...TEXT_FIELDS, 'merge']) {
+  for (const f of [...TEXT_FIELDS, 'merge', 'folderRole']) {
     const v = vision[f];
     if (v && (!out[f] || v.c > out[f].c)) { out[f] = v; sources[f] = 'vision'; }
   }
@@ -614,22 +676,29 @@ function addSuggestion(db, card, s, runId) {
     if (dup) return false;
     // the reverse proposal (target → this card) already waits: one is enough
     if (db.prepare(`SELECT id FROM suggestions WHERE model_id = ? AND type = 'merge' AND target_id = ? AND status = 'pending'`).get(s.targetId, card.id)) return false;
+  } else if (s.type === 'role') {
+    // one pending proposal per folder (any card may propose it)
+    const pend = db.prepare(`SELECT id, proposed FROM suggestions WHERE type = 'role' AND path = ? AND status = 'pending'`).all(s.path);
+    if (pend.some(p => p.proposed === proposed)) return false;
+    if (pend.length) db.prepare(`UPDATE suggestions SET status = 'superseded', decided_at = datetime('now') WHERE id IN (${pend.map(() => '?').join(',')})`).run(...pend.map(p => p.id));
   } else {
     const pend = db.prepare(`SELECT id, proposed FROM suggestions WHERE model_id = ? AND type = ? AND field = ? AND status = 'pending'`).all(card.id, s.type, s.field);
     if (pend.some(p => p.proposed === proposed)) return false;
     if (pend.length) db.prepare(`UPDATE suggestions SET status = 'superseded', decided_at = datetime('now') WHERE id IN (${pend.map(() => '?').join(',')})`).run(...pend.map(p => p.id));
   }
-  db.prepare(`INSERT INTO suggestions (model_id, type, field, current, proposed, target_id, confidence, reason, source, run_id)
-    VALUES (?,?,?,?,?,?,?,?,?,?)`).run(card.id, s.type, s.field, current, proposed, s.targetId || null, round2(s.confidence), s.reason || null, s.source || 'text', runId);
+  db.prepare(`INSERT INTO suggestions (model_id, type, field, current, proposed, target_id, path, confidence, reason, source, run_id)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?)`).run(card.id, s.type, s.field, current, proposed, s.targetId || null, s.path || null, round2(s.confidence), s.reason || null, s.source || 'text', runId);
   return true;
 }
 
 /** Was the same proposal rejected before for this card? (§2 "reject memory") */
 function rejectedLookup(db, modelId) {
-  const rows = db.prepare(`SELECT model_id, type, field, proposed, target_id FROM suggestions WHERE (model_id = ? OR (type = 'merge' AND target_id = ?)) AND status = 'rejected'`).all(modelId, modelId);
-  const fn = (type, field, proposed, targetId) => rows.some(r => r.type === type && (type === 'merge'
+  const rows = db.prepare(`SELECT model_id, type, field, proposed, target_id, path FROM suggestions WHERE (model_id = ? OR (type = 'merge' AND target_id = ?) OR type = 'role') AND status = 'rejected'`).all(modelId, modelId);
+  const fn = (type, field, proposed, targetId, dir) => rows.some(r => r.type === type && (type === 'merge'
     // a rejected merge stays rejected in either direction (Geral → Geralt and Geralt → Geral)
     ? (r.model_id === modelId && r.target_id === targetId) || (r.model_id === targetId && r.target_id === modelId)
+    // a rejected folder role stays rejected for that folder, whichever card proposes it again
+    : type === 'role' ? r.path === dir && parseJSON(r.proposed, r.proposed) === proposed
     : r.model_id === modelId && r.field === field && norm(parseJSON(r.proposed, r.proposed)) === norm(typeof proposed === 'string' && proposed.startsWith('[') ? parseJSON(proposed, proposed) : proposed)));
   fn.tags = () => rows.filter(r => r.model_id === modelId && r.field === 'tags').flatMap(r => { const v = parseJSON(r.proposed, []); return Array.isArray(v) ? v : [v]; });
   return fn;
@@ -671,11 +740,12 @@ async function runEnrich(o) {
 
   const finishCard = (card, ans, sources = {}) => {
     const rejected = rejectedLookup(db, card.id);
-    const plan = planActions(card, ans, { ...th, isKnownGenre, rejected, rejectedTags: rejected.tags, tagsOnly: o.tagsOnly, source: 'text' });
+    const roleOf = (o.ctxOpts && o.ctxOpts.roleOf) || o.roleOf || null;
+    const plan = planActions(card, ans, { ...th, isKnownGenre, rejected, rejectedTags: rejected.tags, tagsOnly: o.tagsOnly, source: 'text', roleOf });
     db.transaction(() => {
       for (const act of plan.apply) { applyAuto(db, card, act, runId); counts.applied++; }
       for (const s of plan.suggest) {
-        if (sources[s.type === 'merge' ? 'merge' : s.field] === 'vision') s.source = 'vision';
+        if (sources[s.type === 'merge' ? 'merge' : s.type === 'role' ? 'folderRole' : s.field] === 'vision') s.source = 'vision';
         if (addSuggestion(db, card, s, runId)) { if (s.type === 'merge') counts.merges++; else counts.suggested++; }
       }
       // re-sign from the evidence as it is now, so the next run skips this card until something changes
@@ -860,9 +930,24 @@ function shapeSuggestion(db, r, cache = new Map()) {
   const out = { id: r.id, type: r.type, field: r.field, model: card(r.model_id) };
   if (r.type === 'merge') out.target = card(r.target_id);
   else { out.current = parseJSON(r.current, r.current); out.proposed = parseJSON(r.proposed, r.proposed); }
+  if (r.type === 'role') {
+    out.path = r.path || null;
+    const lr = r.path ? folderRoles.libRel(r.path, librariesNow()) : null;
+    out.rel = lr ? lr.rel : null;
+    if (lr && lr.library) out.library = lr.library;
+  }
   Object.assign(out, { confidence: r.confidence, reason: r.reason, source: r.source, runId: r.run_id, status: r.status });
   if (r.decided_at) out.decidedAt = r.decided_at;
   return out;
+}
+
+/** Libraries for rel paths of role suggestions (re-read at most once a minute). */
+let libCache = { at: 0, libs: [] };
+function librariesNow() {
+  if (Date.now() - libCache.at > 60000) {
+    try { libCache = { at: Date.now(), libs: require('./libraries').listLibraries(process.env.LIBRARY_PATH || '/library') }; } catch { libCache = { at: Date.now(), libs: [] }; }
+  }
+  return libCache.libs;
 }
 
 function suggestionWhere(f = {}) {
@@ -898,7 +983,7 @@ function listSuggestions(db, f = {}) {
 
 function summary(db) {
   const rows = db.prepare(`SELECT type, field, confidence FROM suggestions WHERE status = 'pending'`).all();
-  const out = { pending: rows.length, byType: { field: 0, merge: 0, rename: 0 }, byField: {}, byConfidence: { high: 0, medium: 0, low: 0 } };
+  const out = { pending: rows.length, byType: { field: 0, merge: 0, rename: 0, role: 0 }, byField: {}, byConfidence: { high: 0, medium: 0, low: 0 } };
   for (const r of rows) {
     out.byType[r.type] = (out.byType[r.type] || 0) + 1;
     if (r.field) out.byField[r.field] = (out.byField[r.field] || 0) + 1;
@@ -953,6 +1038,22 @@ function decide(db, ids, decision, { snapshot } = {}) {
       res.rejected++; continue;
     }
     try {
+      if (s.type === 'role') {
+        // accepting writes the app mark; the next scan applies it (a _Meta file mark still wins)
+        const role = folderRoles.normalizeRole(parseJSON(s.proposed, s.proposed));
+        if (!role || !s.path) throw new Error('not a folder role proposal');
+        let isDir = false;
+        try { isDir = fs.statSync(s.path).isDirectory(); } catch { isDir = false; }
+        if (!isDir) { supersede(id, 'the folder no longer exists'); continue; }
+        db.transaction(() => {
+          db.prepare(`INSERT INTO folder_overrides (path, role, genre, grp, tags, note, updated_at) VALUES (?, ?, NULL, NULL, NULL, ?, datetime('now'))
+            ON CONFLICT(path) DO UPDATE SET role = excluded.role, genre = NULL, grp = NULL, tags = NULL, updated_at = excluded.updated_at`).run(s.path, role, 'accepted AI proposal');
+          db.prepare(`UPDATE suggestions SET status = 'accepted', decided_at = datetime('now') WHERE id = ?`).run(id);
+          // other pending proposals for the same folder are moot
+          db.prepare(`UPDATE suggestions SET status = 'superseded', decided_at = datetime('now') WHERE type = 'role' AND path = ? AND status = 'pending' AND id != ?`).run(s.path, id);
+        })();
+        res.accepted++; res.roles = (res.roles || 0) + 1; continue;
+      }
       const row = db.prepare('SELECT * FROM models WHERE id = ?').get(s.model_id);
       if (!row) throw new Error('card not found');
       if (row.folded_into != null) throw new Error(`card was folded into #${row.folded_into}`);

@@ -319,6 +319,7 @@ function VaultApp() {
           onSuggestionsChange={(s) => setPendingSuggestions(s && typeof s.pending === 'number' ? s.pending : 0)}
           libraryWritable={health ? health.libraryWritable : undefined}
           libraryPath={health?.libraryPath}
+          onOpenModel={(m) => { setShowOrganize(false); fetchStats(); openModel(m); }}
         />
       )}
 

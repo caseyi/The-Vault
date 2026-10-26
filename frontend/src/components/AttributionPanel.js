@@ -4,6 +4,7 @@ import {
   asList, sortEditions, formatTerm, sourceLabel, explainConfidence, CONFIDENCE_LABELS,
   FIELD_SOURCE_LABELS, isAttributed,
 } from '../library';
+import { roleLabel, suggestionFolder } from '../folderRoles';
 
 // "Where did this come from?" panel on the model detail page: studio, creator,
 // genre/group/character, editions, release term, source links, claim status and
@@ -138,6 +139,9 @@ function EditButton({ label, onClick }) {
 
 function suggestionText(s) {
   if (s.type === 'merge') return null;
+  if (s.type === 'role') {
+    return <>Mark <b title={s.path}>{suggestionFolder(s)}</b> as <ins className="diff-new">{roleLabel(s.proposed)}</ins></>;
+  }
   const cur = asValues(s.current);
   if (s.field === 'tags' || s.field === 'editions' || Array.isArray(s.proposed)) {
     return <>{addedValues(s.current, s.proposed).map(v => <ins key={v} className="diff-new">+ {v}</ins>)}</>;
@@ -164,7 +168,7 @@ function InlineSuggestions({ items, onDecide }) {
       <ul>
         {items.map(s => {
           const b = band(s.confidence);
-          const label = s.type === 'merge' ? 'Same character as' : s.type === 'rename' ? 'Name' : (FIELD_LABELS[s.field] || s.field);
+          const label = s.type === 'merge' ? 'Same character as' : s.type === 'rename' ? 'Name' : s.type === 'role' ? 'Folder role' : (FIELD_LABELS[s.field] || s.field);
           return (
             <li key={s.id} className="attr-sugg">
               <div className="attr-sugg-line">

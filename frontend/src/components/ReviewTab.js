@@ -7,6 +7,8 @@ import {
   formatRunDate, decideToasts, splitDecideErrors, actualCost,
 } from '../enrich';
 import { formatTerm } from '../library';
+import { roleLabel, suggestionFolder } from '../folderRoles';
+import { useNotifyRescan } from './RoleMenu';
 
 // Organize → Review: AI suggestions waiting for Casey (docs/ai-enrichment.md §5).
 // Grouped by type, filterable by creator and confidence band, decided one by
@@ -75,6 +77,17 @@ function ValueDiff({ item }) {
   );
 }
 
+/** "Mark Misc/Terrain as Category (now Auto)" for a folder-role suggestion. */
+export function RoleChange({ item }) {
+  const folder = suggestionFolder(item);
+  return (
+    <span className="diff role-diff">
+      Mark <b className="role-diff-folder" title={item.path}>{folder}</b> as <ins className="diff-new">{roleLabel(item.proposed)}</ins>
+      <span className="attr-faint"> (now {roleLabel(item.current)})</span>
+    </span>
+  );
+}
+
 function MergeCard({ card, role }) {
   const info = useCardInfo(card && card.id);
   if (!card) return <div className="merge-card missing">Card not found</div>;
@@ -102,7 +115,8 @@ function MergeCard({ card, role }) {
 
 function ReviewRow({ item, active, selected, onSelect, onDecide, busy, rowRef, onFocus }) {
   const isMerge = item.type === 'merge';
-  const label = isMerge ? 'Same character' : item.type === 'rename' ? 'Name' : (FIELD_LABELS[item.field] || item.field);
+  const isRole = item.type === 'role';
+  const label = isMerge ? 'Same character' : item.type === 'rename' ? 'Name' : isRole ? 'Folder role' : (FIELD_LABELS[item.field] || item.field);
   return (
     <li ref={rowRef} className={`review-row ${active ? 'active' : ''} ${selected ? 'selected' : ''} ${isMerge ? 'is-merge' : ''}`}
       tabIndex={active ? 0 : -1} onFocus={onFocus} aria-label={`${label}: ${item.model?.name || ''}`}>
@@ -125,7 +139,7 @@ function ReviewRow({ item, active, selected, onSelect, onDecide, busy, rowRef, o
               <span className="review-name" title={item.model?.name}>{item.model?.name}</span>
               <span className="review-creator">{item.model?.creator_name}</span>
             </div>
-            <div className="review-change"><span className="review-field">{label}</span><ValueDiff item={item} /></div>
+            <div className="review-change"><span className="review-field">{label}</span>{isRole ? <RoleChange item={item} /> : <ValueDiff item={item} />}</div>
             <div className="review-meta"><ConfidenceChip value={item.confidence} /><SourceChip source={item.source} /><span className="review-reason">{item.reason}</span></div>
           </div>
         </div>
@@ -286,6 +300,7 @@ export function RunsHistory({ refreshKey, onUndone }) {
 
 export default function ReviewTab({ onSummary }) {
   const notify = useNotify();
+  const notifyRescan = useNotifyRescan();
   const [confirmUi, askConfirm] = useConfirm();
   const [summary, setSummary] = useState(null);
   const [group, setGroup] = useState(null);
@@ -365,11 +380,14 @@ export default function ReviewTab({ onSummary }) {
         toasts.filter(t => t.type !== 'success').forEach(t => notify(t.message, { type: t.type }));
       } else toasts.forEach(t => notify(t.message, { type: t.type }));
       if (r?.merged) { clearReviewCardCache(); setMergesKey(k => k + 1); }
+      if (decision === 'accept' && r?.accepted && rows.some(x => x.type === 'role')) {
+        notifyRescan('Folder roles saved. They apply on the next scan.');
+      }
       loadSummary();
       setRunsKey(k => k + 1);
     } catch (e) { notify(`Couldn't ${decision} suggestions: ${errorMessage(e)}`); }
     setBusy(false);
-  }, [loadSummary, notify]);
+  }, [loadSummary, notify, notifyRescan]);
 
   // Accepting more than one suggestion, or any merge, asks first (merges are only reversible by Unmerge)
   const decide = useCallback(async (ids, decision, rows = []) => {
@@ -423,6 +441,7 @@ export default function ReviewTab({ onSummary }) {
       const r = await apiSend('/api/suggestions/decide-filter', 'POST', { filter: { ...base, minConfidence: HIGH_MIN, status: 'pending' }, decision: 'accept' });
       decideToasts(r).forEach(t => notify(t.message, { type: t.type }));
       if (r?.merged) { clearReviewCardCache(); setMergesKey(k => k + 1); }
+      if (r?.accepted && groupDef.id === 'roles') notifyRescan('Folder roles saved. They apply on the next scan.');
       await loadSummary();
       load(1);
       setRunsKey(k => k + 1);
