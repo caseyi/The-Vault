@@ -11,6 +11,7 @@
   "dependencies": {
     "express": "^4.18.2",
     "node-unrar-js": "^2.0.2",
+    "sharp": "^0.35.5",
     "yauzl": "^3.4.0"
   },
   "devDependencies": {

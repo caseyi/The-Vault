@@ -5,6 +5,7 @@ import { activeFilterChips, EMPTY_FILTERS, filterParams } from '../filters';
 import { cardEditions, multiLibraryLabel, formatTerm, isAttributed } from '../library';
 import { isTermLabel } from '../enrich';
 import Modal from '../components/Modal';
+import { cardImages, isMeshPreview } from '../thumbs';
 
 const EnrichPanel = React.lazy(() => import('../components/EnrichPanel'));
 
@@ -34,14 +35,29 @@ export function CardMeta({ model, showAttribution }) {
 }
 
 const ModelCard = memo(function ModelCard({ model, onClick, bulkMode, selected, onToggle, onHide, onFavorite, showAttribution }) {
-  const imgs = model.images || [];
+  // Small cached copies (thumb_url / thumb_urls) when the backend has them;
+  // the originals otherwise (older backend).
+  const imgs = useMemo(() => cardImages(model), [model]);
   const [imgIdx, setImgIdx] = useState(0);
   const [imgLoaded, setImgLoaded] = useState(false);
   const [imgFailed, setImgFailed] = useState(false);
-  const currentImg = imgs[imgIdx] || model.thumbnail_path || imgs[0];
+  const [useOriginal, setUseOriginal] = useState(false); // a /thumbs/ URL failed: try the original once
+  const idx = imgIdx < imgs.length ? imgIdx : 0;
+  const thumbSrc = imgs[idx] || model.thumbnail_path;
+  const originalSrc = (model.images || [])[idx] || model.thumbnail_path;
+  const currentImg = useOriginal && originalSrc ? originalSrc : thumbSrc;
   const isHidden = model.hidden === 1 || model.hidden === true;
   const isFav = model.is_favorite === 1 || model.is_favorite === true;
   const showImg = currentImg && !imgFailed;
+  const meshPreview = isMeshPreview(model);
+
+  const onImgError = () => {
+    if (!useOriginal && typeof thumbSrc === 'string' && thumbSrc.startsWith('/thumbs/') && originalSrc && originalSrc !== thumbSrc) {
+      setUseOriginal(true);
+      return;
+    }
+    setImgFailed(true);
+  };
 
   const handleClick = () => {
     if (bulkMode) { onToggle(model.id); return; }
@@ -51,6 +67,7 @@ const ModelCard = memo(function ModelCard({ model, onClick, bulkMode, selected, 
   const cycleImg = (e, dir) => {
     e.stopPropagation();
     setImgFailed(false);
+    setUseOriginal(false);
     setImgIdx(prev => {
       const next = prev + dir;
       if (next < 0) return imgs.length - 1;
@@ -94,19 +111,25 @@ const ModelCard = memo(function ModelCard({ model, onClick, bulkMode, selected, 
           {isHidden ? '👁' : '🙈'}
         </button>
       )}
-      {showImg ? (
-        <img className="model-card-img" src={currentImg} alt={model.name} loading="lazy" decoding="async"
-          style={{ opacity: imgLoaded ? 1 : 0 }}
-          onLoad={() => setImgLoaded(true)}
-          onError={() => setImgFailed(true)} />
-      ) : (
-        <div className="model-card-no-img">🧩</div>
-      )}
+      <div className="model-card-media">
+        {showImg ? (
+          <img className="model-card-img" src={currentImg} alt={model.name} loading="lazy" decoding="async"
+            width={480} height={360}
+            style={{ opacity: imgLoaded ? 1 : 0 }}
+            onLoad={() => setImgLoaded(true)}
+            onError={onImgError} />
+        ) : (
+          <div className="model-card-no-img" role="img" aria-label={`No picture for ${model.name}`}><span aria-hidden="true">🧩</span></div>
+        )}
+        {showImg && meshPreview && (
+          <span className="card-3d-badge" role="img" title="Preview rendered from the 3D model" aria-label="3D preview rendered from the model">3D</span>
+        )}
+      </div>
       {imgs.length > 1 && !bulkMode && (
         <>
           <button onClick={e => cycleImg(e, -1)} className="card-nav prev card-hover-only" aria-label="Previous image">‹</button>
           <button onClick={e => cycleImg(e, 1)} className="card-nav next card-hover-only" aria-label="Next image">›</button>
-          <div className="card-img-count card-hover-only" aria-hidden="true">{imgIdx + 1}/{imgs.length}</div>
+          <div className="card-img-count card-hover-only" aria-hidden="true">{idx + 1}/{imgs.length}</div>
         </>
       )}
       <div className="model-card-body">

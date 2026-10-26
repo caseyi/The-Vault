@@ -1,7 +1,6 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { createExtractorFromData } = require('node-unrar-js');
 const db = require('./db');
 const {
   discoverModelFolders, VARIANT_DIR, MEDIA_DIR, IGNORED_FOLDERS, isJunkFile,
@@ -18,7 +17,9 @@ const IMAGE_EXTS  = new Set(['.jpg', '.jpeg', '.png', '.webp', '.gif']);
 const STL_EXTS    = new Set(['.stl', '.obj', '.3mf']);
 const SLICE_EXTS  = new Set(['.chitubox', '.ctb', '.photon', '.lys', '.lychee']);
 const PLATE_EXTS  = new Set(['.gcode', '.gco', '.nc']);
-const RENDER_KW   = ['render', 'preview', 'thumb', 'photo', 'pic', 'image', 'renders', 'previews', 'photos', 'presentation'];
+// pic covers pics/pictures, image covers images/"(Images)", photo covers photos (docs/thumbnails.md §2.2)
+const RENDER_KW   = ['render', 'preview', 'thumb', 'photo', 'pic', 'image', 'renders', 'previews', 'photos', 'presentation',
+  'poster', 'promo', 'artwork', 'gallery', 'showcase'];
 const ARCHIVE_EXTS = new Set(['.zip', '.rar']);
 
 // Archives bigger than this are not opened for render extraction (they are read
@@ -179,37 +180,16 @@ async function extractImagesFromZip(zipPath, modelUuid, opts = {}) {
   }
 }
 
-// node-unrar-js v2's createExtractorFromData is async (it loads a WASM module);
-// calling it synchronously (as this used to) silently extracted nothing.
+// RAR is read from disk (lib/rar.js, node-unrar-js createExtractorFromFile): only the image
+// entries are written, so a multi-GB .rar no longer needs ARCHIVE_MAX_MB.
 async function extractImagesFromRar(rarPath, modelUuid) {
-  const extracted = [];
-  if (archiveTooBig(rarPath)) return extracted;
   try {
-    const data = fs.readFileSync(rarPath);
-    // Hand node-unrar-js the Buffer's own ArrayBuffer when it isn't a pooled
-    // slice (large reads never are) — avoids copying the whole archive again.
-    const ab = (data.byteOffset === 0 && data.byteLength === data.buffer.byteLength)
-      ? data.buffer
-      : data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
-    const extractor = await createExtractorFromData({ data: ab });
-    const modelImgDir = path.join(IMAGES_DIR, modelUuid);
-    if (!fs.existsSync(modelImgDir)) fs.mkdirSync(modelImgDir, { recursive: true });
-    // Only decompress image entries (the STLs in the same archive are skipped).
-    const list = extractor.extract({
-      files: (h) => !h.flags.directory && isRenderImage(h.name) && !(h.unpSize > imageMaxBytes()),
-    });
-    for (const file of list.files) {
-      const safeName = path.basename(String(file.fileHeader.name).replace(/\\/g, '/')).replace(/[^a-zA-Z0-9._-]/g, '_');
-      const outPath = path.join(modelImgDir, safeName);
-      if (!fs.existsSync(outPath) && file.extraction) {
-        fs.writeFileSync(outPath, file.extraction);
-      }
-      extracted.push(`/images/${modelUuid}/${safeName}`);
-    }
+    const names = await require('./lib/rar').extractRar(rarPath, path.join(IMAGES_DIR, modelUuid), (n) => isRenderImage(n), { maxBytes: imageMaxBytes() });
+    return [...new Set(names)].map(n => `/images/${modelUuid}/${n}`);
   } catch (e) {
     console.warn(`Could not extract rar ${rarPath}: ${e.message}`);
+    return [];
   }
-  return extracted;
 }
 
 /** Extract render images from a .zip/.rar into IMAGES_DIR/<uuid>/. Always returns a Promise. */
@@ -774,6 +754,7 @@ const worksLib = require('./lib/works');
 const metaLib = require('./lib/meta');
 const folderRolesLib = require('./lib/folder-roles');
 const librariesLib = require('./lib/libraries');
+const picturesLib = require('./lib/pictures');
 
 function layoutMode() {
   return String(process.env.LAYOUT_MODE || 'layout').trim().toLowerCase() === 'legacy' ? 'legacy' : 'layout';
@@ -830,19 +811,17 @@ function copyImageFiles(paths, modelUuid) {
   return out;
 }
 
-/** Renders for a work: hinted/render archives first (legacy order), then loose images. */
+/**
+ * Pictures for a work (lib/pictures.js steps a, f, p): hinted/render archives first (legacy order),
+ * then loose images, then a peek inside the work's other archives. { images, source, tried }
+ */
+async function workPictures(w, modelUuid, hint, log) {
+  const res = await picturesLib.findPictures({ files: w.files, uuid: modelUuid, hint, steps: 'afp', log });
+  if (res.images.length && res.source === 'archive') log('img', `       → ${res.images.length} image(s)`);
+  return res;
+}
 async function workImages(w, modelUuid, hint, log) {
-  const analysis = analysisFromFiles(w.files);
-  const fresh = [];
-  const archives = pickRenderArchives(analysis, hint).slice(0, MAX_RENDER_ARCHIVES);
-  for (const a of archives) {
-    log('zip', `    📦 ${path.basename(a)}`);
-    const imgs = await extractImagesFromArchive(a, modelUuid, { limit: MAX_ARCHIVE_IMAGES });
-    fresh.push(...imgs);
-    if (imgs.length) log('img', `       → ${imgs.length} image(s)`);
-  }
-  if (!fresh.length && analysis.images.length) fresh.push(...copyImageFiles(rankImages(analysis.images).slice(0, MAX_LOOSE_IMAGES), modelUuid));
-  return fresh;
+  return (await workPictures(w, modelUuid, hint, log)).images;
 }
 
 const parseJSON = (s, d) => { try { const v = JSON.parse(s); return v == null ? d : v; } catch { return d; } };
@@ -1008,6 +987,9 @@ function layoutStmts() {
         last_scanned=datetime('now'), updated_at=datetime('now')
       WHERE id=?`),
     touch: db.prepare(`UPDATE models SET last_scanned=datetime('now') WHERE id=?`),
+    setPics: db.prepare(`UPDATE models SET images=?, thumbnail_path=?, thumb_source=?, thumb_attempt=?, updated_at=datetime('now') WHERE id=?`),
+    setAttempt: db.prepare(`UPDATE models SET thumb_attempt=? WHERE id=?`),
+    setThumbMeta: db.prepare(`UPDATE models SET thumb_source=?, thumb_attempt=? WHERE id=?`),
     setPath: db.prepare(`UPDATE models SET folder_path=? WHERE id=?`),
     delByPath: db.prepare('DELETE FROM model_files WHERE filepath = ?'),
     delModelScope: db.prepare('DELETE FROM model_files WHERE model_id = ? AND filepath > ? AND filepath < ?'),
@@ -1102,7 +1084,7 @@ async function scanLibraryLayout(libraryPath, progressCallback, logger, { scope 
         if (!printedByNameSize.has(k) || printedByNameSize.get(k) < r.printed_at) printedByNameSize.set(k, r.printed_at);
       }
     }
-    const rows = new Map(db.prepare('SELECT id, uuid, work_key, folder_path, folded_into, hidden, name, name_locked, folder_hash, images, thumbnail_path, render_zip_hint, creator_id, attribution, franchise, team, group_name, character, editions, source_url FROM models').all().map(r => [r.id, r]));
+    const rows = new Map(db.prepare('SELECT id, uuid, work_key, folder_path, folded_into, hidden, name, name_locked, folder_hash, images, thumbnail_path, render_zip_hint, creator_id, attribution, franchise, team, group_name, character, editions, source_url, thumb_source, thumb_attempt FROM models').all().map(r => [r.id, r]));
     const byKey = new Map();
     const byFolder = new Map();
     for (const r of rows.values()) {
@@ -1293,6 +1275,19 @@ async function scanLibraryLayout(libraryPath, progressCallback, logger, { scope 
         const sameLabels = base && (base.franchise || null) === ft.franchise && (base.team || null) === ft.team;
         if (base && base.work_key === w.key && base.folder_hash === w.hash && filesOwned && prevAttr.sig === attribution.sig && base.folder_path === w.folderPath && sameLabels) {
           w.rowId = base.id;
+          // an unchanged card without a picture: steps a/f/p once per files signature + pipeline version
+          const sig = picturesLib.filesSig(w.files);
+          if (!parseJSON(base.images, []).length && base.thumb_source !== 'user' && !picturesLib.covered(base.thumb_attempt, sig, 'afp')) {
+            let pics = null;
+            try {
+              const creatorRow = stmts.getCreator.get(w.creator);
+              const res = await workPictures(w, base.uuid, base.render_zip_hint || (creatorRow && creatorRow.render_zip_hint) || null, log);
+              pics = { attempt: picturesLib.nextAttempt(base.thumb_attempt, sig, 'afp'), ...(res.images.length ? picturesLib.mergeImages(base, rankImages(res.images), res.source) : {}) };
+              if (res.images.length) { counters.pictured = (counters.pictured || 0) + 1; log('img', `    🖼 ${w.name}: ${res.images.length} picture(s) (${res.source})`); }
+            } catch (e) { log('warn', `    images for ${w.name}: ${e.message}`); }
+            prepared.push({ w, skip: true, pics });
+            continue;
+          }
           prepared.push({ w, skip: true });
           continue;
         }
@@ -1309,24 +1304,45 @@ async function scanLibraryLayout(libraryPath, progressCallback, logger, { scope 
           for (const im of parseJSON(k.r.images, [])) if (!images.includes(im)) images.push(im);
           if (!kidThumb && k.r.thumbnail_path) kidThumb = k.r.thumbnail_path;
         }
-        const needImages = !images.length || (w.baseByKey && base.folder_hash !== w.hash);
+        const sig = picturesLib.filesSig(w.files);
+        const isRender = (base && base.thumb_source === 'stl') || false;
+        const needImages = !images.length || (w.baseByKey && base.folder_hash !== w.hash) || (isRender && !picturesLib.covered(base.thumb_attempt, sig, 'afp'));
+        let fresh = [], freshSource = null, attempt = base ? base.thumb_attempt || null : null;
         if (needImages) {
           try {
-            const fresh = await workImages(w, uuid, hint, log);
+            const res = await workPictures(w, uuid, hint, log);
+            fresh = res.images; freshSource = res.source;
             if (fresh.length) images = [...new Set([...fresh, ...images])];
+            attempt = picturesLib.nextAttempt(attempt, sig, 'afp');
             counters.extracted = (counters.extracted || 0) + 1;
           } catch (e) { log('warn', `    images for ${w.name}: ${e.message}`); }
         }
         images = rankImages(images);
-        const thumbnail = base && base.thumbnail_path && images.includes(base.thumbnail_path) ? base.thumbnail_path
+        let thumbnail = base && base.thumbnail_path && images.includes(base.thumbnail_path) ? base.thumbnail_path
           : (kidThumb && images.includes(kidThumb) ? kidThumb : (images[0] || null));
-        prepared.push({ w, uuid, images, thumbnail, products, attribution, prevAttr, ft, kept });
+        let thumbSource = !images.length ? null
+          : (base && thumbnail === base.thumbnail_path ? (base.thumb_source || null) : (fresh.includes(thumbnail) ? freshSource : null));
+        if (isRender && fresh.length && freshSource !== 'stl' && base.thumb_source !== 'user') {
+          // real pictures replace a mesh render; the render moves to the end
+          const m = picturesLib.mergeImages(base, rankImages(fresh), freshSource);
+          images = [...new Set([...m.images, ...images])];
+          const renders = images.filter(i => i.endsWith(`/${picturesLib.PREVIEW_NAME}`));
+          images = [...images.filter(i => !renders.includes(i)), ...renders];
+          thumbnail = m.thumbnail_path; thumbSource = m.thumb_source;
+        }
+        if (!thumbSource && images.length && fresh.length && thumbnail === images[0] && fresh.includes(thumbnail)) thumbSource = freshSource;
+        prepared.push({ w, uuid, images, thumbnail, thumbSource, attempt, products, attribution, prevAttr, ft, kept });
       }
 
       db.transaction(() => {
         for (const p of prepared) {
           const w = p.w;
-          if (p.skip) { S.touch.run(w.base.id); counters.modelsSkipped++; continue; }
+          if (p.skip) {
+            S.touch.run(w.base.id); counters.modelsSkipped++;
+            if (p.pics && p.pics.images) S.setPics.run(JSON.stringify(p.pics.images), p.pics.thumbnail_path, p.pics.thumb_source, p.pics.attempt, w.base.id);
+            else if (p.pics) S.setAttempt.run(p.pics.attempt, w.base.id);
+            continue;
+          }
           const real = worksLib.realFolder(w.folderPath);
           const creatorId = getOrCreateCreator(w.creator, plan.creatorFolders.get(w.creator) || w.creatorFolder || real);
           const a = analysisFromFiles(w.files);
@@ -1359,6 +1375,7 @@ async function scanLibraryLayout(libraryPath, progressCallback, logger, { scope 
             if (w.splitSource) S.setNotes.run(`Split from ${w.splitSource.name} (release ${w.releaseLabel || w.releaseId})`, id);
           }
           w.rowId = id;
+          S.setThumbMeta.run(p.thumbSource || null, p.attempt || null, id);
           if (w.roleTags && w.roleTags.length) addRoleTags(id, w.roleTags);
           // files: take them from their old owners, replace this row's files in scope
           S.delModelScope.run(id, lo, hi);
@@ -1501,7 +1518,7 @@ async function scanLibraryLayout(libraryPath, progressCallback, logger, { scope 
     stmts.finishLog.run('complete', modelsFound, modelsAdded, modelsUpdated, modelsSkipped, logId);
     const scanMs = Date.now() - t0;
     log('info', `Skipped ${modelsSkipped} unchanged card(s)${folded ? `, folded ${folded} earlier model(s)` : ''} — ${Math.round(scanMs / 100) / 10}s (meta ${metaMs} ms)`);
-    return { success: true, modelsFound, modelsAdded, modelsUpdated, modelsSkipped, folded, extracted: counters.extracted || 0, byKind, metaMs, scanMs, files: tree.fileCount,
+    return { success: true, modelsFound, modelsAdded, modelsUpdated, modelsSkipped, folded, extracted: counters.extracted || 0, pictured: counters.pictured || 0, byKind, metaMs, scanMs, files: tree.fileCount,
       // plain _Meta summary for the server's /api/meta and /api/attribution routes (not sent to clients)
       metaSummary: (() => { try { return metaSummaryLib.summarize(meta); } catch { return null; } })() };
   } catch (err) {
@@ -1530,4 +1547,7 @@ module.exports = {
   scanLibrary, scanSingleCreator, scanLibraryLegacy, LIBRARY_PATH, matchesHint, pickRenderArchives, analyzeFolder,
   inferReleaseName, discoverModelFolders, extractImagesFromArchive, VARIANT_DIR, isImageFile: isRenderImage,
   layoutMode, rankImages, analysisFromFiles, realFolder: worksLib.realFolder, loadLibraryMeta, franchiseAndTeam, loadFolderRoles,
+  // used by lib/pictures.js
+  imageScoreOf: imageScore, isRenderArchive, copyImageFiles, workImages, workPictures,
+  MAX_RENDER_ARCHIVES, MAX_ARCHIVE_IMAGES, MAX_LOOSE_IMAGES,
 };

@@ -406,6 +406,23 @@ const MIGRATIONS = [
     db.exec(`CREATE INDEX IF NOT EXISTS idx_suggestions_model ON suggestions(model_id)`);
     db.exec(`CREATE INDEX IF NOT EXISTS idx_suggestions_path ON suggestions(path)`);
   },
+  // 8: thumbnails (docs/thumbnails.md §2): where a card's picture came from, and the signature of
+  //    the last attempt to find one (files + pipeline version + steps tried). Existing pictures get
+  //    a best guess: scraped_N.* from the web, a loose image of the card from its folder, else an archive.
+  () => {
+    addColumn('models', 'thumb_source TEXT');
+    addColumn('models', 'thumb_attempt TEXT');
+    const rows = db.prepare(`SELECT id, thumbnail_path FROM models WHERE thumbnail_path IS NOT NULL AND thumbnail_path != ''`).all();
+    const looseOf = db.prepare(`SELECT filename FROM model_files WHERE model_id = ? AND filetype = 'image'`);
+    const set = db.prepare('UPDATE models SET thumb_source = ? WHERE id = ?');
+    for (const r of rows) {
+      const base = String(r.thumbnail_path).split('/').pop();
+      let src = 'archive';
+      if (/^scraped_\d+\./.test(base)) src = 'web';
+      else if (looseOf.all(r.id).some(f => String(f.filename).replace(/[^a-zA-Z0-9._-]/g, '_') === base)) src = 'folder';
+      set.run(src, r.id);
+    }
+  },
 ];
 
 db.getSetting = (key) => {

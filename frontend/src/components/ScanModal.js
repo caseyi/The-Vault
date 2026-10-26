@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback, Suspense } from 'react';
 import TaskLog from './TaskLog';
 import Modal, { useUniqueId } from './Modal';
+import ThumbnailsPanel from './ThumbnailsPanel';
 
 // Enrich metadata (AI) lives in its own chunk; it is also used for "Enrich selected".
 const EnrichPanel = React.lazy(() => import('./EnrichPanel'));
@@ -35,6 +36,7 @@ export default function ScanModal({ onClose, onScanComplete, filters, onOpenRevi
   const [rootFilter, setRootFilter] = useState('');
   const [enriching, setEnriching] = useState(false);
   const [findingImages, setFindingImages] = useState(false);
+  const [fillingThumbs, setFillingThumbs] = useState(false);
   const [apiKey, setApiKey] = useState(() => localStorage.getItem('claude_api_key') || '');
   const [showKey, setShowKey] = useState(false);
   const [testingKey, setTestingKey] = useState(false);
@@ -313,7 +315,7 @@ export default function ScanModal({ onClose, onScanComplete, filters, onOpenRevi
   // Cleanup SSE connections on unmount
   useEffect(() => () => { imgEsRef.current?.close(); }, []);
 
-  const busyAi = enriching || findingImages;
+  const busyAi = enriching || findingImages || fillingThumbs;
 
   if (checking) {
     return (
@@ -475,6 +477,11 @@ export default function ScanModal({ onClose, onScanComplete, filters, onOpenRevi
             onOpenReview={onOpenReview}
             onDone={(r) => { if (onScanComplete) onScanComplete(); if (onEnrichDone) onEnrichDone(r); }} />
         </Suspense>
+
+        {/* Thumbnails: counts, find missing pictures (SSE), rebuild cache */}
+        <ThumbnailsPanel disabled={running}
+          onRunningChange={setFillingThumbs}
+          onChanged={() => { if (onScanComplete) onScanComplete(); }} />
 
         {reconnecting && (
           <div className="scan-reconnecting" role="status">

@@ -127,4 +127,20 @@ async function extractZipImages(file, destDir, opts = {}) {
   } finally { try { zf.close(); } catch {} }
 }
 
-module.exports = { listZip, extractZipImages, zipTooBig, zipMaxBytes, imageMaxBytes, safeName, IMAGE_EXTS, MAX_IMAGE_ENTRY_BYTES };
+/**
+ * Stream one entry to a file (never into memory). Refuses entries over maxBytes (uncompressed).
+ * @returns {Promise<string>} dest
+ */
+async function extractEntryToFile(file, entryName, dest, maxBytes = Infinity) {
+  const zf = await openZip(file);
+  try {
+    const e = (await readEntries(zf)).find(x => x.name === entryName && !x.isDirectory);
+    if (!e) throw new Error(`entry not found: ${entryName}`);
+    if (e.size > maxBytes) throw new Error(`entry is larger than ${Math.round(maxBytes / 1048576)} MB`);
+    fs.mkdirSync(path.dirname(dest), { recursive: true });
+    await writeEntry(zf, e._entry, dest);
+    return dest;
+  } finally { try { zf.close(); } catch {} }
+}
+
+module.exports = { listZip, extractZipImages, extractEntryToFile, zipTooBig, zipMaxBytes, imageMaxBytes, safeName, IMAGE_EXTS, MAX_IMAGE_ENTRY_BYTES };
