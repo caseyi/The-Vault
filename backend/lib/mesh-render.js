@@ -409,6 +409,20 @@ function viewBasis(azimuthDeg = 35, elevationDeg = 24) {
   return { r, u, d };
 }
 
+/**
+ * Rotations that turn each possible "down" direction into -Z (Z-up world for the view), as rows:
+ * p' = (M[0]·p, M[1]·p, M[2]·p). Order: -X, +X, -Y, +Y, -Z, +Z. All proper rotations (det 1).
+ */
+const DOWN_MATS = [
+  [[0, 0, -1], [0, 1, 0], [1, 0, 0]],   // -X down: (x,y,z) → (-z, y, x)
+  [[0, 0, 1], [0, 1, 0], [-1, 0, 0]],   // +X down: → (z, y, -x)
+  [[1, 0, 0], [0, 0, -1], [0, 1, 0]],   // -Y down (Y-up model): → (x, -z, y)
+  [[1, 0, 0], [0, 0, 1], [0, -1, 0]],   // +Y down: → (x, z, -y)
+  [[1, 0, 0], [0, 1, 0], [0, 0, 1]],    // -Z down (slicer convention)
+  [[1, 0, 0], [0, -1, 0], [0, 0, -1]],  // +Z down (upside down): → (x, -y, -z)
+];
+const DOWN_NAMES = ['-x', '+x', '-y', '+y', '-z', '+z'];
+
 // ── PNG ──────────────────────────────────────────────────────────────────────
 
 const CRC_TABLE = (() => {
@@ -511,35 +525,69 @@ async function renderMeshes(sources, opts = {}) {
   const { r, u, d } = viewBasis(opts.azimuth, opts.elevation);
   const memCap = opts.memTriangles || MEM_TRIANGLES;
 
-  // pass 1: bounds (world, and view space for both up-axis conventions), plus an in-memory copy
+  // pass 1: bounds (world, per source, and in view space for each of the 6 "down" directions),
+  // the axis-facing triangles for the flat-bottom detector, plus an in-memory copy
   let mem = new Float32Array(9 * 65536);
   let memN = 0;
   let memOk = true;
   let total = 0;
   const wb = [POS_INF, POS_INF, POS_INF, NEG_INF, NEG_INF, NEG_INF];
-  // view bounds: [minx, miny, minz, maxx, maxy, maxz] for Z-up (vz) and Y-up (vy)
-  const vz = [POS_INF, POS_INF, POS_INF, NEG_INF, NEG_INF, NEG_INF];
-  const vy = [POS_INF, POS_INF, POS_INF, NEG_INF, NEG_INF, NEG_INF];
-  const r0 = r[0], r1 = r[1], r2 = r[2], u0 = u[0], u1 = u[1], u2 = u[2], d0 = d[0], d1 = d[1], d2 = d[2];
+  // per orientation k: combined basis (view · M_k) as 9 numbers, and view bounds [min xyz, max xyz]
+  const OB = new Float64Array(54);
+  for (let k = 0; k < 6; k++) {
+    const M = DOWN_MATS[k];
+    for (let v = 0; v < 3; v++) {
+      const axis = v === 0 ? r : (v === 1 ? u : d);
+      for (let c = 0; c < 3; c++) OB[k * 9 + v * 3 + c] = axis[0] * M[0][c] + axis[1] * M[1][c] + axis[2] * M[2][c];
+    }
+  }
+  const VB = new Float64Array(36);
+  for (let k = 0; k < 6; k++) { VB[k * 6] = VB[k * 6 + 1] = VB[k * 6 + 2] = POS_INF; VB[k * 6 + 3] = VB[k * 6 + 4] = VB[k * 6 + 5] = NEG_INF; }
+  // flat-bottom detector records: triangles facing an axis (|n·axis| > 0.95)
+  const FLAT_CAP = 2000000;
+  let flatN = 0;
+  let fSrc = new Uint16Array(65536), fAxis = new Uint8Array(65536), fLo = new Float32Array(65536), fHi = new Float32Array(65536), fArea = new Float32Array(65536);
+  const srcBox = [], srcArea = [];
+  let si = 0;
+  let sb = null;
   const vert = (x, y, z) => {
-    if (x < wb[0]) wb[0] = x; if (y < wb[1]) wb[1] = y; if (z < wb[2]) wb[2] = z;
-    if (x > wb[3]) wb[3] = x; if (y > wb[4]) wb[4] = y; if (z > wb[5]) wb[5] = z;
-    // Z-up
-    let sx = x * r0 + y * r1 + z * r2, sy = x * u0 + y * u1 + z * u2, sz = x * d0 + y * d1 + z * d2;
-    if (sx < vz[0]) vz[0] = sx; if (sy < vz[1]) vz[1] = sy; if (sz < vz[2]) vz[2] = sz;
-    if (sx > vz[3]) vz[3] = sx; if (sy > vz[4]) vz[4] = sy; if (sz > vz[5]) vz[5] = sz;
-    // Y-up: (x, y, z) → (x, -z, y)
-    sx = x * r0 - z * r1 + y * r2; sy = x * u0 - z * u1 + y * u2; sz = x * d0 - z * d1 + y * d2;
-    if (sx < vy[0]) vy[0] = sx; if (sy < vy[1]) vy[1] = sy; if (sz < vy[2]) vy[2] = sz;
-    if (sx > vy[3]) vy[3] = sx; if (sy > vy[4]) vy[4] = sy; if (sz > vy[5]) vy[5] = sz;
+    if (x < sb[0]) sb[0] = x; if (y < sb[1]) sb[1] = y; if (z < sb[2]) sb[2] = z;
+    if (x > sb[3]) sb[3] = x; if (y > sb[4]) sb[4] = y; if (z > sb[5]) sb[5] = z;
+    for (let k = 0, o = 0, q = 0; k < 6; k++, o += 9, q += 6) {
+      const sx = x * OB[o] + y * OB[o + 1] + z * OB[o + 2], sy = x * OB[o + 3] + y * OB[o + 4] + z * OB[o + 5], sz = x * OB[o + 6] + y * OB[o + 7] + z * OB[o + 8];
+      if (sx < VB[q]) VB[q] = sx; if (sy < VB[q + 1]) VB[q + 1] = sy; if (sz < VB[q + 2]) VB[q + 2] = sz;
+      if (sx > VB[q + 3]) VB[q + 3] = sx; if (sy > VB[q + 4]) VB[q + 4] = sy; if (sz > VB[q + 5]) VB[q + 5] = sz;
+    }
+  };
+  const flat = (ax, ay, az, bx, by, bz, cx, cy, cz) => {
+    const e1x = bx - ax, e1y = by - ay, e1z = bz - az, e2x = cx - ax, e2y = cy - ay, e2z = cz - az;
+    const nx = e1y * e2z - e1z * e2y, ny = e1z * e2x - e1x * e2z, nz = e1x * e2y - e1y * e2x;
+    const len = SQRT(nx * nx + ny * ny + nz * nz);
+    if (!(len > 0)) return;
+    srcArea[si] += len / 2;
+    let axis = -1, lo = 0, hi = 0;
+    if (ABS(nz) > 0.95 * len) { axis = 2; lo = MIN(az, bz, cz); hi = MAX(az, bz, cz); }
+    else if (ABS(ny) > 0.95 * len) { axis = 1; lo = MIN(ay, by, cy); hi = MAX(ay, by, cy); }
+    else if (ABS(nx) > 0.95 * len) { axis = 0; lo = MIN(ax, bx, cx); hi = MAX(ax, bx, cx); }
+    if (axis < 0 || flatN >= FLAT_CAP) return;
+    if (flatN === fSrc.length) {
+      const grow = (A) => { const nb = new A.constructor(A.length * 2); nb.set(A); return nb; };
+      fSrc = grow(fSrc); fAxis = grow(fAxis); fLo = grow(fLo); fHi = grow(fHi); fArea = grow(fArea);
+    }
+    fSrc[flatN] = si; fAxis[flatN] = axis; fLo[flatN] = lo; fHi[flatN] = hi; fArea[flatN] = len / 2;
+    flatN++;
   };
   const used = [];
   for (const src of sources) {
     if (opts.shouldStop && opts.shouldStop()) throw new Error('stopped');
     if (total >= maxTris) break;
+    si = used.length;
+    sb = [POS_INF, POS_INF, POS_INF, NEG_INF, NEG_INF, NEG_INF];
+    srcBox[si] = sb; srcArea[si] = 0;
     const n = await forEachTriangle(src, (ax, ay, az, bx, by, bz, cx, cy, cz) => {
       if (!(isFin(ax + ay + az + bx + by + bz + cx + cy + cz))) return;
       vert(ax, ay, az); vert(bx, by, bz); vert(cx, cy, cz);
+      flat(ax, ay, az, bx, by, bz, cx, cy, cz);
       if (memOk) {
         if ((memN + 1) * 9 > mem.length) {
           if (mem.length / 9 >= memCap) { memOk = false; mem = null; return; }
@@ -552,19 +600,50 @@ async function renderMeshes(sources, opts = {}) {
     }, { limit: maxTris - total });
     total += n;
     used.push(src);
+    for (let c = 0; c < 3; c++) { if (sb[c] < wb[c]) wb[c] = sb[c]; if (sb[c + 3] > wb[c + 3]) wb[c + 3] = sb[c + 3]; }
   }
   if (!isFin(wb[0]) || total === 0) throw new Error('no triangles in the mesh');
   const tRead = Date.now();
 
-  const ex = wb[3] - wb[0], ey = wb[4] - wb[1], ez = wb[5] - wb[2];
-  const up = opts.upAxis === 'y' || (opts.upAxis !== 'z' && ey > 1.6 * ez && ey > 1.2 * ex) ? 'y' : 'z';
-  const vb = up === 'y' ? vy : vz;
+  // which way is down: the flat bottom of the largest part (sources are drawn together)
+  let main = 0;
+  for (let k = 1; k < used.length; k++) if (srcArea[k] > srcArea[main]) main = k;
+  const down = new Float64Array(6); // -X +X -Y +Y -Z +Z
+  {
+    const b = srcBox[main];
+    for (let i = 0; i < flatN; i++) {
+      if (fSrc[i] !== main) continue;
+      const a = fAxis[i];
+      const tol = 0.02 * (b[a + 3] - b[a]);
+      if (fHi[i] - b[a] <= tol) down[2 * a] += fArea[i];
+      if (b[a + 3] - fLo[i] <= tol) down[2 * a + 1] += fArea[i];
+    }
+  }
+  let k = 4;
+  if (opts.upAxis === 'z') k = 4;
+  else if (opts.upAxis === 'y') k = 2;
+  else {
+    let best = 4;
+    for (let q = 0; q < 6; q++) if (down[q] > down[best]) best = q;
+    // slicer convention wins when it already stands on a sizeable flat face (blocks, plates, busts
+    // on square plinths); otherwise the largest flat face at an extreme is the bottom
+    // a clear winner only: at least 1% of the surface and 1.5x any other direction (curved
+    // surfaces have small near-flat patches at every extreme: a tie)
+    let second = 0;
+    for (let q = 0; q < 6; q++) if (q !== best && down[q] > second) second = down[q];
+    if (down[best] >= 0.01 * (srcArea[main] || 1) && down[best] >= 1.5 * second && down[4] < 0.5 * down[best]) k = best;
+  }
+  const up = k >> 1 === 0 ? 'x' : (k >> 1 === 1 ? 'y' : 'z');
+  const ob = k * 9;
+  const r0 = OB[ob], r1 = OB[ob + 1], r2 = OB[ob + 2], u0 = OB[ob + 3], u1 = OB[ob + 4], u2 = OB[ob + 5], d0 = OB[ob + 6], d1 = OB[ob + 7], d2 = OB[ob + 8];
+  const vb = Array.from(VB.subarray(k * 6, k * 6 + 6));
   const spanX = vb[3] - vb[0], spanY = vb[4] - vb[1];
   const span = MAX(spanX, spanY) || 1;
   const margin = 0.08;
   const scale = (W * (1 - 2 * margin)) / span;
   const cxv = (vb[0] + vb[3]) / 2, cyv = (vb[1] + vb[4]) / 2;
   const zmin = vb[2], zmax = vb[5];
+  fSrc = fAxis = fLo = fHi = fArea = null;
 
   // pass 2: raster (depth + view-space normal per sample)
   const N = W * H;
@@ -573,7 +652,6 @@ async function renderMeshes(sources, opts = {}) {
   let drawn = 0;
   const halfW = W / 2, halfH = H / 2;
   const tri = (ax, ay, az, bx, by, bz, cx, cy, cz) => {
-    if (up === 'y') { let t = ay; ay = -az; az = t; t = by; by = -bz; bz = t; t = cy; cy = -cz; cz = t; }
     // view space
     const sax = ax * r0 + ay * r1 + az * r2, say = ax * u0 + ay * u1 + az * u2, saz = ax * d0 + ay * d1 + az * d2;
     const sbx = bx * r0 + by * r1 + bz * r2, sby = bx * u0 + by * u1 + bz * u2, sbz = bx * d0 + by * d1 + bz * d2;
@@ -664,7 +742,7 @@ async function renderMeshes(sources, opts = {}) {
   const png = encodePng(rgb, size, size);
   const tEnd = Date.now();
   return {
-    png, width: size, height: size, triangles: total, drawn, coverage: hit / N, upAxis: up,
+    png, width: size, height: size, triangles: total, drawn, coverage: hit / N, upAxis: up, down: DOWN_NAMES[k],
     ms: { read: tRead - t0, raster: tRaster - tRead, shade: tShade - tRaster, encode: tEnd - tShade, total: tEnd - t0 },
   };
 }
@@ -771,5 +849,5 @@ function estimateTriangles(name, size) {
 }
 
 module.exports = {
-  renderMeshes, forEachTriangle, encodePng, decodePng, estimateTriangles, viewBasis, MESH_EXTS,
+  DOWN_MATS, DOWN_NAMES, renderMeshes, forEachTriangle, encodePng, decodePng, estimateTriangles, viewBasis, MESH_EXTS,
 };

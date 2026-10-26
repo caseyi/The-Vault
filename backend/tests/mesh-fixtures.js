@@ -105,4 +105,58 @@ async function noisyImage(sharp, w, h, fmt = 'png') {
   return fmt === 'jpeg' ? img.jpeg({ quality: 95 }).toBuffer() : img.png().toBuffer();
 }
 
-module.exports = { boxTris, torusTris, binaryStl, writeTorusStl, asciiStl, obj, threeMf, noisyImage, zlib };
+/**
+ * A miniature on a round base, Z up: a disc (radius 12, 3 high) with a figure (a tall box and a
+ * ball-ish head) standing on it. `map` re-orients every vertex, e.g. Y-up: ([x, y, z]) => [x, z, -y].
+ */
+function miniTris(map = (p) => p) {
+  const out = [];
+  const seg = 48, R = 12, h = 3;
+  for (let i = 0; i < seg; i++) {
+    const a0 = (i / seg) * 2 * Math.PI, a1 = ((i + 1) / seg) * 2 * Math.PI;
+    const p0 = [R * Math.cos(a0), R * Math.sin(a0)], p1 = [R * Math.cos(a1), R * Math.sin(a1)];
+    out.push([0, 0, 0, p1[0], p1[1], 0, p0[0], p0[1], 0]);           // bottom (faces -Z)
+    out.push([0, 0, h, p0[0], p0[1], h, p1[0], p1[1], h]);           // top of the base
+    out.push([p0[0], p0[1], 0, p1[0], p1[1], 0, p1[0], p1[1], h]);   // rim
+    out.push([p0[0], p0[1], 0, p1[0], p1[1], h, p0[0], p0[1], h]);
+  }
+  // body: a slightly twisted column so its sides do not face an axis
+  const body = boxTris(-4, -3, h, 4, 3, h + 30).map(t => {
+    const q = [];
+    for (let k = 0; k < 9; k += 3) { const z = t[k + 2], a = 0.35 + z * 0.01; q.push(t[k] * Math.cos(a) - t[k + 1] * Math.sin(a), t[k] * Math.sin(a) + t[k + 1] * Math.cos(a), z); }
+    return q;
+  });
+  out.push(...body);
+  return out.map(t => { const q = []; for (let k = 0; k < 9; k += 3) q.push(...map([t[k], t[k + 1], t[k + 2]])); return q; });
+}
+
+/** Minimal RAR 4.x writer (stored entries), as in archives.test.js. */
+function makeRar(entries) {
+  const hdr = (body) => { const crc = Buffer.alloc(2); crc.writeUInt16LE(zlib.crc32(body) & 0xffff); return Buffer.concat([crc, body]); };
+  const main = Buffer.alloc(11); main.writeUInt8(0x73, 0); main.writeUInt16LE(0, 1); main.writeUInt16LE(13, 3);
+  const parts = [Buffer.from('Rar!\x1a\x07\x00', 'binary'), hdr(main)];
+  for (const [name, data] of entries) {
+    const nb = Buffer.from(name);
+    const b = Buffer.alloc(30 + nb.length);
+    let o = 0;
+    b.writeUInt8(0x74, o); o += 1;
+    b.writeUInt16LE(0x8000, o); o += 2;
+    b.writeUInt16LE(32 + nb.length, o); o += 2;
+    b.writeUInt32LE(data.length, o); o += 4;
+    b.writeUInt32LE(data.length, o); o += 4;
+    b.writeUInt8(2, o); o += 1;
+    b.writeUInt32LE(zlib.crc32(data) >>> 0, o); o += 4;
+    b.writeUInt32LE(0x5a210000, o); o += 4;
+    b.writeUInt8(29, o); o += 1;
+    b.writeUInt8(0x30, o); o += 1;
+    b.writeUInt16LE(nb.length, o); o += 2;
+    b.writeUInt32LE(0x20, o); o += 4;
+    nb.copy(b, o);
+    parts.push(hdr(b), data);
+  }
+  const end = Buffer.alloc(5); end.writeUInt8(0x7b, 0); end.writeUInt16LE(0x4000, 1); end.writeUInt16LE(7, 3);
+  parts.push(hdr(end));
+  return Buffer.concat(parts);
+}
+
+module.exports = { miniTris, makeRar, boxTris, torusTris, binaryStl, writeTorusStl, asciiStl, obj, threeMf, noisyImage, zlib };

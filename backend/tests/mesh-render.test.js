@@ -117,13 +117,36 @@ describe('render', () => {
     expect(Buffer.compare(a.png, b.png)).toBe(0);
   });
 
-  test('Y-up meshes are stood up (much taller in Y)', async () => {
-    const r = await mr.renderMeshes([{ kind: 'file', path: file('yup.stl', fx.binaryStl(fx.boxTris(0, 0, 0, 10, 80, 10))) }]);
-    expect(r.upAxis).toBe('y');
-    const a = analyse(r.png);
-    expect(a.maxy - a.miny).toBeGreaterThan(a.maxx - a.minx);
-    const flat = await mr.renderMeshes([{ kind: 'file', path: file('flat.stl', fx.binaryStl(fx.boxTris(0, 0, 0, 80, 80, 5))) }]);
-    expect(flat.upAxis).toBe('z');
+  test('up axis: the flat bottom of a round base points down, whichever axis it is on', async () => {
+    const orient = [
+      ['-z', (p) => p],
+      ['-y', ([x, y, z]) => [x, z, -y]],     // Y-up export
+      ['-x', ([x, y, z]) => [z, y, -x]],     // base facing -X
+      ['+x', ([x, y, z]) => [-z, y, x]],     // base facing +X
+      ['+z', ([x, y, z]) => [x, -y, -z]],    // upside down
+    ];
+    for (const [want, map] of orient) {
+      const r = await mr.renderMeshes([{ kind: 'file', path: file(`mini${want}.stl`, fx.binaryStl(fx.miniTris(map))) }]);
+      expect(r.down).toBe(want);
+      // stood up: the figure is taller than the base is wide, and the base is at the bottom
+      const a = analyse(r.png);
+      expect(a.maxy - a.miny).toBeGreaterThan((a.maxx - a.minx) * 1.1);
+    }
+  });
+
+  test('up axis: no flat face (or a tie with -Z) keeps Z up', async () => {
+    expect((await mr.renderMeshes([{ kind: 'file', path: file('round.stl', fx.binaryStl(fx.torusTris(40, 20))) }])).down).toBe('-z');
+    expect((await mr.renderMeshes([{ kind: 'file', path: file('rod.stl', fx.binaryStl(fx.boxTris(0, 0, 0, 10, 80, 10))) }])).down).toBe('-z');
+    expect((await mr.renderMeshes([{ kind: 'file', path: file('plate.stl', fx.binaryStl(fx.boxTris(0, 0, 0, 80, 80, 5))) }])).upAxis).toBe('z');
+  });
+
+  test('up axis: multi-part renders use the largest part for all parts', async () => {
+    const yup = ([x, y, z]) => [x, z, -y];
+    const body = file('kitY/body.stl', fx.binaryStl(fx.miniTris(yup)));
+    // a small part with a big flat face toward +X; alone it would be turned
+    const arm = file('kitY/arm.stl', fx.binaryStl(fx.boxTris(20, 10, -2, 21, 14, 2)));
+    const r = await mr.renderMeshes([{ kind: 'file', path: arm }, { kind: 'file', path: body }]);
+    expect(r.down).toBe('-y');
   });
 
   test('multi-part folder: parts are drawn together in place', async () => {

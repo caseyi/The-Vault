@@ -1,7 +1,6 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { createExtractorFromData } = require('node-unrar-js');
 const db = require('./db');
 const {
   discoverModelFolders, VARIANT_DIR, MEDIA_DIR, IGNORED_FOLDERS, isJunkFile,
@@ -181,37 +180,16 @@ async function extractImagesFromZip(zipPath, modelUuid, opts = {}) {
   }
 }
 
-// node-unrar-js v2's createExtractorFromData is async (it loads a WASM module);
-// calling it synchronously (as this used to) silently extracted nothing.
+// RAR is read from disk (lib/rar.js, node-unrar-js createExtractorFromFile): only the image
+// entries are written, so a multi-GB .rar no longer needs ARCHIVE_MAX_MB.
 async function extractImagesFromRar(rarPath, modelUuid) {
-  const extracted = [];
-  if (archiveTooBig(rarPath)) return extracted;
   try {
-    const data = fs.readFileSync(rarPath);
-    // Hand node-unrar-js the Buffer's own ArrayBuffer when it isn't a pooled
-    // slice (large reads never are) — avoids copying the whole archive again.
-    const ab = (data.byteOffset === 0 && data.byteLength === data.buffer.byteLength)
-      ? data.buffer
-      : data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
-    const extractor = await createExtractorFromData({ data: ab });
-    const modelImgDir = path.join(IMAGES_DIR, modelUuid);
-    if (!fs.existsSync(modelImgDir)) fs.mkdirSync(modelImgDir, { recursive: true });
-    // Only decompress image entries (the STLs in the same archive are skipped).
-    const list = extractor.extract({
-      files: (h) => !h.flags.directory && isRenderImage(h.name) && !(h.unpSize > imageMaxBytes()),
-    });
-    for (const file of list.files) {
-      const safeName = path.basename(String(file.fileHeader.name).replace(/\\/g, '/')).replace(/[^a-zA-Z0-9._-]/g, '_');
-      const outPath = path.join(modelImgDir, safeName);
-      if (!fs.existsSync(outPath) && file.extraction) {
-        fs.writeFileSync(outPath, file.extraction);
-      }
-      extracted.push(`/images/${modelUuid}/${safeName}`);
-    }
+    const names = await require('./lib/rar').extractRar(rarPath, path.join(IMAGES_DIR, modelUuid), (n) => isRenderImage(n), { maxBytes: imageMaxBytes() });
+    return [...new Set(names)].map(n => `/images/${modelUuid}/${n}`);
   } catch (e) {
     console.warn(`Could not extract rar ${rarPath}: ${e.message}`);
+    return [];
   }
-  return extracted;
 }
 
 /** Extract render images from a .zip/.rar into IMAGES_DIR/<uuid>/. Always returns a Promise. */
