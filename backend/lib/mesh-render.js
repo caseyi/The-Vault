@@ -605,6 +605,17 @@ async function renderMeshes(sources, opts = {}) {
   if (!isFin(wb[0]) || total === 0) throw new Error('no triangles in the mesh');
   const tRead = Date.now();
 
+  // parts that are not an assembly (laid out side by side on a plate, a figure next to its base):
+  // render only the largest one, with its own up axis
+  if (used.length > 1 && opts.assemblyCheck !== false) {
+    const which = assemblyCheck(used, srcBox, srcArea);
+    if (!which.assembly) {
+      mem = null;
+      const res = await renderMeshes([used[which.main]], { ...opts, assemblyCheck: false, maxTriangles: POS_INF });
+      return { ...res, parts: [sources.indexOf(used[which.main])], assembly: false, ms: { ...res.ms, total: Date.now() - t0 } };
+    }
+  }
+
   // which way is down: the flat bottom of the largest part (sources are drawn together)
   let main = 0;
   for (let k = 1; k < used.length; k++) if (srcArea[k] > srcArea[main]) main = k;
@@ -743,8 +754,50 @@ async function renderMeshes(sources, opts = {}) {
   const tEnd = Date.now();
   return {
     png, width: size, height: size, triangles: total, drawn, coverage: hit / N, upAxis: up, down: DOWN_NAMES[k],
+    parts: used.map(u2 => sources.indexOf(u2)), assembly: used.length > 1 ? true : null,
     ms: { read: tRead - t0, raster: tRaster - tRead, shade: tShade - tRaster, encode: tEnd - tShade, total: tEnd - t0 },
   };
+}
+
+const BASE_NAME_RE = /(^|[^a-z])(base|bases|plinth|stand|pedestal)([^a-z]|$)/i;
+function sourceName(src) {
+  return path.basename(String(src.kind === 'zip' ? src.entry : (src.kind === 'buffer' ? src.name : src.path) || ''));
+}
+
+/**
+ * Do these parts form one model in place? Not when their boxes mostly do not overlap: the union
+ * box is more than 3x the summed part boxes, or fewer than half of the other parts touch the
+ * largest part's box grown by 10%. The largest part is by surface area, base-like names last.
+ * @returns {{ assembly: boolean, main: number }}
+ */
+function assemblyCheck(srcs, boxes, areas) {
+  const n = srcs.length;
+  let main = -1;
+  for (let i = 0; i < n; i++) {
+    const isBase = BASE_NAME_RE.test(sourceName(srcs[i]).replace(/\.[^.]+$/, ''));
+    if (isBase) continue;
+    if (main < 0 || areas[i] > areas[main]) main = i;
+  }
+  if (main < 0) { main = 0; for (let i = 1; i < n; i++) if (areas[i] > areas[main]) main = i; }
+  const U = [POS_INF, POS_INF, POS_INF, NEG_INF, NEG_INF, NEG_INF];
+  for (const b of boxes) for (let c = 0; c < 3; c++) { U[c] = MIN(U[c], b[c]); U[c + 3] = MAX(U[c + 3], b[c + 3]); }
+  const pad = 0.01 * SQRT((U[3] - U[0]) ** 2 + (U[4] - U[1]) ** 2 + (U[5] - U[2]) ** 2); // flat parts still have a volume
+  const vol = (b) => (b[3] - b[0] + pad) * (b[4] - b[1] + pad) * (b[5] - b[2] + pad);
+  let sum = 0;
+  for (const b of boxes) sum += vol(b);
+  const spread = vol(U) > 3 * sum;
+  const M = boxes[main];
+  const g = [0, 1, 2].map(c => 0.1 * (M[c + 3] - M[c]) + pad);
+  let touching = 0;
+  for (let i = 0; i < n; i++) {
+    if (i === main) continue;
+    const b = boxes[i];
+    let hit = true;
+    for (let c = 0; c < 3; c++) if (b[c] > M[c + 3] + g[c] || b[c + 3] < M[c] - g[c]) hit = false;
+    if (hit) touching++;
+  }
+  const apart = touching < (n - 1) / 2;
+  return { assembly: !(spread || apart), main };
 }
 
 /** Summed-area table of a Float32Array (W x H) → Float64Array ((W+1) x (H+1)). */
@@ -849,5 +902,5 @@ function estimateTriangles(name, size) {
 }
 
 module.exports = {
-  DOWN_MATS, DOWN_NAMES, renderMeshes, forEachTriangle, encodePng, decodePng, estimateTriangles, viewBasis, MESH_EXTS,
+  assemblyCheck, DOWN_MATS, DOWN_NAMES, renderMeshes, forEachTriangle, encodePng, decodePng, estimateTriangles, viewBasis, MESH_EXTS,
 };

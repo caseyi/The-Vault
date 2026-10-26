@@ -388,8 +388,10 @@ async function renderPreview(files, uuid, opts = {}) {
     fs.writeFileSync(tmp, res.png);
     fs.renameSync(tmp, dest);
     try { require('./thumbs').removeImageThumbs(`/images/${uuid}/${PREVIEW_NAME}`); } catch {}
-    log('img', `    ◆ rendered ${choice.parts.map(p => p.label).join(', ')} (${res.triangles.toLocaleString('en-US')} triangles, ${res.ms.total} ms)`);
-    return { url: `/images/${uuid}/${PREVIEW_NAME}`, triangles: res.triangles, ms: res.ms.total, parts: choice.parts.map(p => p.id), upAxis: res.upAxis };
+    const drawn = (res.parts && res.parts.length && res.parts.length <= choice.parts.length && res.parts.every(i => i >= 0))
+      ? res.parts.map(i => choice.parts[i]) : choice.parts;
+    log('img', `    ◆ rendered ${drawn.map(p => p.label).join(', ')}${res.assembly === false ? ' (parts are laid out apart: largest part only)' : ''} (${res.triangles.toLocaleString('en-US')} triangles, ${res.ms.total} ms)`);
+    return { url: `/images/${uuid}/${PREVIEW_NAME}`, triangles: res.triangles, ms: res.ms.total, parts: drawn.map(p => p.id), upAxis: res.upAxis, assembly: res.assembly };
   } finally {
     temps.forEach(rmQuiet);
   }

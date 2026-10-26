@@ -143,24 +143,55 @@ describe('render', () => {
   test('up axis: multi-part renders use the largest part for all parts', async () => {
     const yup = ([x, y, z]) => [x, z, -y];
     const body = file('kitY/body.stl', fx.binaryStl(fx.miniTris(yup)));
-    // a small part with a big flat face toward +X; alone it would be turned
-    const arm = file('kitY/arm.stl', fx.binaryStl(fx.boxTris(20, 10, -2, 21, 14, 2)));
+    // a small part attached to the figure (so the parts are one assembly)
+    const arm = file('kitY/arm.stl', fx.binaryStl(fx.boxTris(10, 10, -3, 11, 16, 3)));
     const r = await mr.renderMeshes([{ kind: 'file', path: arm }, { kind: 'file', path: body }]);
     expect(r.down).toBe('-y');
   });
 
-  test('multi-part folder: parts are drawn together in place', async () => {
-    const left = file('kit/left_arm.stl', fx.binaryStl(fx.boxTris(-60, 0, 0, -40, 20, 40)));
-    const right = file('kit/right_arm.stl', fx.asciiStl(fx.boxTris(40, 0, 0, 60, 20, 40)));
-    const both = analyse((await mr.renderMeshes([{ kind: 'file', path: left }, { kind: 'file', path: right }])).png);
-    const one = analyse((await mr.renderMeshes([{ kind: 'file', path: left }])).png);
-    // two blocks far apart: the middle column of the picture is background
-    const { data, width } = mr.decodePng((await mr.renderMeshes([{ kind: 'file', path: left }, { kind: 'file', path: right }])).png);
-    let mid = 0;
-    for (let y = 0; y < 640; y++) { const o = (y * width + 320) * 3; if (data[o] >= data[o + 2]) mid++; }
-    expect(mid).toBe(0);
-    expect(both.maxx - both.minx).toBeGreaterThan(400);
-    expect(one.share).toBeGreaterThan(both.share); // a single part fills the frame on its own
+  test('assembly: a statue split at the waist and parts sharing coordinates render together', async () => {
+    const legs = file('statue/legs.stl', fx.binaryStl(fx.boxTris(-10, -6, 0, 10, 6, 40)));
+    const torso = file('statue/torso.stl', fx.asciiStl(fx.boxTris(-12, -7, 40, 12, 7, 75)));
+    const head = file('statue/head.stl', fx.binaryStl(fx.boxTris(-5, -5, 75, 5, 5, 88)));
+    const arm = file('statue/arm_left.stl', fx.binaryStl(fx.boxTris(-20, -3, 45, -12, 3, 72))); // touches the torso
+    const r = await mr.renderMeshes([legs, torso, head, arm].map(p => ({ kind: 'file', path: p })));
+    expect(r.assembly).toBe(true);
+    expect(r.parts).toEqual([0, 1, 2, 3]);
+    const a = analyse(r.png);
+    expect(a.maxy - a.miny).toBeGreaterThan(450); // the whole statue fills the frame height
+    // Wicked: parts exported in place, overlapping boxes
+    const body = file('wicked/body.stl', fx.binaryStl(fx.miniTris()));
+    const cape = file('wicked/cape.stl', fx.binaryStl(fx.boxTris(-6, 3, 8, 6, 5, 30)));
+    expect((await mr.renderMeshes([{ kind: 'file', path: body }, { kind: 'file', path: cape }])).assembly).toBe(true);
+  });
+
+  test('not an assembly: parts laid out apart render only the largest part (Flind, Eyepatch)', async () => {
+    // Eyepatch: a figure and its base far apart → each would be tiny in the frame
+    const fig = file('eyepatch/eyepatch_32mm.stl', fx.binaryStl(fx.miniTris()));
+    const base = file('eyepatch/eyepatch_base.stl', fx.binaryStl(fx.boxTris(300, 300, 0, 330, 330, 4)));
+    const r = await mr.renderMeshes([{ kind: 'file', path: base }, { kind: 'file', path: fig }]);
+    expect(r.assembly).toBe(false);
+    expect(r.parts).toEqual([1]);
+    const a = analyse(r.png);
+    expect(a.maxy - a.miny).toBeGreaterThan(450); // the figure alone fills the frame
+    // Flind: body, arms, head and a base disc side by side on the plate (Y-up export)
+    const yup = ([x, y, z]) => [x, z, -y];
+    const parts = [
+      ['flind/body.stl', fx.miniTris(yup)],
+      ['flind/arm_l.stl', fx.boxTris(40, 0, -3, 46, 20, 3)],
+      ['flind/arm_r.stl', fx.boxTris(60, 0, -3, 66, 20, 3)],
+      ['flind/head.stl', fx.boxTris(80, 0, -4, 88, 9, 4)],
+    ].map(([n, t]) => ({ kind: 'file', path: file(n, fx.binaryStl(t)) }));
+    const f = await mr.renderMeshes(parts);
+    expect(f.assembly).toBe(false);
+    expect(f.parts).toEqual([0]);
+    expect(f.down).toBe('-y'); // its own up axis
+  });
+
+  test('assemblyCheck ignores base-like names when picking the largest part', () => {
+    const box = (x0, x1) => [x0, 0, 0, x1, 10, 10];
+    const r = mr.assemblyCheck([{ kind: 'file', path: '/a/round_base.stl' }, { kind: 'file', path: '/a/hero.stl' }], [box(0, 100), box(500, 510)], [9000, 500]);
+    expect(r).toEqual({ assembly: false, main: 1 });
   });
 
   test('1M triangles render in bounded time (reported)', async () => {
