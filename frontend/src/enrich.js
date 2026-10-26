@@ -9,11 +9,12 @@ export const REVIEW_GROUPS = [
   { id: 'names', label: 'Names', filter: { type: 'rename' }, count: s => s?.byType?.rename },
   { id: 'editions', label: 'Editions', filter: { type: 'field', field: 'editions' }, count: s => s?.byField?.editions, optional: true },
   { id: 'tags', label: 'Tags', filter: { type: 'field', field: 'tags' }, count: s => s?.byField?.tags },
+  { id: 'roles', label: 'Folder roles', filter: { type: 'role' }, count: s => s?.byType?.role, optional: true },
 ];
 
 export const FIELD_LABELS = {
   character: 'Character', franchise: 'Genre', group_name: 'Group', editions: 'Editions', name: 'Name', tags: 'Tags',
-  studio: 'Studio', release_term: 'Term',
+  studio: 'Studio', release_term: 'Term', folder_role: 'Folder role',
 };
 
 export const HIGH_MIN = 0.8;

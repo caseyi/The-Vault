@@ -443,7 +443,7 @@ function resolveCreatorDirs(basePath, depth = 0, log = () => {}, overrides = new
     const ov = overrides.get(dirPath);
     if (ov === 'ignore') { log('info', `Skipping "${dir.name}" (manual override: ignore)`); continue; }
     if (ov === 'creator') { results.push({ name: dir.name, path: dirPath }); continue; }
-    if (ov === 'passthrough' && depth < MAX_PASSTHROUGH_DEPTH) {
+    if ((ov === 'passthrough' || ov === 'category') && depth < MAX_PASSTHROUGH_DEPTH) {
       log('info', `"${dir.name}" → descending (manual override: container)`);
       results.push(...resolveCreatorDirs(dirPath, depth + 1, log, overrides));
       continue;
@@ -465,6 +465,16 @@ function resolveCreatorDirs(basePath, depth = 0, log = () => {}, overrides = new
 function loadFolderOverrides() {
   try { return new Map(db.prepare('SELECT path, role FROM folder_overrides').all().map(r => [r.path, r.role])); }
   catch { return new Map(); }
+}
+
+/**
+ * Effective folder roles (docs/folder-roles.md §2): `_Meta/folder_roles.csv` rows (meta.folderRoles)
+ * merged over the app's marks; the file wins.
+ * @returns {{ overrides: Map, roleInfo: Map, merged: Map }}
+ */
+function loadFolderRoles(meta) {
+  const merged = folderRolesLib.mergeRoles((meta && meta.folderRoles) || [], folderRolesLib.loadAppRoles(db));
+  return { merged, ...folderRolesLib.roleMaps(merged) };
 }
 
 function nextPathBound(p) {
@@ -762,6 +772,7 @@ async function scanSingleCreatorLegacy(creatorPath, creatorId, creatorName, prog
 // attributes them from <library>/_Meta.
 const worksLib = require('./lib/works');
 const metaLib = require('./lib/meta');
+const folderRolesLib = require('./lib/folder-roles');
 const librariesLib = require('./lib/libraries');
 
 function layoutMode() {
@@ -869,7 +880,16 @@ function franchiseAndTeam(w, base, prevAttr, meta) {
  * Pending AI field proposals made stale by this scan: the field now holds a value from model.json,
  * the genre folder or the creator's manifest that differs from what the proposal was made for.
  */
-function supersedeStaleSuggestions(log) {
+function supersedeStaleSuggestions(log, roles = null) {
+  // folder-role proposals the folder's effective mark already answers (file or app)
+  if (roles && roles.size) {
+    try {
+      const done = db.prepare(`SELECT id, path, proposed FROM suggestions WHERE status = 'pending' AND type = 'role'`).all()
+        .filter(r => { const e = roles.get(r.path); return e && JSON.stringify(e.role) === r.proposed; });
+      for (const r of done) db.prepare(`UPDATE suggestions SET status = 'superseded', decided_at = datetime('now') WHERE id = ?`).run(r.id);
+      if (done.length) log('info', `${done.length} folder role proposal(s) superseded: the folder is marked that way now`);
+    } catch { /* no path column yet */ }
+  }
   // proposals about a card this scan folded away (or that would fold into one) can't be acted on
   try {
     const r = db.prepare(`UPDATE suggestions SET status = 'superseded', decided_at = datetime('now') WHERE status = 'pending' AND (
@@ -881,7 +901,7 @@ function supersedeStaleSuggestions(log) {
   const stale = [];
   for (const p of pend) {
     const prov = (parseJSON(p.attribution, {}).fields || {})[p.field];
-    if (!['sidecar', 'path', 'manifest'].includes(prov)) continue;
+    if (!['sidecar', 'path', 'manifest', 'role'].includes(prov)) continue;
     const now = p.field === 'editions' ? JSON.stringify(parseJSON(p.editions, [])) : JSON.stringify(p[p.field] ?? null);
     const was = p.field === 'editions' ? JSON.stringify(parseJSON(p.current, [])) : JSON.stringify(parseJSON(p.current, null));
     if (now !== was) stale.push(p.id);
@@ -889,6 +909,17 @@ function supersedeStaleSuggestions(log) {
   if (!stale.length) return;
   db.transaction(() => { for (const id of stale) db.prepare(`UPDATE suggestions SET status = 'superseded', decided_at = datetime('now') WHERE id = ?`).run(id); })();
   log('info', `${stale.length} AI proposal(s) superseded: the scan found values of its own`);
+}
+
+/** Tags of the category marks above a card, unless the user removed that tag (attribution.removedTags). */
+function addRoleTags(id, roleTags) {
+  const row = db.prepare('SELECT tags, attribution FROM models WHERE id = ?').get(id);
+  if (!row) return;
+  const tags = parseJSON(row.tags, []);
+  const removed = new Set((parseJSON(row.attribution, {}).removedTags || []).map(t => String(t).toLowerCase()));
+  const have = new Set(tags.map(t => String(t).toLowerCase()));
+  const add = roleTags.filter(t => !have.has(t.toLowerCase()) && !removed.has(t.toLowerCase()));
+  if (add.length) db.prepare('UPDATE models SET tags = ? WHERE id = ?').run(JSON.stringify([...tags, ...add]), id);
 }
 
 /** Confirmed merges: Map(from work_key → { to_key, to_name }) for worksLib.planWorks. */
@@ -1032,12 +1063,14 @@ async function scanLibraryLayout(libraryPath, progressCallback, logger, { scope 
     const tm = Date.now();
     const { meta, libs } = loadLibraryMeta(log);
     const metaMs = Date.now() - tm;
-    const overrides = loadFolderOverrides();
+    const { overrides, roleInfo, merged: roles } = loadFolderRoles(meta);
     const ignore = new Set([...overrides].filter(([, r]) => r === 'ignore').map(([p]) => p));
     const tw = Date.now();
     const tree = worksLib.walkTree(libraryPath, { ignore, scope });
     log('info', `Walked ${tree.fileCount} file(s) in ${Date.now() - tw} ms`);
-    const plan = worksLib.planWorks({ libraryPath, tree, meta, overrides, log, scope, aliases: loadAliases() });
+    const rolesLine = folderRolesLib.summaryLine(roles, (p) => tree.dirs.has(p) || ignore.has(p));
+    if (rolesLine) log('info', rolesLine);
+    const plan = worksLib.planWorks({ libraryPath, tree, meta, overrides, roleInfo, log, scope, aliases: loadAliases() });
     worksLib.finalizeWorks(plan.works, { libraries: libs, libraryOf: librariesLib.libraryOf });
     for (const w of plan.works) {
       w.attr = worksLib.attributeWork(w, meta);
@@ -1248,8 +1281,12 @@ async function scanLibraryLayout(libraryPath, progressCallback, logger, { scope 
         const products = JSON.stringify(w.attr.products);
         const attribution = { ...w.attr.attribution, autoFranchise: w.attr.genre || null, sourceUrl: w.attr.sourceUrl || null };
         if (Array.isArray(prevAttr.foldedFrom) && prevAttr.foldedFrom.length) attribution.foldedFrom = prevAttr.foldedFrom;
+        // tags the user removed stay removed (category tags, AI tags): the scan keeps the list
+        if (Array.isArray(prevAttr.removedTags) && prevAttr.removedTags.length) attribution.removedTags = prevAttr.removedTags;
         const kept = keptFields(w, base, prevAttr, attribution);
-        const attrSig = JSON.stringify([products, w.attr.attribution, w.attr.genre, w.attr.release_term, w.attr.release_label, w.group || null, w.editions || [], w.libraries, w.name]);
+        if (w.roleTags && w.roleTags.length) attribution.roleTags = w.roleTags;
+        const attrSig = JSON.stringify([products, w.attr.attribution, w.attr.genre, w.attr.release_term, w.attr.release_label, w.group || null, w.editions || [], w.libraries, w.name,
+          ...(w.roleTags && w.roleTags.length ? [w.roleTags] : [])]);
         attribution.sig = crypto.createHash('sha1').update(attrSig).digest('hex').slice(0, 12);
         const filesOwned = base && w.owners.size === 1 && w.owners.get(base.id) === w.files.length;
         const ft = franchiseAndTeam(w, base, prevAttr, meta);
@@ -1322,6 +1359,7 @@ async function scanLibraryLayout(libraryPath, progressCallback, logger, { scope 
             if (w.splitSource) S.setNotes.run(`Split from ${w.splitSource.name} (release ${w.releaseLabel || w.releaseId})`, id);
           }
           w.rowId = id;
+          if (w.roleTags && w.roleTags.length) addRoleTags(id, w.roleTags);
           // files: take them from their old owners, replace this row's files in scope
           S.delModelScope.run(id, lo, hi);
           for (const f of w.files) {
@@ -1450,7 +1488,7 @@ async function scanLibraryLayout(libraryPath, progressCallback, logger, { scope 
 
     const orphaned = db.prepare('DELETE FROM creators WHERE id NOT IN (SELECT DISTINCT creator_id FROM models WHERE creator_id IS NOT NULL)').run();
     if (orphaned.changes > 0) log('info', `Cleaned up ${orphaned.changes} orphaned creator(s)`);
-    supersedeStaleSuggestions(log);
+    supersedeStaleSuggestions(log, roles);
     if (typeof db.setSetting === 'function') {
       db.setSetting('layout_regroup_done', db.getSetting('layout_regroup_done') || new Date().toISOString());
       if (!scope) {
@@ -1491,5 +1529,5 @@ async function scanSingleCreator(creatorPath, creatorId, creatorName, progressCa
 module.exports = {
   scanLibrary, scanSingleCreator, scanLibraryLegacy, LIBRARY_PATH, matchesHint, pickRenderArchives, analyzeFolder,
   inferReleaseName, discoverModelFolders, extractImagesFromArchive, VARIANT_DIR, isImageFile: isRenderImage,
-  layoutMode, rankImages, analysisFromFiles, realFolder: worksLib.realFolder, loadLibraryMeta, franchiseAndTeam,
+  layoutMode, rankImages, analysisFromFiles, realFolder: worksLib.realFolder, loadLibraryMeta, franchiseAndTeam, loadFolderRoles,
 };

@@ -9,6 +9,7 @@ const AttributionHealth = React.lazy(() => import('./AttributionHealth'));
 // The Review tab (AI suggestions) is its own chunk too.
 const ReviewTab = React.lazy(() => import('./ReviewTab'));
 const OrganizerExport = React.lazy(() => import('./OrganizerExport'));
+const SuspectFolders = React.lazy(() => import('./SuspectFolders'));
 
 const READ_ONLY_TIP = 'Library is mounted read-only';
 
@@ -594,7 +595,7 @@ function FileDupRow({ d, libraryPath }) {
   );
 }
 
-function HealthTab({ onAnnotateThese, libraryPath }) {
+function HealthTab({ onAnnotateThese, libraryPath, onOpenModel }) {
   const notify = useNotify();
   const [confirmUi, askConfirm] = useConfirm();
   const [data, setData] = useState(null);
@@ -615,6 +616,21 @@ function HealthTab({ onAnnotateThese, libraryPath }) {
       .catch(() => setAttrSummary(null));
   }, []);
   useEffect(() => { loadAttrSummary(); }, [loadAttrSummary]);
+
+  // Suspect folders (docs/folder-roles.md §4); undefined = loading, null = older backend
+  const [suspects, setSuspects] = useState(undefined);
+  const [suspectsError, setSuspectsError] = useState('');
+  const [showDismissed, setShowDismissed] = useState(false);
+  const loadSuspects = useCallback((dismissed) => {
+    setSuspectsError('');
+    apiGet(`/api/folder-roles/suspects?dismissed=${dismissed ? 1 : 0}`)
+      .then(d => setSuspects(d && Array.isArray(d.items) ? d : null))
+      .catch(e => {
+        if (e && e.status === 404) setSuspects(null);
+        else { setSuspectsError(errorMessage(e)); setSuspects(s => (s === undefined ? { items: [] } : s)); }
+      });
+  }, []);
+  useEffect(() => { loadSuspects(showDismissed); }, [loadSuspects, showDismissed]);
 
   const resolveDup = useCallback(async (groupKey, keepId, models) => {
     const drop = models.filter(m => m.id !== keepId);
@@ -690,6 +706,7 @@ function HealthTab({ onAnnotateThese, libraryPath }) {
 
   const sections = [
     ...(attrSummary ? [{ id: 'attribution', label: 'Attribution', icon: '🔖', count: attrSummary.gaps }] : []),
+    ...(suspects ? [{ id: 'suspects', label: 'Suspect Folders', icon: '⚑', count: suspects.items.filter(x => !x.dismissed).length }] : []),
     { id: 'crossCreator', label: 'X-Creator Dupes', icon: '🔀', count: data?.summary?.crossCreatorDupes },
     { id: 'duplicates',   label: 'Similar Names',   icon: '⧉', count: data?.summary?.duplicatePairs },
     ...(data?.summary?.fileDuplicates !== undefined ? [{ id: 'fileDuplicates', label: 'Duplicate Files', icon: '⧉', count: data.summary.fileDuplicates }] : []),
@@ -760,6 +777,13 @@ function HealthTab({ onAnnotateThese, libraryPath }) {
         return (
           <React.Suspense fallback={<div className="org-hint-inline">Loading…</div>}>
             <div className="attr-health"><OrganizerExport /></div>
+          </React.Suspense>
+        );
+      case 'suspects':
+        return (
+          <React.Suspense fallback={<div className="org-hint-inline">Loading…</div>}>
+            <SuspectFolders data={suspects} error={suspectsError} showDismissed={showDismissed}
+              onShowDismissed={setShowDismissed} onChange={() => loadSuspects(showDismissed)} onOpenModel={onOpenModel} />
           </React.Suspense>
         );
       case 'attribution':
@@ -1695,7 +1719,7 @@ const TABS = [
   { id: 'advanced',  label: 'Advanced',  icon: '⚙' },
 ];
 
-export default function OrganizeModal({ onClose, libraryWritable, libraryPath, initialTab, onSuggestionsChange }) {
+export default function OrganizeModal({ onClose, libraryWritable, libraryPath, initialTab, onSuggestionsChange, onOpenModel }) {
   const titleId = useUniqueId('org-title');
   const [tab, setTab] = useState(initialTab || 'annotate');
   const [pending, setPending] = useState(null);
@@ -1739,7 +1763,7 @@ export default function OrganizeModal({ onClose, libraryWritable, libraryPath, i
         </React.Suspense>
       )}
       {tab === 'annotate'  && <AnnotateTab target={annotateTarget} onClearTarget={() => setAnnotateTarget(null)} />}
-      {tab === 'health'    && <HealthTab onAnnotateThese={handleAnnotateThese} libraryPath={libraryPath} />}
+      {tab === 'health'    && <HealthTab onAnnotateThese={handleAnnotateThese} libraryPath={libraryPath} onOpenModel={onOpenModel} />}
       {tab === 'franchise' && <FranchiseTab onAnnotateThese={handleAnnotateThese} />}
       {tab === 'advanced'  && <AdvancedTab libraryWritable={libraryWritable} />}
     </Modal>

@@ -11,7 +11,9 @@
  * (shadow data-final3): canonical character names, genres and teams for the DC / Spawn / Star Wars
  * / Marvel studio works, typo fixes, same-character merges (Geral → Geralt, Doct Oct → Doc Ock,
  * Poison → Poison Ivy, Ahsoka → Ahsoka Tano…), descriptive tags for the tabletop packs, a few
- * new-genre proposals and low-confidence / needs_vision answers where the evidence is thin.
+ * new-genre proposals and low-confidence / needs_vision answers where the evidence is thin, and
+ * folder roles (docs/folder-roles.md §5) for cards whose folder is a grouping: "Heroes", "Terrain",
+ * "Misc" and packs mixing many folders → category; mount-like dumps ("STL Archive") → container.
  *
  * callClaudeAPI(apiKey, body, { signal }) has the same contract as lib/claude.js.
  */
@@ -413,6 +415,22 @@ function genericAnswer(ev, out) {
   return out;
 }
 
+// folder roles (docs/folder-roles.md §5): the card's folder is a grouping, not one model
+const CATEGORY_WORDS = /^(?:all\b.*|heroes|enemies|allies|npcs?|monsters|terrain|scenery|bases|props|objects|busts|minis|miniatures|characters|creatures|bonus|extras|weapons|vehicles|buildings|accessories|misc)$/i;
+const MOUNT_WORDS = /^(?:stl[\s_-]?archive|3d[\s_-]?prints?|library|downloads?|gumroad downloads)$/i;
+function folderRoleAnswer(ev) {
+  const f = ev.folder;
+  if (!f || f.role) return null;
+  const base = String(f.path || '').split('/').pop().trim();
+  if (MOUNT_WORDS.test(base)) return { role: 'passthrough', c: 0.8, why: `"${base}" is a download dump or mount of many creators, not one model` };
+  if (CATEGORY_WORDS.test(base) || CATEGORY_WORDS.test(String(ev.cur.name || '').trim())) {
+    if ((f.nsubs || 0) >= 2) return { role: 'category', c: 0.82, why: `"${base}" groups different models (${(f.subs || []).slice(0, 3).join(', ')})` };
+    return { role: 'category', c: 0.62, why: `"${base}" may hold separate pieces (${f.files} files); check before marking` };
+  }
+  if ((f.nsubs || 0) >= 8) return { role: 'category', c: 0.76, why: `"${base}" mixes ${f.nsubs} different folders (${(f.subs || []).slice(0, 3).join(', ')})` };
+  return null;
+}
+
 /** One answer item for one evidence object. */
 function answer(ev) {
   const out = { id: ev.id };
@@ -436,6 +454,8 @@ function answer(ev) {
     const twin = mine.split(' ').length >= 2 && mine.length >= 8 && (ev.similar || []).find(s => s.id < ev.id && strip(s.name) === mine);
     if (twin) { out.merge = { into: twin.id, c: norm(twin.name) === norm(ev.cur.name) ? 0.9 : 0.82 }; out.why = 'same miniature: supported and presupported copies in separate folders'; }
   }
+  const fr = folderRoleAnswer(ev);
+  if (fr) { out.folderRole = { path: ev.folder.path, role: fr.role, c: fr.c }; out.why = out.why ? `${out.why}; ${fr.why}` : fr.why; }
   // drop fields that would just echo the card
   if (out.name && out.name.v === ev.cur.name) delete out.name;
   return out;
@@ -483,4 +503,4 @@ async function callClaudeAPI(apiKey, body, { signal } = {}) {
   };
 }
 
-module.exports = { callClaudeAPI, answer, resolveCharacter, KNOWN, ALIAS, MERGES };
+module.exports = { callClaudeAPI, answer, resolveCharacter, folderRoleAnswer, KNOWN, ALIAS, MERGES };

@@ -355,6 +355,57 @@ const MIGRATIONS = [
   () => {
     addColumn('enrich_runs', 'usd REAL DEFAULT 0');
   },
+  // 7: folder roles (docs/folder-roles.md): the roles table learns category / model and the
+  //     category values; suggestions learn type 'role' and the folder they are about. Both CHECK
+  //     constraints change, so the tables are rebuilt (rows and ids kept).
+  () => {
+    const cols = (t) => db.prepare(`PRAGMA table_info(${t})`).all().map(c => c.name);
+    const fo = cols('folder_overrides');
+    db.exec(`
+      CREATE TABLE folder_overrides_v7 (
+        path TEXT PRIMARY KEY,
+        role TEXT NOT NULL CHECK(role IN ('creator','passthrough','category','model','ignore')),
+        genre TEXT,
+        grp TEXT,
+        tags TEXT,
+        note TEXT,
+        created_at TEXT DEFAULT (datetime('now')),
+        updated_at TEXT DEFAULT (datetime('now'))
+      )
+    `);
+    db.exec(`INSERT INTO folder_overrides_v7 (path, role, created_at, updated_at)
+      SELECT path, role, ${fo.includes('created_at') ? 'created_at' : `datetime('now')`}, ${fo.includes('created_at') ? 'created_at' : `datetime('now')`} FROM folder_overrides`);
+    db.exec('DROP TABLE folder_overrides');
+    db.exec('ALTER TABLE folder_overrides_v7 RENAME TO folder_overrides');
+
+    const sc = cols('suggestions');
+    const keep = ['id', 'model_id', 'type', 'field', 'current', 'proposed', 'target_id', 'confidence', 'reason', 'source', 'run_id', 'status', 'created_at', 'decided_at'].filter(c => sc.includes(c));
+    db.exec(`
+      CREATE TABLE suggestions_v7 (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        model_id INTEGER NOT NULL,
+        type TEXT NOT NULL CHECK(type IN ('field','merge','rename','role')),
+        field TEXT,
+        current TEXT,
+        proposed TEXT,
+        target_id INTEGER,
+        path TEXT,
+        confidence REAL,
+        reason TEXT,
+        source TEXT DEFAULT 'text',
+        run_id INTEGER,
+        status TEXT DEFAULT 'pending' CHECK(status IN ('pending','accepted','rejected','superseded')),
+        created_at TEXT DEFAULT (datetime('now')),
+        decided_at TEXT
+      )
+    `);
+    db.exec(`INSERT INTO suggestions_v7 (${keep.join(',')}) SELECT ${keep.join(',')} FROM suggestions`);
+    db.exec('DROP TABLE suggestions');
+    db.exec('ALTER TABLE suggestions_v7 RENAME TO suggestions');
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_suggestions_status ON suggestions(status, type, field)`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_suggestions_model ON suggestions(model_id)`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_suggestions_path ON suggestions(path)`);
+  },
 ];
 
 db.getSetting = (key) => {

@@ -29,6 +29,8 @@ const { acquireOr409 } = require('./lib/jobs');
 const { callClaudeAPI } = require('./lib/claude');
 const enrich = require('./lib/enrich');
 const organizerExport = require('./lib/organizer-export');
+const folderRolesLib = require('./lib/folder-roles');
+const { folderRolesRouter } = require('./folder-roles-routes');
 
 const app = wrapAsyncRoutes(express());
 const PORT = process.env.PORT || 3001;
@@ -53,6 +55,8 @@ app.use(originPolicy());
 app.use(express.json({ limit: '10mb' }));
 app.use('/images', express.static(IMAGES_DIR));
 app.use('/api/organize', organizeRouter);
+// folder roles (docs/folder-roles.md): marks from _Meta/folder_roles.csv and the app
+app.use('/api/folder-roles', folderRolesRouter({ db, root: LIBRARY_PATH, getLibraries: () => librariesFor() }));
 
 // ── Library metadata (_Meta) cache ────────────────────────────────────────────
 // /api/meta/* and /api/attribution/* use a plain summary of _Meta (lib/meta-summary.js).
@@ -82,6 +86,40 @@ async function getMetaSummary({ reload = false } = {}) {
   return loadMetaSummary();
 }
 const parseJSON = (s, d) => { try { const v = JSON.parse(s); return v == null ? d : v; } catch { return d; } };
+
+/** Libraries (top-level folders) with their labels: the health cache, else read now. */
+function librariesSync() {
+  if (healthCache.libraries && healthCache.libraries.length) return healthCache.libraries;
+  return librariesLib.listLibraries(LIBRARY_PATH, metaSummary?.libraryLabels);
+}
+async function librariesFor() {
+  try { await getMetaSummary(); } catch { /* labels from LIBRARY_LABELS only */ }
+  return librariesSync();
+}
+
+/**
+ * The card's folders from the library root down to its real folder, each with its effective role
+ * (breadcrumb with roles on the card detail).
+ */
+function folderRolesFor(model) {
+  const real = require('./lib/works').realFolder(model.folder_path || '');
+  if (!real) return [];
+  const libs = librariesSync();
+  const lr = folderRolesLib.libRel(real, libs);
+  const top = lr.root || (real === LIBRARY_PATH || real.startsWith(LIBRARY_PATH + path.sep) ? LIBRARY_PATH : null);
+  if (!top) return [];
+  let merged;
+  try { merged = folderRolesLib.effectiveRoles(db, LIBRARY_PATH, libs).merged; } catch { merged = new Map(); }
+  const chain = [];
+  for (let d = real; ; d = path.dirname(d)) {
+    chain.unshift(d);
+    if (d === top || d.length <= top.length || d === path.dirname(d)) break;
+  }
+  return chain.map(d => {
+    const e = merged.get(d);
+    return { path: d, rel: path.relative(top, d).split(path.sep).join('/'), name: path.basename(d), role: e ? e.role : null, source: e ? e.source : null };
+  });
+}
 
 // ── Scan ──────────────────────────────────────────────────────────────────────
 
@@ -450,6 +488,7 @@ app.get('/api/models/:id(\\d+)', (req, res) => {
     siblings,
     enrichment: en && en.at ? { at: en.at, model: en.model || null, runId: en.runId || null } : null,
     suggestions: enrich.suggestionsFor(db, model.id),
+    folderRoles: folderRolesFor(model),
     products: parseJSON(model.products, []).map(({ matchedBy, genre, creator, ...p }) => p),
     attribution: attribution || { confidence: model.confidence || 'none', fields: {}, matchedFiles: 0, totalFiles: files.length },
     files
@@ -1457,7 +1496,10 @@ function enrichParams(q) {
 async function enrichContext() {
   let sum = null;
   try { sum = await getMetaSummary(); } catch { sum = null; }
-  return { promptCtx: enrich.promptContext(db, sum || {}), evCtx: { libraryRoot: LIBRARY_PATH } };
+  let roles = new Map();
+  try { roles = folderRolesLib.effectiveRoles(db, LIBRARY_PATH, librariesSync()).merged; } catch { roles = new Map(); }
+  const roleOf = (p) => { const e = roles.get(p); return e ? e.role : null; };
+  return { promptCtx: enrich.promptContext(db, sum || {}), evCtx: { libraryRoot: LIBRARY_PATH, roleOf } };
 }
 function loadRender(card) {
   const file = imageUrlToFile(card.thumbnail_path || '');

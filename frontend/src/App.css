@@ -2471,3 +2471,74 @@ input:focus-visible, textarea:focus-visible, select:focus-visible { outline-offs
 .accepted-merge-list { list-style: none; border: 1px solid var(--border); border-radius: var(--radius); max-height: 240px; overflow-y: auto; }
 .accepted-merge-row { gap: 10px; flex-wrap: wrap; }
 .accepted-merge-row .org-health-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ── Folder roles (docs/folder-roles.md §7) ─────────────────────────────── */
+.role-menu { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; min-width: 0; }
+.role-menu-line { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; min-width: 0; }
+.role-select { background: var(--bg3); border: 1px solid var(--border); color: var(--text-muted); border-radius: 4px; font-size: 10px; font-family: var(--font-mono); padding: 2px 4px; cursor: pointer; }
+.role-select.set { background: rgba(193,127,58,0.15); border-color: var(--accent); color: var(--accent-text); }
+.role-select:focus-visible, .role-tree-toggle:focus-visible, .role-edit-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.role-chip { font-family: var(--font-mono); font-size: 10px; padding: 1px 6px; border-radius: 3px; border: 1px solid var(--border-bright); color: var(--text-muted); white-space: nowrap; }
+.role-chip.role-category, .role-chip.role-model, .role-chip.role-creator, .role-chip.role-passthrough { color: var(--accent-text); border-color: rgba(193,127,58,0.5); }
+.role-chip.role-ignore { color: var(--text-faint); }
+.role-file-badge { font-family: var(--font-mono); font-size: 9px; padding: 1px 5px; border-radius: 3px; background: rgba(90,150,220,0.15); color: var(--blue-text); border: 1px solid rgba(90,150,220,0.4); white-space: nowrap; cursor: help; }
+.role-conflict { font-family: var(--font-mono); font-size: 9px; color: var(--yellow-text); white-space: nowrap; }
+.role-values { display: inline-flex; flex-wrap: wrap; gap: 3px; }
+.role-value { font-size: 10px; color: var(--text-muted); background: var(--bg4); border-radius: 3px; padding: 0 5px; white-space: nowrap; }
+.role-edit-btn { background: none; border: none; color: var(--text-faint); cursor: pointer; font-size: 12px; padding: 0 2px; }
+.role-edit-btn:hover { color: var(--accent-text); }
+.role-cat-form { flex-basis: 100%; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; padding: 8px; margin: 4px 0; background: var(--bg3); border: 1px solid var(--border); border-radius: 6px; }
+.role-cat-form label { display: flex; flex-direction: column; gap: 2px; font-size: 11px; color: var(--text-muted); min-width: 0; }
+.role-cat-form .url-input { margin: 0; font-size: 12px; padding: 4px 6px; }
+.role-cat-actions { grid-column: 1 / -1; display: flex; gap: 6px; justify-content: flex-end; }
+.role-cat-hint { grid-column: 1 / -1; font-size: 10px; }
+@media (max-width: 600px) { .role-cat-form { grid-template-columns: 1fr; } }
+
+.role-toolbar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.role-ai-btn { color: var(--purple-text); border-color: rgba(155,114,207,0.4); }
+.role-ai-btn:disabled { color: var(--text-faint); border-color: var(--border); opacity: 0.6; }
+.role-export-link { margin-left: auto; }
+.role-rescan-bar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 10px; padding: 6px 10px; border: 1px solid rgba(76,175,125,0.4); background: rgba(76,175,125,0.08); border-radius: 6px; font-size: 12px; color: var(--green-text); }
+.role-ai-box { margin-top: 10px; border: 1px solid rgba(155,114,207,0.4); border-radius: 6px; padding: 10px; background: rgba(155,114,207,0.06); }
+.role-ai-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; font-size: 12px; color: var(--purple-text); }
+.role-ai-head > span { margin-right: auto; }
+.role-ai-list { list-style: none; margin: 0; padding: 0; font-size: 11px; }
+.role-ai-list li { padding: 3px 0; border-bottom: 1px solid var(--border); }
+.role-marked { margin-top: 10px; font-size: 12px; }
+.role-marked > summary { cursor: pointer; color: var(--text-muted); padding: 4px 0; }
+.role-marked-list, .role-meta-files { list-style: none; margin: 4px 0; padding: 0; }
+.role-meta-files { font-size: 11px; color: var(--text-muted); }
+.role-meta-files > li { padding: 2px 0; }
+.role-meta-errors { margin: 2px 0 4px 16px; padding: 0; color: var(--yellow-text); font-size: 11px; }
+.role-marked-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 4px 6px; border-bottom: 1px solid var(--border); }
+.role-marked-path { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; color: var(--text); }
+.role-tree, .role-tree-list { list-style: none; margin: 0; padding: 0; }
+.role-tree { margin-top: 8px; max-height: 420px; overflow-y: auto; border: 1px solid var(--border); border-radius: 6px; padding: 6px 4px; }
+.role-tree-row { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; padding: 3px 4px; }
+.role-tree-row:hover { background: var(--bg3); }
+.role-tree-toggle { background: none; border: none; color: var(--text-faint); cursor: pointer; font-size: 10px; width: 14px; padding: 0; }
+.role-tree-name { flex: 1; min-width: 80px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; color: var(--text); }
+.role-tree-name.ignored { color: var(--text-faint); text-decoration: line-through; }
+.role-tree-counts { color: var(--text-faint); font-size: 10px; font-family: var(--font-mono); margin-left: 6px; }
+.role-tree-note { font-size: 10px; color: var(--text-faint); padding: 2px 0; }
+
+.suspects-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; justify-content: space-between; margin: 4px 8px 8px; }
+.suspects-toggle { font-size: 11px; color: var(--text-muted); display: inline-flex; align-items: center; gap: 4px; cursor: pointer; }
+.suspect-list { list-style: none; margin: 0; padding: 0; }
+.org-health-row.suspect-row { align-items: flex-start; flex-wrap: wrap; gap: 8px; }
+.suspect-row.dismissed { opacity: 0.6; }
+.suspect-main { flex: 1 1 260px; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.suspect-title { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.suspect-path { font-size: 12px; color: var(--text-main); font-weight: 600; overflow-wrap: anywhere; }
+.suspect-reason { font-size: 11px; color: var(--text-muted); }
+.suspect-meta { display: flex; align-items: center; gap: 4px 10px; flex-wrap: wrap; font-size: 11px; }
+.suspect-sample { color: var(--text-faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%; }
+.suspect-actions { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+
+.folder-crumb-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+.folder-crumb { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 6px; font-size: 12px; }
+.folder-crumb-sep { color: var(--text-faint); }
+.folder-crumb-name { color: var(--text-muted); overflow-wrap: anywhere; min-width: 0; }
+.folder-crumb.current .folder-crumb-name { color: var(--text-main); font-weight: 600; }
+.folder-crumb-hint { margin-top: 8px; font-size: 10px; }
+.role-diff b { color: var(--text-main); font-weight: 600; }

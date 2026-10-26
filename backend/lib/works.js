@@ -17,6 +17,7 @@ const naming = require('./naming');
 const metaLib = require('./meta');
 const librariesLib = require('./libraries');
 const { makeDiscovery, IGNORED_FOLDERS, isJunkFile, isPrintableName, isExtVariantName } = require('./discovery');
+const folderRoles = require('./folder-roles');
 
 const SKIP_DIR = /^(?:_Inbox|_Duplicates_Pending_Delete|_Meta|#recycle|@eaDir|\..*)$/i; // + hidden ".Archive Service Temp…" 
 // unfinished browser downloads are not files of a work
@@ -124,9 +125,20 @@ function resolveRoots(base, tree, { overrides = new Map(), containers = DEFAULT_
     const lower = name.trim().toLowerCase();
     const alias = naming.canonicalCreator(name);
     if (ov === 'creator') { out.push({ type: alias && naming.STUDIO_CREATORS.has(alias) ? 'studio' : 'regular', name, creator: alias || name, path: p }); continue; }
+    // folder role "model" (docs/folder-roles.md §1): the whole folder is one card, creator Unsorted
+    if (ov === 'model') { out.push({ type: 'model', name, creator: LOOSE_CREATOR, path: p }); continue; }
     const sub = { overrides, containers, log, depth: depth + 1 };
     if (libraryFolders && libraryFolders.has(p) && ov !== 'creator') { out.push(...resolveRoots(p, tree, { ...sub, depth: 0, libraryFolders })); continue; }
-    if (ov === 'passthrough' && depth < 6) { out.push(...resolveRoots(p, tree, sub)); continue; }
+    // a category at the creator level is not a creator and its sub-folders are not creators: one
+    // folder root of creator Unsorted (cards below it as usual, its loose files one card each)
+    if (ov === 'category') { out.push({ type: 'regular', name, creator: LOOSE_CREATOR, path: p, category: true }); continue; }
+    if (ov === 'passthrough' && depth < 6) {
+      // a container: go inside to find creators; its loose printable files become one card each
+      const kid = tree.dirs.get(p);
+      if (kid && kid.files.some(f => isPrintableName(f.name))) out.push({ type: 'loose', name, creator: LOOSE_CREATOR, path: p });
+      out.push(...resolveRoots(p, tree, sub));
+      continue;
+    }
     if (alias && naming.STUDIO_CREATORS.has(alias)) { out.push({ type: 'studio', name, creator: alias, path: p }); continue; }
     if (containers[lower]) { out.push({ type: 'studio', name, creator: containers[lower], path: p, container: true }); continue; }
     if (lower === '_tools') { out.push({ type: 'tools', name: '_Tools', creator: '_Tools', path: p }); continue; }
@@ -246,25 +258,35 @@ function studioRecords(root, tree, ctx) {
     const relDirs = rel ? rel.split(path.sep) : [];
     // transparent containers and term folders ("MOVIES August Term 2024") carry no identity
     const segs = [];
-    let termHint = null, genre = null;
+    let termHint = null, genre = null, catGenre = null, modelSeg = null;
     let accum = root.path;
     for (const name of relDirs) {
       accum = path.join(accum, name);
       const lower = name.trim().toLowerCase();
+      // folder roles: the nearest "model" folder is the identity; categories and containers carry none
+      const role = ctx.overrides.get(accum);
+      if (role === 'model') { modelSeg = { name, abs: accum, idx: segs.length }; segs.push({ name, abs: accum }); continue; }
+      if (role === 'category' || role === 'passthrough') {
+        const cv = role === 'category' ? folderRoles.categoryValues(ctx.roleInfo && ctx.roleInfo.get(accum) || { role, path: accum, tags: [] }, ctx.isGenre) : null;
+        if (cv && cv.genre) catGenre = cv.genre;
+        continue;
+      }
       if (TRANSPARENT.has(lower)) continue;
       const tf = naming.parseTermFolder(name);
       if (tf && P(name).generic) { termHint = termHint || tf.term; genre = genre || tf.genre; continue; }
       segs.push({ name, abs: accum });
     }
-    if (segs.length && ctx.isGenre(segs[0].name)) genre = ctx.isGenre(segs.shift().name);
+    if (segs.length && !(modelSeg && modelSeg.idx === 0) && ctx.isGenre(segs[0].name)) { genre = ctx.isGenre(segs.shift().name); if (modelSeg) modelSeg.idx--; }
     else if (!genre && root.genre) genre = root.genre;
+    if (catGenre) genre = catGenre; // a category's genre replaces the genre-folder rule
 
     const sc = ctx.sidecarFor(f.dir, root.path);
     const fp = P(f.name);
     const isArchive = ARCHIVE_RE.test(f.name);
     let anchor = null, anchorIdx = -1;
     const isImage = IMAGE_EXTS.has(extOf(f.name));
-    if ((isArchive || (fp.prefixed && !isImage)) && fp.strong) { anchor = fp; anchorIdx = segs.length; }
+    if (modelSeg) { anchor = P(modelSeg.name); anchorIdx = modelSeg.idx; }
+    else if ((isArchive || (fp.prefixed && !isImage)) && fp.strong) { anchor = fp; anchorIdx = segs.length; }
     else {
       for (let i = segs.length - 1; i >= 0; i--) {
         const p = P(segs[i].name);
@@ -272,7 +294,7 @@ function studioRecords(root, tree, ctx) {
       }
     }
     // Diorama context: unbranded parts / sub-dioramas inside a diorama folder belong to it
-    if (anchor) {
+    if (anchor && !modelSeg) {
       for (let i = 0; i < Math.min(anchorIdx, segs.length); i++) {
         const d = P(segs[i].name);
         if (!d.isDiorama || d.generic || d === anchor) continue;
@@ -282,7 +304,13 @@ function studioRecords(root, tree, ctx) {
       }
     }
     let ident;
-    if (anchor) {
+    if (modelSeg) {
+      // every file below a model-marked folder joins one work keyed from the folder's own name
+      const key = anchor.key || naming.normKey(prettyName(modelSeg.name), fix) || slugify(modelSeg.name);
+      const character = anchor.character || naming.titleCase(prettyName(naming.cleanStem(modelSeg.name)));
+      const edition = fp.prefixed && fp.edition ? fp.edition : (anchor.edition || fp.edition || null);
+      ident = { kind: anchor.isDiorama ? 'diorama' : 'work', character, key, edition, creator: anchor.creator || null, prefixed: !!anchor.prefixed, strong: true, anchor: modelSeg.abs, model: modelSeg.abs };
+    } else if (anchor) {
       ident = { kind: anchor.isDiorama ? 'diorama' : 'work', character: anchor.character, key: anchor.key, edition: anchor.edition, creator: anchor.creator, prefixed: anchor.prefixed, strong: true, anchor: anchorIdx === segs.length ? f.abs : segs[anchorIdx].abs };
     } else {
       // the deepest meaningful folder with no part/variant folder above it
@@ -385,7 +413,7 @@ function studioWorks(recs, ctx) {
     const anchors = new Map(); // key → Set(anchor) (distinct names, not files)
     const charOf = new Map();
     for (const r of list) {
-      if (r.ident.kind !== 'work' || r.ident.sidecar) continue;
+      if (r.ident.kind !== 'work' || r.ident.sidecar || r.ident.model) continue;
       if (!anchors.has(r.ident.key)) anchors.set(r.ident.key, new Set());
       anchors.get(r.ident.key).add(r.ident.anchor);
       if (!charOf.has(r.ident.key) || r.ident.strong) charOf.set(r.ident.key, r.ident.character);
@@ -418,7 +446,7 @@ function studioWorks(recs, ctx) {
       else if (!rest || naming.isGenericText(rest) || dominant) remap.set(k, { key: t.key, character: charOf.get(t.key) || t.character });
     }
     for (const r of list) {
-      const to = r.ident.kind === 'work' && !r.ident.sidecar && remap.get(r.ident.key);
+      const to = r.ident.kind === 'work' && !r.ident.sidecar && !r.ident.model && remap.get(r.ident.key);
       if (to) r.ident = { ...r.ident, key: to.key, character: to.character };
     }
   }
@@ -455,7 +483,7 @@ function studioWorks(recs, ctx) {
   const works = new Map();
   for (const r of recs) {
     const g = `${r.ident.creator}|${r.ident.kind}`;
-    const key = canon.get(`${g}|${r.ident.key}`) || r.ident.key;
+    const key = r.ident.model ? r.ident.key : (canon.get(`${g}|${r.ident.key}`) || r.ident.key); // a model mark is never merged by spelling
     const wk = `${r.ident.creator}|${r.ident.kind}|${key}`;
     let w = works.get(wk);
     if (!w) {
@@ -463,7 +491,8 @@ function studioWorks(recs, ctx) {
       works.set(wk, w);
     }
     w.files.push({ abs: r.abs, name: r.name, size: r.size, mtimeMs: r.mtimeMs, dir: r.dir, variant: r.variant, edition: r.ident.kind === 'diorama' ? 'Diorama' : r.edition,
-      segs: r.segNames || [], scTerm: r.ident.sidecar && r.ident.sidecar.release_term ? r.ident.sidecar.release_term : null, termHint: r.termHint || null });
+      segs: r.segNames || [], scTerm: r.ident.sidecar && r.ident.sidecar.release_term ? r.ident.sidecar.release_term : null, termHint: r.termHint || null,
+      ...(r.ident.model ? { modelDir: r.ident.model } : {}) });
     const weight = (r.ident.sidecar ? 100 : 0) + (r.ident.prefixed ? 3 : 0) + (r.ident.strong ? 2 : 1);
     w.names.set(r.ident.character, (w.names.get(r.ident.character) || 0) + weight);
     if (r.genre) w.genres.set(r.genre, (w.genres.get(r.genre) || 0) + 1);
@@ -515,8 +544,10 @@ function folderWorks(root, tree, ctx) {
     if (!n) return;
     for (const d of n.dirs) {
       const p = path.join(dir, d);
-      if (ctx.overrides.get(p) === 'ignore') continue;
-      if (isRelease(p, d)) releases.push(p); else collectReleases(p, depth + 1);
+      const role = ctx.overrides.get(p);
+      if (role === 'ignore' || ctx.excluded(p)) continue;
+      if (isRelease(p, d)) releases.push(p);
+      else if (role !== 'model') collectReleases(p, depth + 1); // never inside a model folder
     }
   };
   const kind = root.type === 'tools' ? 'tool' : 'model';
@@ -527,7 +558,9 @@ function folderWorks(root, tree, ctx) {
     const top = tree.dirs.get(root.path);
     for (const d of top ? top.dirs : []) {
       const p = path.join(root.path, d);
-      if (releases.includes(p) || ctx.overrides.get(p) === 'ignore') continue;
+      const role = ctx.overrides.get(p);
+      if (releases.includes(p) || role === 'ignore' || role === 'category' || role === 'passthrough' || ctx.excluded(p)) continue;
+      if (role === 'model') { releases.push(p); continue; } // a model-marked pack folder: one item
       if (releases.some(r => r.startsWith(p + path.sep))) continue; // holds dated releases ("Pre-Supported (thick)/#41 - …")
       // "_Undated/<Title>", "SupportedFiles/<Title>": the container is transparent, its folders are the packs
       const container = /^_(undated|bundles)$/i.test(d) || isExtVariantName(d) || /^(?:pre[\s_-]?)?supported\s*files$|^unsupported(?:\s*files)?$/i.test(prettyName(d));
@@ -539,23 +572,35 @@ function folderWorks(root, tree, ctx) {
     }
   }
   const releaseSet = new Set(releases);
-  const models = disc.discoverModelFolders(root.path, '', 5, ctx.overrides, { boundary: (abs) => releaseSet.has(abs) })
+  const ov = ctx.rootOverrides || ctx.overrides;
+  const models = disc.discoverModelFolders(root.path, '', 5, ov, { boundary: (abs) => releaseSet.has(abs) })
     .map(m => ({ ...m, kind, release: null }));
   for (const rel of releases) {
     const info = naming.parseRelease(path.basename(rel))
       || { term: null, label: (releaseItemName(path.basename(rel)) || prettyName(path.basename(rel))).replace(/^myairbridge-/i, ''), number: null, undated: true };
-    const items = disc.discoverModelFolders(rel, '', 7, ctx.overrides);
+    // a model-marked release folder is a single item
+    const items = ctx.overrides.get(rel) === 'model' ? [{ name: '', fullPath: rel, variantDirs: [], role: 'model' }] : disc.discoverModelFolders(rel, '', 7, ov);
     // A release folder with loose packs is itself an item (the delivered zips)
     const relNode = tree.dirs.get(rel);
     if (relNode && relNode.files.some(f => isPrintableName(f.name)) && !items.some(i => i.fullPath === rel)) items.unshift({ name: '', fullPath: rel, variantDirs: [] });
     for (const it of items) models.push({ ...it, kind: kind === 'tool' ? 'tool' : 'release-item', release: { path: rel, ...info } });
   }
 
+  const kp = root.keyPrefix ? `${root.keyPrefix}/` : '';
   // File ownership: the deepest discovered folder that contains the file
   const owners = new Map(models.map(m => [m.fullPath, m]));
   const works = new Map();
   for (const m of models) {
-    const skip = (d) => d !== m.fullPath && owners.has(d);
+    if (m.looseFiles) {
+      // a category / container folder deeper down: its loose printable files are one card each
+      for (const w of looseWorks({ path: m.fullPath, creator: root.creator }, tree, ctx, { keyBase: kp + (path.relative(root.path, m.fullPath).toLowerCase() || '.') })) {
+        if (works.has(w.key)) continue;
+        w.roots = new Map([[root.path, w.files.length]]);
+        works.set(w.key, w);
+      }
+      continue;
+    }
+    const skip = (d) => d !== m.fullPath && (owners.has(d) || ctx.excluded(d));
     const files = filesUnder(tree, m.fullPath, skip).filter(f => f.name !== 'model.json');
     if (!files.length) continue;
     let name, key, group = null;
@@ -564,15 +609,19 @@ function folderWorks(root, tree, ctx) {
       const relKey = naming.normKey(releaseItemName(m.release.label) || m.release.label, ctx.fix) || slugify(m.release.label);
       const isRoot = m.fullPath === m.release.path;
       let label = isRoot ? m.release.label : base;
-      if (!isRoot && naming.isGenericText(label)) {
+      if (m.role === 'model' && !isRoot) {
+        // a model-marked item folder: its own name, its own card (never merged with a sibling by name)
+        name = releaseItemName(base) || prettyName(base);
+        key = `${root.creator}|release-item|${kp}${relKey}/@${path.relative(m.release.path, m.fullPath).toLowerCase()}`;
+      } else if (!isRoot && naming.isGenericText(label)) {
         // "All_Busts_v2/STL" style: name after the nearest meaningful folder
         let d = path.dirname(m.fullPath);
         while (d.length > m.release.path.length && naming.isGenericText(path.basename(d))) d = path.dirname(d);
         label = d.length > m.release.path.length ? path.basename(d) : m.release.label;
       }
-      name = releaseItemName(label) || m.release.label;
+      if (!key) name = releaseItemName(label) || m.release.label;
       // "All Objects" / "All Busts" / "Env" say what kind of items, not which: name after the pack or folder above
-      if (!isRoot && (/^all\b/i.test(name) || /^(?:env|environment|objects?|props?|busts?|heroes|enemies|allies|npcs?|scenery|terrain|bonus|extras?|minis)$/i.test(name))) {
+      if (!key && !isRoot && (/^all\b/i.test(name) || /^(?:env|environment|objects?|props?|busts?|heroes|enemies|allies|npcs?|scenery|terrain|bonus|extras?|minis)$/i.test(name))) {
         let d = path.dirname(m.fullPath), up = '';
         while (d.length > m.release.path.length) { const pn = releaseItemName(path.basename(d)); if (pn && !/^all\b/i.test(pn) && !naming.isGenericText(pn)) { up = pn; break; } d = path.dirname(d); }
         name = `${up || releaseItemName(m.release.label) || m.release.label} ${name.replace(/^all\s+/i, '')}`.trim();
@@ -588,11 +637,12 @@ function folderWorks(root, tree, ctx) {
         }
       }
       const pk = parent ? naming.normKey(parent, ctx.fix) : '';
-      if (parent && !CATEGORY_RE.test(parent) && !naming.normKey(name, ctx.fix).includes(pk.split(' ')[0].slice(0, 5))) {
+      if (key) { if (parent) group = parent; }
+      else if (parent && !CATEGORY_RE.test(parent) && !naming.normKey(name, ctx.fix).includes(pk.split(' ')[0].slice(0, 5))) {
         group = parent;
         if (parent.split(' ').length <= 2) name = `${parent} ${name}`;
       } else if (parent) group = parent;
-      key = `${root.creator}|${kind === 'tool' ? 'tool' : 'release-item'}|${relKey}/${pk ? pk + '/' : ''}${naming.normKey(name, ctx.fix) || slugify(name)}`;
+      if (!key) key = `${root.creator}|${kind === 'tool' ? 'tool' : 'release-item'}|${kp}${relKey}/${pk ? pk + '/' : ''}${naming.normKey(name, ctx.fix) || slugify(name)}`;
     } else {
       name = inferModelName(m.fullPath);
       if (naming.isGenericText(name)) {
@@ -601,7 +651,7 @@ function folderWorks(root, tree, ctx) {
         const parentName = d.length > root.path.length ? inferModelName(d) : root.name;
         name = `${parentName} ${name}`.trim();
       }
-      key = `${root.creator}|${kind}|${path.relative(root.path, m.fullPath).toLowerCase() || '.'}`;
+      key = `${root.creator}|${kind}|${kp}${path.relative(root.path, m.fullPath).toLowerCase() || '.'}`;
     }
     let w = works.get(key);
     if (!w) {
@@ -634,7 +684,7 @@ function folderWorks(root, tree, ctx) {
  * one card per file, files with the same name ("Red Dragon.zip", "Red Dragon (1).zip") share it.
  * Images and info files with a matching stem join that card; anything else at that level is left out.
  */
-function looseWorks(root, tree, ctx) {
+function looseWorks(root, tree, ctx, { keyBase = null } = {}) {
   const node = tree.dirs.get(root.path);
   if (!node) return [];
   const nameOf = (file) => {
@@ -647,7 +697,7 @@ function looseWorks(root, tree, ctx) {
   const files = node.files.filter(f => f.name !== 'model.json' && !isJunkFile(f.name));
   for (const f of files.filter(x => isPrintableName(x.name))) {
     const name = nameOf(f.name);
-    const key = `${root.creator}|model|${path.basename(root.path).toLowerCase()}/${naming.normKey(name, ctx.fix) || slugify(name)}`;
+    const key = `${root.creator}|model|${keyBase != null ? keyBase : path.basename(root.path).toLowerCase()}/${naming.normKey(name, ctx.fix) || slugify(name)}`;
     let w = works.get(key);
     if (!w) {
       w = { key, kind: 'model', layout: 'loose', creator: root.creator, studio: null, name, character: null, group: null, editions: [], files: [], folders: [root.path], sidecar: null, roots: new Map([[root.path, 0]]), stem: naming.normKey(name, ctx.fix) };
@@ -668,13 +718,54 @@ function looseWorks(root, tree, ctx) {
   return [...works.values()];
 }
 
+/**
+ * A folder marked "model" at the creator level (or a library folder): one card with every file
+ * below it, creator Unsorted (docs/folder-roles.md §1).
+ */
+function modelRootWorks(root, tree, ctx, libraryPath) {
+  const files = filesUnder(tree, root.path, (d) => d !== root.path && (ctx.skipDir(d) || ctx.excluded(d))).filter(f => f.name !== 'model.json');
+  if (!files.length) return [];
+  const name = inferModelName(root.path); // the user named this folder as one model: its own name
+  const rel = (path.relative(libraryPath || path.dirname(root.path), root.path) || path.basename(root.path)).toLowerCase();
+  const w = {
+    key: `${root.creator}|model|${rel}`, kind: 'model', layout: 'folder', creator: root.creator, studio: null, name, character: null, group: null, editions: [],
+    files: files.map(f => ({ abs: f.abs, name: f.name, size: f.size, mtimeMs: f.mtimeMs, dir: f.dir,
+      variant: releaseVariant(path.relative(root.path, f.dir).split(path.sep).filter(Boolean)) || fileVariantFallback(f.name) || 'other', edition: null })),
+    folders: [root.path], sidecar: ctx.sidecarFor(root.path, root.path), roots: new Map([[root.path, files.length]]), modelDir: root.path,
+  };
+  return [w];
+}
+
+/**
+ * Folders marked "creator" deeper inside a creator root: their subtree is taken out of the parent
+ * root and scanned as its own creator root (studio parsing when the name is a studio alias).
+ */
+function deepCreatorRoots(roots, tree, overrides, log) {
+  const have = new Set(roots.map(r => r.path));
+  const marks = [...overrides].filter(([p, r]) => r === 'creator' && !have.has(p) && tree.dirs.has(p)).map(([p]) => p).sort((a, b) => a.length - b.length);
+  const out = [];
+  for (const p of marks) {
+    if (![...roots, ...out].some(r => r.type !== 'loose' && p.startsWith(r.path + path.sep))) continue;
+    let ignored = false;
+    for (let d = path.dirname(p); d !== path.dirname(d); d = path.dirname(d)) if (overrides.get(d) === 'ignore') { ignored = true; break; }
+    if (ignored) continue;
+    const name = path.basename(p);
+    const alias = naming.canonicalCreator(name);
+    out.push({ type: alias && naming.STUDIO_CREATORS.has(alias) ? 'studio' : 'regular', name, creator: alias || name, path: p, deep: true });
+    log('info', `"${name}" is marked as a creator: scanned as its own creator`);
+  }
+  return out;
+}
+
 // ── planning ─────────────────────────────────────────────────────────────────
 
 /**
  * Build every work under `libraryPath`.
  * @param {object} opts { libraryPath, tree, meta, overrides, log, scope? (only roots under this path) }
  */
-function planWorks({ libraryPath, tree, meta, overrides = new Map(), log = () => {}, scope = null, containers, aliases = null, libraryFolders = null }) {
+function planWorks({ libraryPath, tree, meta, overrides = new Map(), roleInfo = null, log = () => {}, scope = null, containers, aliases = null, libraryFolders = null }) {
+  // roleInfo: Map(abs → { role, genre, group, tags, source }) (lib/folder-roles.js); plain overrides alone work too
+  if (!roleInfo) roleInfo = new Map([...overrides].map(([p, role]) => [p, { path: p, role, genre: null, group: null, tags: [] }]));
   const fix = meta?.fix || naming.makeFixer();
   const parseCache = new Map();
   const parse = (name) => { let p = parseCache.get(name); if (!p) { p = naming.parseName(name, { fix }); parseCache.set(name, p); } return p; };
@@ -706,7 +797,7 @@ function planWorks({ libraryPath, tree, meta, overrides = new Map(), log = () =>
     }
   };
   const skipDir = (d) => overrides.get(d) === 'ignore';
-  const ctx = { fix, parse, isGenre, sidecarFor, meta, overrides, skipDir };
+  const ctx = { fix, parse, isGenre, sidecarFor, meta, overrides, roleInfo, skipDir, excluded: () => false, rootOverrides: null };
   const cont = { ...DEFAULT_CONTAINERS };
   for (const c of containers || []) if (c && c.name) cont[String(c.name).toLowerCase()] = c.creator || 'Wicked';
   if (Array.isArray(meta?.vault?.containers)) for (const c of meta.vault.containers) { if (typeof c === 'string') cont[c.toLowerCase()] = 'Wicked'; else if (c && c.name) cont[c.name.toLowerCase()] = c.creator || 'Wicked'; }
@@ -719,15 +810,30 @@ function planWorks({ libraryPath, tree, meta, overrides = new Map(), log = () =>
     const names = librariesLib.libraryFolderNames(top ? top.dirs : [], labels);
     libraryFolders = new Set(names.length ? names.map(n => path.join(libraryPath, n)) : [libraryPath]);
   }
-  let roots = resolveRoots(libraryPath, tree, { overrides, containers: cont, log, libraryFolders });
+  let roots = overrides.get(libraryPath) === 'model'
+    ? [{ type: 'model', name: path.basename(libraryPath), creator: LOOSE_CREATOR, path: libraryPath }]
+    : resolveRoots(libraryPath, tree, { overrides, containers: cont, log, libraryFolders });
+  roots.push(...deepCreatorRoots(roots, tree, overrides, log));
+  // Unsorted category roots: keys carry the category folder so they never meet other Unsorted cards
+  for (const r of roots) if (r.category) r.keyPrefix = `@${path.relative(libraryPath, r.path).toLowerCase()}`;
   // a loose-files root holds only the files at its own level: in a scoped scan it belongs to that scope alone
   if (scope) roots = roots.filter(r => r.path === scope || r.path.startsWith(scope + path.sep) || (r.type !== 'loose' && scope.startsWith(r.path + path.sep)));
   const recs = [];
   const works = [];
   for (const r of roots) {
-    if (r.type === 'studio') recs.push(...studioRecords(r, tree, ctx));
-    else if (r.type === 'loose') works.push(...looseWorks(r, tree, ctx).map(w => ({ ...w, creatorFolder: r.path })));
-    else works.push(...folderWorks(r, tree, ctx).map(w => ({ ...w, creatorFolder: r.path })));
+    // roots inside this root (deep "creator" marks) are not part of its walk
+    const nested = roots.filter(o => o !== r && o.type !== 'loose' && o.path.startsWith(r.path + path.sep)).map(o => o.path);
+    let rctx = ctx;
+    if (nested.length) {
+      const set = new Set(nested);
+      const ov = new Map(overrides);
+      for (const n of nested) ov.set(n, 'ignore');
+      rctx = { ...ctx, excluded: (d) => set.has(d), skipDir: (d) => skipDir(d) || set.has(d), rootOverrides: ov };
+    }
+    if (r.type === 'studio') recs.push(...studioRecords(r, tree, rctx));
+    else if (r.type === 'loose') works.push(...looseWorks(r, tree, rctx).map(w => ({ ...w, creatorFolder: r.path })));
+    else if (r.type === 'model') works.push(...modelRootWorks(r, tree, rctx, libraryPath).map(w => ({ ...w, creatorFolder: r.path })));
+    else works.push(...folderWorks(r, tree, rctx).map(w => ({ ...w, creatorFolder: r.path })));
   }
   works.push(...studioWorks(recs, ctx));
   const joined = applyAliases(works, aliases);
@@ -735,6 +841,14 @@ function planWorks({ libraryPath, tree, meta, overrides = new Map(), log = () =>
   // after aliases: a confirmed merge never collapses two releases of a character
   const merged = splitReleases(joined, meta);
   if (merged.length !== joined.length) log('info', `Releases: ${merged.length - joined.length} more card(s) for characters released more than once`);
+  // category marks above a work's files: genre / group / tags (docs/folder-roles.md §1)
+  if ([...roleInfo.values()].some(e => e.role === 'category')) {
+    for (const w of merged) {
+      const dir = commonDir([...new Set(w.files.map(f => f.dir))]);
+      const cv = dir && folderRoles.categoryFor(dir, roleInfo, isGenre, libraryPath);
+      if (cv) { w.roleGenre = cv.genre; w.roleGroup = cv.group; w.roleTags = cv.tags; }
+    }
+  }
   if (meta) { meta.sidecars = sidecars; meta.sidecarErrors = sidecarErrors; }
   // Root folder per creator (for the creators table)
   const creatorFolders = new Map();
@@ -825,6 +939,8 @@ function splitReleases(works, meta) {
   const printable = (fs) => fs.filter(f => PRINTABLE_RE.test(f.name)).length;
   for (const w of works) {
     if (w.layout !== 'studio' || w.kind !== 'work' || w.files.length < 2) { out.push(w); continue; }
+    // all files below one model-marked folder: that folder is exactly one card (docs/folder-roles.md)
+    if (w.files[0].modelDir && w.files.every(f => f.modelDir === w.files[0].modelDir)) { out.push(w); continue; }
     const wkey = String(w.key).split('|').slice(2).join('|');
     const wToks = new Set(wkey.split(' ').filter(t => t.length >= 3));
     const family = (c) => naming.studioOf(c) || c;
@@ -1059,6 +1175,7 @@ function attributeWork(w, meta) {
   const metaGenre = majority(strongProducts.map(p => p.genre)) || majority(anyProducts.map(p => p.genre));
   let genre = null;
   if (sc && sc.genre) { genre = sc.genre; fields.franchise = 'sidecar'; }
+  if (!genre && w.roleGenre) { genre = w.roleGenre; fields.franchise = 'role'; } // a category mark
   if (!genre && pathGenre) { genre = pathGenre; fields.franchise = 'path'; }
   if (!genre && metaGenre) { genre = metaGenre; fields.franchise = 'manifest'; }
   if (pathGenre && metaGenre && naming.normKey(pathGenre) !== naming.normKey(metaGenre)) conflicts.push({ field: 'franchise', pathValue: pathGenre, metaValue: metaGenre });
@@ -1074,6 +1191,7 @@ function attributeWork(w, meta) {
     if (g) { genre = g.genre; fields.franchise = g.by; }
   }
   if (!genre && naming.FIXED_GENRE[w.creator]) { genre = naming.FIXED_GENRE[w.creator]; fields.franchise = 'path'; }
+  if (w.roleGroup) fields.group_name = 'role';
   // character
   if (w.layout === 'studio') fields.character = sc && sc.character ? 'sidecar' : 'parse';
   // release term
@@ -1172,6 +1290,7 @@ function finalizeWorks(works, { libraries = [], libraryOf }) {
       w.group = g ? g.name : null;
       delete w.groupCandidates;
     }
+    if (w.roleGroup) w.group = w.roleGroup; // a category mark above the work names its group
     const h = crypto.createHash('sha1');
     for (const f of [...w.files].sort((a, b) => (a.abs < b.abs ? -1 : 1))) h.update(`${f.abs}:${f.size}:${Math.round(f.mtimeMs)}|`);
     w.hash = h.digest('hex').slice(0, 16);
@@ -1211,7 +1330,7 @@ function realFolder(p) {
 }
 
 module.exports = {
-  walkTree, filesUnder, resolveRoots, planWorks, studioRecords, studioWorks, folderWorks, attributeWork,
+  walkTree, filesUnder, resolveRoots, planWorks, modelRootWorks, deepCreatorRoots, studioRecords, studioWorks, folderWorks, attributeWork,
   finalizeWorks, realFolder, editDistance, applyAliases, splitReleases, productRelease, releaseLabel, prettyName, inferModelName, releaseVariant, releaseItemName, commonDir, slugify,
   TRANSPARENT, SKIP_DIR,
 };

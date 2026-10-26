@@ -12,6 +12,7 @@ const DESCRIPTIONS = {
   'filing_rules.csv': 'typo fixes (aliases), groups and genre rules',
   'model_json.ndjson': 'one model.json per work folder',
   'moves.csv': 'proposed gold-layout paths for off-layout works (never applied by the app)',
+  'folder_roles.csv': 'folder roles set in the app, to merge into each library\'s _Meta/folder_roles.csv (the file wins)',
 };
 
 export function curlExample(file, origin) {

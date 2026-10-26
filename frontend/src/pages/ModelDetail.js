@@ -6,6 +6,7 @@ import ReleaseFileList from '../components/ReleaseFileList';
 import RenderHintPanel from '../components/RenderHintPanel';
 import Modal from '../components/Modal';
 import AttributionPanel, { hasAttributionData, AiMark } from '../components/AttributionPanel';
+import FolderBreadcrumb from '../components/FolderBreadcrumb';
 import { decideToasts, splitDecideErrors, isTermLabel } from '../enrich';
 import { useConfirm } from '../components/ConfirmDialog';
 import { formatTerm } from '../library';
@@ -653,6 +654,7 @@ export default function ModelDetail({ modelId, onBack, onSaved, onQueueChange, c
             )}
 
             {narrow && <div style={{ marginBottom: 16 }}><AttributionPanel model={model} onSaveField={saveAttributionField} onDecide={decideSuggestion} /></div>}
+            {narrow && <div style={{ marginBottom: 16 }}><FolderBreadcrumb model={model} /></div>}
 
             {/* Image tools */}
             <div className="detail-card" style={{ marginBottom: 16 }}>
@@ -781,6 +783,7 @@ export default function ModelDetail({ modelId, onBack, onSaved, onQueueChange, c
           {/* Middle: metadata panel */}
           <div className="detail-panel">
             {!narrow && <AttributionPanel model={model} onSaveField={saveAttributionField} onDecide={decideSuggestion} />}
+            {!narrow && <FolderBreadcrumb model={model} />}
             <div className="detail-card">
               <div className="detail-card-title">Info</div>
               {!showAttribution && <div className="meta-row"><span className="meta-label">Creator</span><span className="meta-val">{model.creator_name || '—'}</span></div>}

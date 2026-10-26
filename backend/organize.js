@@ -19,6 +19,7 @@ const path     = require('path');
 const db       = require('./db');
 const { pickRenderArchives, analyzeFolder, extractImagesFromArchive, analysisFromFiles, realFolder } = require('./scanner');
 const librariesLib = require('./lib/libraries');
+const folderRolesLib = require('./lib/folder-roles');
 const { callClaudeAPI, claudeStream } = require('./lib/claude');
 const { confinePath, tryConfine, sendPathError, isSafeSegment } = require('./lib/paths');
 const { openSSE } = require('./lib/sse');
@@ -1225,25 +1226,32 @@ router.post('/group-files', (req, res) => {
 });
 
 // ── Folder role overrides ──────────────────────────────────────────────────
-// Let the user pin how the scanner treats a folder (creator | passthrough |
-// ignore), overriding the heuristic. Used by scanner.resolveCreatorDirs.
+// The app's folder marks (creator | passthrough | category | model | ignore), docs/folder-roles.md.
+// The same DB rows as /api/folder-roles (which also shows the _Meta/folder_roles.csv marks).
 
 router.get('/folder-overrides', (req, res) => {
-  res.json(db.prepare('SELECT path, role, created_at FROM folder_overrides ORDER BY path').all());
+  res.json(db.prepare('SELECT path, role, genre, grp, tags, note, created_at, updated_at FROM folder_overrides ORDER BY path').all()
+    .map(({ grp, tags, ...r }) => ({ ...r, group: grp || null, tags: (() => { try { return JSON.parse(tags || '[]'); } catch { return []; } })() })));
 });
 
 router.post('/folder-overrides', (req, res) => {
-  const role = req.body?.role;
+  const role = folderRolesLib.normalizeRole(req.body?.role);
   if (!req.body?.path) return res.status(400).json({ error: 'path required' });
   if (!role) {
+    if (role === undefined) return res.status(400).json({ error: 'invalid role' });
     // Clearing is always allowed (even for a stale path outside the library)
     db.prepare('DELETE FROM folder_overrides WHERE path = ?').run(String(req.body.path));
     return res.json({ ok: true, cleared: true });
   }
   const p = confinedOr4xx(res, String(req.body.path));
   if (!p) return;
-  if (!['creator', 'passthrough', 'ignore'].includes(role)) return res.status(400).json({ error: 'invalid role' });
-  db.prepare('INSERT INTO folder_overrides (path, role) VALUES (?, ?) ON CONFLICT(path) DO UPDATE SET role = excluded.role').run(p, role);
+  const isCat = role === 'category';
+  const tags = isCat ? folderRolesLib.parseTags(req.body.tags) : [];
+  db.prepare(`INSERT INTO folder_overrides (path, role, genre, grp, tags, note, updated_at) VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
+    ON CONFLICT(path) DO UPDATE SET role = excluded.role, genre = excluded.genre, grp = excluded.grp, tags = excluded.tags,
+      note = COALESCE(excluded.note, folder_overrides.note), updated_at = excluded.updated_at`)
+    .run(p, role, isCat ? folderRolesLib.cleanValue(req.body.genre) : null, isCat ? folderRolesLib.cleanValue(req.body.group) : null,
+      tags.length ? JSON.stringify(tags) : null, folderRolesLib.cleanValue(req.body.note, 200));
   res.json({ ok: true });
 });
 
@@ -1254,17 +1262,19 @@ router.get('/fs-tree', (req, res) => {
   if (!base) return;
   const maxDepth = Math.min(parseInt(req.query.depth, 10) || 3, 5);
   const MAX_CHILDREN = 300;
-  let overrides;
-  try { overrides = new Map(db.prepare('SELECT path, role FROM folder_overrides').all().map(r => [r.path, r.role])); }
-  catch { overrides = new Map(); }
+  let roles;
+  try { roles = folderRolesLib.effectiveRoles(db, LIBRARY_PATH, librariesLib.listLibraries(LIBRARY_PATH)).merged; }
+  catch { roles = new Map(); }
 
   function walk(dir, depth) {
     let entries;
     try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return null; }
     entries = entries.filter(e => !e.name.startsWith('@') && !e.name.startsWith('#') && !e.name.startsWith('.'));
     const dirs = entries.filter(e => e.isDirectory());
+    const e = roles.get(dir);
     const node = {
-      name: path.basename(dir), path: dir, role: overrides.get(dir) || null,
+      name: path.basename(dir), path: dir, role: e ? e.role : null, source: e ? e.source : null, conflict: e ? e.conflict || null : null,
+      genre: e ? e.genre || null : null, group: e ? e.group || null : null, tags: e ? e.tags || [] : [],
       dirCount: dirs.length, fileCount: entries.length - dirs.length, children: [],
     };
     if (depth < maxDepth) {
@@ -1306,10 +1316,12 @@ router.post('/classify-folders', async (req, res) => {
   const treeText = lines.join('\n').slice(0, 12000);
 
   const system = `You classify folders in a 3D-print library so a scanner groups models correctly. For each folder, decide a role:
-- "creator": a creator/studio whose subfolders are that creator's models — the scanner should STOP here.
-- "passthrough": a wrapper, download dump, mount root, or category folder the scanner should descend THROUGH (e.g. "Downloads", "Gumroad", "STL Archive").
+- "creator": a creator/studio whose subfolders are that creator's models: the scanner should STOP here.
+- "passthrough": a wrapper, download dump or mount root the scanner should descend THROUGH (e.g. "Downloads", "Gumroad", "STL Archive").
+- "category": a grouping folder of different models (e.g. "Marvel", "X-Men", "Terrain", "Heroes"): never one card; its name becomes the genre or group of the models below it.
+- "model": one model whose parts or variants sit in many sub-folders: exactly one card.
 - "ignore": junk/system folders to skip.
-Use folder NAMES as the main signal (e.g. "...Studios"/"...3D Models" = creator; "Gumroad Downloads" = passthrough). Only include folders where you have a clear opinion; skip obvious individual model folders. Respond with ONLY a JSON array: [{"path":"<full path exactly as given after ::>","role":"creator|passthrough|ignore","reason":"short"}]`;
+Use folder NAMES as the main signal (e.g. "...Studios"/"...3D Models" = creator; "Gumroad Downloads" = passthrough). Only include folders where you have a clear opinion; skip obvious individual model folders. Respond with ONLY a JSON array: [{"path":"<full path exactly as given after ::>","role":"creator|passthrough|category|model|ignore","reason":"short"}]`;
   const user = `Folder tree (indentation = depth; each line ends with " :: <full path>"):\n\n${treeText}`;
 
   try {
@@ -1325,7 +1337,8 @@ Use folder NAMES as the main signal (e.g. "...Studios"/"...3D Models" = creator;
     const text = (parsed.content || []).filter(b => b.type === 'text').map(b => b.text).join('\n');
     const m = text.match(/\[[\s\S]*\]/);
     const suggestions = (m ? JSON.parse(m[0]) : [])
-      .filter(s => s && s.path && ['creator', 'passthrough', 'ignore'].includes(s.role));
+      .map(s => (s && s.role === 'container' ? { ...s, role: 'passthrough' } : s))
+      .filter(s => s && s.path && folderRolesLib.ROLES.includes(s.role));
     res.json({ suggestions });
   } catch (e) {
     res.status(500).json({ error: e.message });

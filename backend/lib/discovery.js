@@ -187,7 +187,8 @@ function makeDiscovery({ listDir = fsListDir, extended = false } = {}) {
 
     function recurse(dir, prefix, depth) {
       if (depth <= 0) return;
-      if (ov.get(dir) === 'ignore') return;
+      const role = ov.get(dir);
+      if (role === 'ignore') return;
       const entries = listDir(dir);
       let subdirs = entries.filter(e => e.isDirectory() && ov.get(path.join(dir, e.name)) !== 'ignore');
       if (boundary) subdirs = subdirs.filter(e => !boundary(path.join(dir, e.name), e.name));
@@ -195,6 +196,21 @@ function makeDiscovery({ listDir = fsListDir, extended = false } = {}) {
       const hasPrintableFiles = files.some(f => isPrintableName(f.name));
       const name = prefix || path.basename(dir);
       const childName = (sub) => (prefix ? `${prefix} / ${sub.name}` : sub.name);
+
+      // Folder roles (docs/folder-roles.md §3). "model": exactly one card, every file below it
+      // belongs to it, no deeper discovery. "category" / "passthrough" (below the root): never a
+      // model, never a variant container; its loose printable files become one card each.
+      if (depth < maxDepth && role === 'model') {
+        results.push({ name, fullPath: dir, variantDirs: subdirs.map(e => e.name), role: 'model' });
+        return;
+      }
+      if ((depth < maxDepth && role === 'passthrough') || role === 'category') {
+        if (hasPrintableFiles) results.push({ name, fullPath: dir, variantDirs: [], role, looseFiles: true });
+        // a marked grouping folder costs no depth: what is below it is found as if it were not there
+        // (a category that is the discovery root: its sub-folders are found as usual)
+        for (const sub of subdirs) recurse(path.join(dir, sub.name), childName(sub), depth < maxDepth ? depth : depth - 1);
+        return;
+      }
 
       if (hasPrintableFiles) {
         const variantDirs = [];
