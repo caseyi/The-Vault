@@ -15,6 +15,7 @@ const path = require('path');
 const crypto = require('crypto');
 const naming = require('./naming');
 const metaLib = require('./meta');
+const librariesLib = require('./libraries');
 const { makeDiscovery, IGNORED_FOLDERS, isJunkFile, isPrintableName, isExtVariantName } = require('./discovery');
 
 const SKIP_DIR = /^(?:_Inbox|_Duplicates_Pending_Delete|_Meta|#recycle|@eaDir|\..*)$/i; // + hidden ".Archive Service Temp…" 
@@ -22,6 +23,7 @@ const SKIP_DIR = /^(?:_Inbox|_Duplicates_Pending_Delete|_Meta|#recycle|@eaDir|\.
 const PARTIAL_FILE = /\.(?:crdownload|part|partial|download|tmp)$|^Unconfirmed \d+|^\./i; // + dotfiles (.smbdelete…, ._x)
 const TRANSPARENT = new Set(['_unsorted', '_dioramas', '_undated', '_bundles', 'wicked archive', 'gumroad downloads']);
 const DEFAULT_CONTAINERS = { 'wicked archive': 'Wicked' };
+const LOOSE_CREATOR = 'Unsorted'; // creator of loose files sitting at a library or container root
 const PASSTHROUGH_NAME = /^(gumroad|gumroad downloads?|downloads?|backups?|sync|syncthing|temp|tmp|unsorted|to[\s_-]?sort|imports?|stl[\s_-]?archive|3d[\s_-]?prints?|prints?|library)$/i;
 const IMAGE_EXTS = new Set(['.jpg', '.jpeg', '.png', '.webp', '.gif']);
 const INFO_EXTS = new Set(['.txt', '.pdf', '.md', '.doc', '.docx', '.rtf']);
@@ -106,10 +108,15 @@ function filesUnder(tree, dir, skip) {
  * containers start a studio subtree, `_Tools` is a tool root, transparent
  * containers are descended. Returns [{ type: 'studio'|'tools'|'regular', name, creator, path }].
  */
-function resolveRoots(base, tree, { overrides = new Map(), containers = DEFAULT_CONTAINERS, log = () => {}, depth = 0 } = {}) {
+function resolveRoots(base, tree, { overrides = new Map(), containers = DEFAULT_CONTAINERS, log = () => {}, depth = 0, libraryFolders = null } = {}) {
   const node = tree.dirs.get(base);
   if (!node) return [];
   const out = [];
+  // A library folder (/library/STL Archive, /library/Endor) is never a creator and never a card, even
+  // with loose files at its top: those become one card each ("Unsorted"), and its folders are creators.
+  if (depth === 0 && libraryFolders && libraryFolders.has(base)) {
+    if (node.files.some(f => isPrintableName(f.name))) out.push({ type: 'loose', name: path.basename(base), creator: LOOSE_CREATOR, path: base });
+  }
   for (const name of node.dirs) {
     const p = path.join(base, name);
     const ov = overrides.get(p);
@@ -117,19 +124,30 @@ function resolveRoots(base, tree, { overrides = new Map(), containers = DEFAULT_
     const lower = name.trim().toLowerCase();
     const alias = naming.canonicalCreator(name);
     if (ov === 'creator') { out.push({ type: alias && naming.STUDIO_CREATORS.has(alias) ? 'studio' : 'regular', name, creator: alias || name, path: p }); continue; }
-    if (ov === 'passthrough' && depth < 6) { out.push(...resolveRoots(p, tree, { overrides, containers, log, depth: depth + 1 })); continue; }
+    const sub = { overrides, containers, log, depth: depth + 1 };
+    if (libraryFolders && libraryFolders.has(p) && ov !== 'creator') { out.push(...resolveRoots(p, tree, { ...sub, depth: 0, libraryFolders })); continue; }
+    if (ov === 'passthrough' && depth < 6) { out.push(...resolveRoots(p, tree, sub)); continue; }
     if (alias && naming.STUDIO_CREATORS.has(alias)) { out.push({ type: 'studio', name, creator: alias, path: p }); continue; }
     if (containers[lower]) { out.push({ type: 'studio', name, creator: containers[lower], path: p, container: true }); continue; }
     if (lower === '_tools') { out.push({ type: 'tools', name: '_Tools', creator: '_Tools', path: p }); continue; }
     const child = tree.dirs.get(p) || { dirs: [], files: [] };
     const hasPrintable = child.files.some(f => isPrintableName(f.name));
     const transparent = TRANSPARENT.has(lower);
+    // A container by name ("_Unsorted", "Downloads", "STL Archive") stays one even with a few loose
+    // files at its top: they become "Unsorted" cards instead of turning the whole tree into one creator.
+    const named = transparent || PASSTHROUGH_NAME.test(name.trim());
+    if (named && hasPrintable && child.dirs.length > 0 && depth < 6) {
+      log('info', `"${name}" is a container with loose files — descending; its loose files become their own cards`);
+      out.push({ type: 'loose', name, creator: LOOSE_CREATOR, path: p });
+      out.push(...resolveRoots(p, tree, sub));
+      continue;
+    }
     const passthrough = !hasPrintable && child.dirs.length > 0 &&
-      (transparent || PASSTHROUGH_NAME.test(name.trim()) ||
+      (named ||
         (depth < 2 && child.dirs.length === 1 && !naming.parseRelease(child.dirs[0]))); // a creator with one release is still a creator
     if (passthrough && depth < 6) {
       log('info', `"${name}" looks like a container — descending to find creators inside it`);
-      out.push(...resolveRoots(p, tree, { overrides, containers, log, depth: depth + 1 }));
+      out.push(...resolveRoots(p, tree, sub));
     } else {
       out.push({ type: 'regular', name, creator: name, path: p });
     }
@@ -611,13 +629,52 @@ function folderWorks(root, tree, ctx) {
   return [...works.values()];
 }
 
+/**
+ * Loose files at a library or container root ("Red+Dragon (1).zip" next to the creator folders):
+ * one card per file, files with the same name ("Red Dragon.zip", "Red Dragon (1).zip") share it.
+ * Images and info files with a matching stem join that card; anything else at that level is left out.
+ */
+function looseWorks(root, tree, ctx) {
+  const node = tree.dirs.get(root.path);
+  if (!node) return [];
+  const nameOf = (file) => {
+    const stem = file.replace(/\.[^.]+$/, '').replace(/\+/g, ' ').replace(/[_]+/g, ' ')
+      .replace(/\s*\(\d+\)\s*$/, '').replace(/\s+copy(?:\s*\d+)?$/i, '').replace(/\s+/g, ' ').trim();
+    // "Nejavina-Slavic-DnD-Setting" (dashes for spaces) reads as words
+    return (/\s/.test(stem) ? stem : stem.replace(/-+/g, ' ').trim()) || file;
+  };
+  const works = new Map();
+  const files = node.files.filter(f => f.name !== 'model.json' && !isJunkFile(f.name));
+  for (const f of files.filter(x => isPrintableName(x.name))) {
+    const name = nameOf(f.name);
+    const key = `${root.creator}|model|${path.basename(root.path).toLowerCase()}/${naming.normKey(name, ctx.fix) || slugify(name)}`;
+    let w = works.get(key);
+    if (!w) {
+      w = { key, kind: 'model', layout: 'loose', creator: root.creator, studio: null, name, character: null, group: null, editions: [], files: [], folders: [root.path], sidecar: null, roots: new Map([[root.path, 0]]), stem: naming.normKey(name, ctx.fix) };
+      works.set(key, w);
+    }
+    w.files.push({ abs: path.join(root.path, f.name), name: f.name, size: f.size, mtimeMs: f.mtimeMs, dir: root.path, variant: fileVariantFallback(f.name) || 'other', edition: null });
+    w.roots.set(root.path, w.roots.get(root.path) + 1);
+  }
+  // "Red Dragon.jpg" / "Red Dragon.txt" next to "Red Dragon.zip"
+  for (const f of files) {
+    const ext = extOf(f.name);
+    if (isPrintableName(f.name) || (!IMAGE_EXTS.has(ext) && !INFO_EXTS.has(ext))) continue;
+    const k = naming.normKey(nameOf(f.name), ctx.fix);
+    const w = [...works.values()].find(x => x.stem && x.stem === k);
+    if (w) w.files.push({ abs: path.join(root.path, f.name), name: f.name, size: f.size, mtimeMs: f.mtimeMs, dir: root.path, variant: IMAGE_EXTS.has(ext) ? 'images' : 'info', edition: null });
+  }
+  for (const w of works.values()) delete w.stem;
+  return [...works.values()];
+}
+
 // ── planning ─────────────────────────────────────────────────────────────────
 
 /**
  * Build every work under `libraryPath`.
  * @param {object} opts { libraryPath, tree, meta, overrides, log, scope? (only roots under this path) }
  */
-function planWorks({ libraryPath, tree, meta, overrides = new Map(), log = () => {}, scope = null, containers, aliases = null }) {
+function planWorks({ libraryPath, tree, meta, overrides = new Map(), log = () => {}, scope = null, containers, aliases = null, libraryFolders = null }) {
   const fix = meta?.fix || naming.makeFixer();
   const parseCache = new Map();
   const parse = (name) => { let p = parseCache.get(name); if (!p) { p = naming.parseName(name, { fix }); parseCache.set(name, p); } return p; };
@@ -656,12 +713,20 @@ function planWorks({ libraryPath, tree, meta, overrides = new Map(), log = () =>
   if (meta?.vault?.studioAliases && typeof meta.vault.studioAliases === 'object') for (const [a, c] of Object.entries(meta.vault.studioAliases)) {
     if (typeof c !== 'string') continue; naming.CREATOR_ALIASES[a.toLowerCase()] = c; naming.STUDIO_CREATORS.add(c); }
 
-  let roots = resolveRoots(libraryPath, tree, { overrides, containers: cont, log });
-  if (scope) roots = roots.filter(r => r.path === scope || r.path.startsWith(scope + path.sep) || scope.startsWith(r.path + path.sep));
+  if (!libraryFolders) {
+    const top = tree.dirs.get(libraryPath);
+    const labels = librariesLib.parseLabels(process.env.LIBRARY_LABELS, meta?.vault?.libraryLabels);
+    const names = librariesLib.libraryFolderNames(top ? top.dirs : [], labels);
+    libraryFolders = new Set(names.length ? names.map(n => path.join(libraryPath, n)) : [libraryPath]);
+  }
+  let roots = resolveRoots(libraryPath, tree, { overrides, containers: cont, log, libraryFolders });
+  // a loose-files root holds only the files at its own level: in a scoped scan it belongs to that scope alone
+  if (scope) roots = roots.filter(r => r.path === scope || r.path.startsWith(scope + path.sep) || (r.type !== 'loose' && scope.startsWith(r.path + path.sep)));
   const recs = [];
   const works = [];
   for (const r of roots) {
     if (r.type === 'studio') recs.push(...studioRecords(r, tree, ctx));
+    else if (r.type === 'loose') works.push(...looseWorks(r, tree, ctx).map(w => ({ ...w, creatorFolder: r.path })));
     else works.push(...folderWorks(r, tree, ctx).map(w => ({ ...w, creatorFolder: r.path })));
   }
   works.push(...studioWorks(recs, ctx));

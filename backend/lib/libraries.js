@@ -35,13 +35,21 @@ const SKIP_TOP = /^(?:[@#.]|_Meta$|_Inbox$|_Duplicates_Pending_Delete$)/;
  * @returns {{ name: string, folder: string, path: string, writable: boolean }[]}
  *   name = label (Dagobah), folder = top-level folder name, path = absolute path
  */
+/**
+ * Which top-level folder names are libraries. A folder counts when it is labelled or looks like a
+ * mount ("STL Archive", "3dPrint"); once one does, every other top-level folder is a mount too
+ * (Docker mounts each library at /library/<name>: add-library.sh adds "/library/Endor").
+ * None qualifying = a plain creator-per-folder library: returns [].
+ */
+function libraryFolderNames(names, labels = new Map()) {
+  const cand = names.filter(n => !SKIP_TOP.test(n));
+  if (!cand.some(n => labels.has(n) || MOUNT_NAME.test(n.trim()))) return [];
+  return cand;
+}
+
 function pickLibraries(root, entries, labels) {
-  const libs = [];
-  for (const e of entries) {
-    if (!e.isDirectory() || SKIP_TOP.test(e.name)) continue;
-    const full = path.join(root, e.name);
-    if (labels.has(e.name) || MOUNT_NAME.test(e.name.trim())) libs.push({ name: labels.get(e.name) || e.name, folder: e.name, path: full });
-  }
+  const names = libraryFolderNames(entries.filter(e => e.isDirectory()).map(e => e.name), labels);
+  const libs = names.map(n => ({ name: labels.get(n) || n, folder: n, path: path.join(root, n) }));
   if (!libs.length) libs.push({ name: labels.get(path.basename(root)) || path.basename(root) || 'Library', folder: '', path: root });
   return libs.sort((a, b) => a.path.localeCompare(b.path));
 }
@@ -93,4 +101,4 @@ function libraryOf(p, libs) {
   return best ? best.name : null;
 }
 
-module.exports = { listLibraries, listLibrariesAsync, libraryOf, parseLabels, libraryRoot };
+module.exports = { libraryFolderNames, listLibraries, listLibrariesAsync, libraryOf, parseLabels, libraryRoot };

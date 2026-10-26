@@ -870,6 +870,12 @@ function franchiseAndTeam(w, base, prevAttr, meta) {
  * the genre folder or the creator's manifest that differs from what the proposal was made for.
  */
 function supersedeStaleSuggestions(log) {
+  // proposals about a card this scan folded away (or that would fold into one) can't be acted on
+  try {
+    const r = db.prepare(`UPDATE suggestions SET status = 'superseded', decided_at = datetime('now') WHERE status = 'pending' AND (
+      model_id IN (SELECT id FROM models WHERE folded_into IS NOT NULL) OR target_id IN (SELECT id FROM models WHERE folded_into IS NOT NULL))`).run();
+    if (r.changes) log('info', `${r.changes} AI proposal(s) superseded: their card was regrouped`);
+  } catch { /* no suggestions table yet */ }
   let pend;
   try { pend = db.prepare(`SELECT s.id, s.field, s.current, m.character, m.franchise, m.group_name, m.editions, m.attribution FROM suggestions s JOIN models m ON m.id = s.model_id WHERE s.status = 'pending' AND s.type = 'field' AND s.field IN ('character','franchise','group_name','editions')`).all(); } catch { return; }
   const stale = [];
