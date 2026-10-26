@@ -23,6 +23,11 @@ Measured on a rebuild of the Oct 12 2026 inventories (54,983 files), the folder-
 - Every top-level folder under `LIBRARY_PATH` (`/library` in Docker) is a library:
   `/library/STL Archive` (Dagobah), `/library/3dPrint` (Endor).
 - Labels: `LIBRARY_LABELS="STL Archive=Dagobah,3dPrint=Endor"` (optional; default = folder name).
+- Once one top-level folder is a library (labelled, or a mount name such as `STL Archive`), every
+  top-level folder is one: `add-library.sh` mounts Endor at `/library/Endor`.
+- A library folder is never a creator or a card. Loose files at its top (`Red+Dragon (1).zip` next
+  to the creator folders) get one card each under the creator `Unsorted`; same for a container
+  folder by name (`Downloads`, `_Unsorted`, ...) that has loose files and sub-folders.
 - Endor is mounted read-only: DSM "Mount Remote Folder" of Endor's share onto Dagobah, then a
   `:ro` bind in docker-compose (`LIBRARY2_*`). See README.
 - A work can have files in several libraries. One card per work; files list their library.
