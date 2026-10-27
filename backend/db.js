@@ -423,6 +423,90 @@ const MIGRATIONS = [
       set.run(src, r.id);
     }
   },
+  // 9: related cards and sets (docs/relations.md): relations between cards and sets of cards, keyed
+  //    by work_key so they survive rescans; suggestions learn the types relation / set / set-member
+  //    and the set they are about (CHECK changes, so the table is rebuilt: rows and ids kept).
+  () => {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS relations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        type TEXT NOT NULL CHECK(type IN ('features','release-of','accessory-of','related')),
+        from_id INTEGER,
+        to_id INTEGER,
+        from_key TEXT NOT NULL,
+        to_key TEXT NOT NULL,
+        source TEXT NOT NULL DEFAULT 'auto' CHECK(source IN ('auto','auto-reviewed','user')),
+        confidence REAL,
+        status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','removed','stale')),
+        reason TEXT,
+        created_at TEXT DEFAULT (datetime('now')),
+        updated_at TEXT DEFAULT (datetime('now')),
+        UNIQUE(type, from_key, to_key)
+      )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_relations_from ON relations(from_id, status)`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_relations_to ON relations(to_id, status)`);
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS sets (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        creator TEXT,
+        name TEXT NOT NULL,
+        kind TEXT NOT NULL CHECK(kind IN ('release','theme')),
+        key TEXT NOT NULL UNIQUE,
+        term TEXT,
+        source TEXT NOT NULL DEFAULT 'auto' CHECK(source IN ('auto','auto-reviewed','user')),
+        status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','suggested','removed')),
+        note TEXT,
+        info TEXT,
+        created_at TEXT DEFAULT (datetime('now')),
+        updated_at TEXT DEFAULT (datetime('now'))
+      )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_sets_kind ON sets(kind, status)`);
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS set_members (
+        set_id INTEGER NOT NULL REFERENCES sets(id) ON DELETE CASCADE,
+        model_key TEXT NOT NULL,
+        model_id INTEGER,
+        via TEXT NOT NULL DEFAULT 'auto' CHECK(via IN ('release','folder','auto','user')),
+        status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','suggested','removed','stale')),
+        confidence REAL,
+        created_at TEXT DEFAULT (datetime('now')),
+        PRIMARY KEY (set_id, model_key)
+      )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_set_members_model ON set_members(model_id, status)`);
+
+    const cols = db.prepare('PRAGMA table_info(suggestions)').all().map(c => c.name);
+    const keep = ['id', 'model_id', 'type', 'field', 'current', 'proposed', 'target_id', 'path', 'confidence', 'reason', 'source', 'run_id', 'status', 'created_at', 'decided_at'].filter(c => cols.includes(c));
+    db.exec(`
+      CREATE TABLE suggestions_v9 (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        model_id INTEGER NOT NULL,
+        type TEXT NOT NULL CHECK(type IN ('field','merge','rename','role','relation','set','set-member')),
+        field TEXT,
+        current TEXT,
+        proposed TEXT,
+        target_id INTEGER,
+        path TEXT,
+        set_id INTEGER,
+        confidence REAL,
+        reason TEXT,
+        source TEXT DEFAULT 'text',
+        run_id INTEGER,
+        status TEXT DEFAULT 'pending' CHECK(status IN ('pending','accepted','rejected','superseded')),
+        created_at TEXT DEFAULT (datetime('now')),
+        decided_at TEXT
+      )
+    `);
+    db.exec(`INSERT INTO suggestions_v9 (${keep.join(',')}) SELECT ${keep.join(',')} FROM suggestions`);
+    db.exec('DROP TABLE suggestions');
+    db.exec('ALTER TABLE suggestions_v9 RENAME TO suggestions');
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_suggestions_status ON suggestions(status, type, field)`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_suggestions_model ON suggestions(model_id)`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_suggestions_path ON suggestions(path)`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_suggestions_set ON suggestions(set_id)`);
+  },
 ];
 
 db.getSetting = (key) => {

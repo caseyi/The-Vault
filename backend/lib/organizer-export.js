@@ -354,12 +354,18 @@ function folderRolesFile(db, { since, libraries } = {}) {
   return { rows, text: toCSV(['library', 'path', 'role', 'genre', 'group', 'tags', 'note'], rows) };
 }
 
+/** relations.csv / sets.csv: related cards and sets (docs/relations.md §4) */
+const relationsFile = (db, ctx = {}) => require('./relations').exportRelations(db, ctx, { libRel, toCSV, unsafeRow });
+const setsFile = (db, ctx = {}) => require('./relations').exportSets(db, ctx, { libRel, toCSV, unsafeRow });
+
 const FILES = {
   'genre_map.csv': { fn: genreMap, type: 'text/csv; charset=utf-8' },
   'filing_rules.csv': { fn: filingRules, type: 'text/csv; charset=utf-8' },
   'model_json.ndjson': { fn: modelJson, type: 'application/x-ndjson; charset=utf-8' },
   'moves.csv': { fn: moves, type: 'text/csv; charset=utf-8' },
   'folder_roles.csv': { fn: folderRolesFile, type: 'text/csv; charset=utf-8' },
+  'relations.csv': { fn: relationsFile, type: 'text/csv; charset=utf-8' },
+  'sets.csv': { fn: setsFile, type: 'text/csv; charset=utf-8' },
 };
 
-module.exports = { FILES, genreMap, filingRules, modelJson, moves, folderRolesFile, toCSV, csvCell, key, trust, goldPath, characterSeg, studioRoots, teamGroups, AI_EXPORT_MIN };
+module.exports = { FILES, relationsFile, setsFile, genreMap, filingRules, modelJson, moves, folderRolesFile, toCSV, csvCell, key, trust, goldPath, characterSeg, studioRoots, teamGroups, AI_EXPORT_MIN };

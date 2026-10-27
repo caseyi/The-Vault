@@ -6,6 +6,9 @@ import { cardEditions, multiLibraryLabel, formatTerm, isAttributed } from '../li
 import { isTermLabel } from '../enrich';
 import Modal from '../components/Modal';
 import { cardImages, isMeshPreview } from '../thumbs';
+import { relationBadges, cardSetChips, setChipLabel } from '../relations';
+import AddToSet from '../components/AddToSet';
+import SetsView from '../components/SetsView';
 
 const EnrichPanel = React.lazy(() => import('../components/EnrichPanel'));
 
@@ -34,7 +37,41 @@ export function CardMeta({ model, showAttribution }) {
   );
 }
 
-const ModelCard = memo(function ModelCard({ model, onClick, bulkMode, selected, onToggle, onHide, onFavorite, showAttribution }) {
+/** "Features N" / "In N dioramas" badges; click shows the card's related set. */
+export function RelationBadges({ model, onRelated, interactive }) {
+  const badges = relationBadges(model);
+  if (!badges.length) return null;
+  return (
+    <div className="card-rel-badges">
+      {badges.map(b => (interactive && onRelated ? (
+        <button key={b.key} type="button" className={`card-rel-badge rel-${b.key}`} title={b.title}
+          aria-label={`${b.label}: show related cards for ${model.name}`}
+          onClick={e => { e.stopPropagation(); onRelated(model); }}>{b.label}</button>
+      ) : (
+        <span key={b.key} className={`card-rel-badge rel-${b.key}`} title={b.title}>{b.label}</span>
+      )))}
+    </div>
+  );
+}
+
+/** Release / theme / diorama chips from `rel.sets`; click filters the gallery to the set. */
+export function CardSetChips({ model, onSet, interactive }) {
+  const sets = cardSetChips(model);
+  if (!sets.length) return null;
+  return (
+    <div className="card-set-chips">
+      {sets.map(s => {
+        const label = setChipLabel(s);
+        return interactive && onSet ? (
+          <button key={`${s.kind}-${s.id}`} type="button" className={`set-chip set-${s.kind}`} title={label}
+            aria-label={`Show set ${label}`} onClick={e => { e.stopPropagation(); onSet(s); }}>{label}</button>
+        ) : <span key={`${s.kind}-${s.id}`} className={`set-chip set-${s.kind}`} title={label}>{label}</span>;
+      })}
+    </div>
+  );
+}
+
+const ModelCard = memo(function ModelCard({ model, onClick, bulkMode, selected, onToggle, onHide, onFavorite, showAttribution, onRelated, onSet }) {
   // Small cached copies (thumb_url / thumb_urls) when the backend has them;
   // the originals otherwise (older backend).
   const imgs = useMemo(() => cardImages(model), [model]);
@@ -124,6 +161,7 @@ const ModelCard = memo(function ModelCard({ model, onClick, bulkMode, selected, 
         {showImg && meshPreview && (
           <span className="card-3d-badge" role="img" title="Preview rendered from the 3D model" aria-label="3D preview rendered from the model">3D</span>
         )}
+        <RelationBadges model={model} onRelated={onRelated} interactive={!bulkMode} />
       </div>
       {imgs.length > 1 && !bulkMode && (
         <>
@@ -142,6 +180,7 @@ const ModelCard = memo(function ModelCard({ model, onClick, bulkMode, selected, 
           <div className="model-card-release" title={`Release: ${model.release_label}`}>{model.release_label}</div>
         )}
         <CardMeta model={model} showAttribution={showAttribution} />
+        <CardSetChips model={model} onSet={onSet} interactive={!bulkMode} />
         <div className="model-card-footer">
           <span className={`status-badge status-${model.print_status}`}>
             {STATUS_ICONS[model.print_status]} {model.print_status}
@@ -157,7 +196,7 @@ const ModelCard = memo(function ModelCard({ model, onClick, bulkMode, selected, 
   );
 });
 
-function BulkActionBar({ selectedIds, onClearSelection, onBulkStatus, onBulkTag, onBulkHide, onSelectAll, totalVisible, collections, onRefreshCollections, onEnrich }) {
+function BulkActionBar({ selectedIds, onClearSelection, onBulkStatus, onBulkTag, onBulkHide, onSelectAll, totalVisible, collections, onRefreshCollections, onEnrich, setsEnabled, onSetsChanged }) {
   const notify = useNotify();
   const [showStatusMenu, setShowStatusMenu] = useState(false);
   const [showTagMenu, setShowTagMenu] = useState(false);
@@ -299,6 +338,8 @@ function BulkActionBar({ selectedIds, onClearSelection, onBulkStatus, onBulkTag,
         </div>
       )}
 
+      {setsEnabled && <AddToSet ids={selectedIds} buttonClass="bulk-btn" onDone={onSetsChanged} />}
+
       {onEnrich && <button onClick={onEnrich} className="bulk-btn bulk-btn-ai" title="Uses Claude API credits">$ ✦ Enrich selected</button>}
       <button onClick={() => run(() => onBulkHide(true), 'Hide')} className="bulk-btn bulk-btn-muted">🙈 Hide</button>
       <button onClick={() => run(() => onBulkHide(false), 'Unhide')} className="bulk-btn bulk-btn-muted">👁 Unhide</button>
@@ -352,7 +393,7 @@ const SORT_OPTIONS = [
 
 const CARD_MIN = { small: 150, medium: 200, large: 290 };
 
-export default function Gallery({ filters, onFilterChange, onModelClick, showHidden, onToggleHidden, onRefreshStats, refreshKey, collections, onRefreshCollections, onScanClick, onOpenReview, onSuggestionsChange }) {
+export default function Gallery({ filters, onFilterChange, onModelClick, showHidden, onToggleHidden, onRefreshStats, refreshKey, collections, onRefreshCollections, onScanClick, onOpenReview, onSuggestionsChange, relations }) {
   const [enrichIds, setEnrichIds] = useState(null);
   const [enrichRunning, setEnrichRunning] = useState(false);
   const notify = useNotify();
@@ -365,6 +406,12 @@ export default function Gallery({ filters, onFilterChange, onModelClick, showHid
   const [bulkMode, setBulkMode] = useState(false);
   const [selectedIds, setSelectedIds] = useState(() => new Set());
   const [sort, setSort] = useState('creator');
+  const relationsOn = !!relations;
+  const [viewMode, setViewMode] = useState(() => {
+    try { return localStorage.getItem('vault_gallery_view') === 'sets' ? 'sets' : 'cards'; } catch { return 'cards'; }
+  });
+  const pickView = (v) => { setViewMode(v); try { localStorage.setItem('vault_gallery_view', v); } catch {} };
+  const setsMode = relationsOn && viewMode === 'sets';
   const [cardSize, setCardSize] = useState(() => {
     try { return localStorage.getItem('vault_card_size') || 'medium'; } catch { return 'medium'; }
   });
@@ -522,6 +569,14 @@ export default function Gallery({ filters, onFilterChange, onModelClick, showHid
     }
   }, [fetchModels, onRefreshStats, notify]); // eslint-disable-line
 
+  const showRelated = useCallback((m) => {
+    onFilterChange({ ...filtersRef.current, relatedTo: String(m.id), relatedToName: m.name || '' });
+  }, [onFilterChange]);
+  const showSet = useCallback((s) => {
+    onFilterChange({ ...filtersRef.current, set: String(s.id), setName: setChipLabel(s) });
+    pickView('cards');
+  }, [onFilterChange]); // eslint-disable-line
+
   const chips = activeFilterChips(filters, { collections });
   if (showHidden && onToggleHidden) {
     chips.push({ key: 'show_hidden', label: 'Showing hidden', value: '', clearHidden: true });
@@ -558,17 +613,26 @@ export default function Gallery({ filters, onFilterChange, onModelClick, showHid
             ))}
           </div>
 
-          <button onClick={() => { setBulkMode(b => !b); setSelectedIds(new Set()); }}
+          {relationsOn && (
+            <div className="size-toggle view-toggle" role="group" aria-label="Gallery view">
+              {[['cards', 'Cards'], ['sets', 'Sets']].map(([v, label]) => (
+                <button key={v} type="button" onClick={() => pickView(v)} aria-pressed={viewMode === v}
+                  className={viewMode === v ? 'active' : ''}>{label}</button>
+              ))}
+            </div>
+          )}
+
+          {!setsMode && <button onClick={() => { setBulkMode(b => !b); setSelectedIds(new Set()); }}
             aria-pressed={bulkMode} className={`chip-btn ${bulkMode ? 'active' : ''}`}>
             {bulkMode ? '✕ Cancel' : '⊡ Select'}
-          </button>
+          </button>}
 
           <a href={buildExportUrl()} download className="chip-btn" title="Export current view to CSV">
             ⬇ CSV
           </a>
         </div>
 
-        <div className="result-count">{total.toLocaleString()} models</div>
+        {!setsMode && <div className="result-count">{total.toLocaleString()} models</div>}
       </div>
 
       <FilterChips chips={chips} onRemove={removeChip} onClearAll={clearAll} />
@@ -576,7 +640,13 @@ export default function Gallery({ filters, onFilterChange, onModelClick, showHid
         <CollectionBanner collection={collections.find(c => String(c.id) === String(filters.collection))} />
       )}
 
-      <div className="gallery-scroll">
+      {setsMode && (
+        <div className="gallery-scroll">
+          <SetsView filters={filters} onModelClick={onModelClick} onShowSet={showSet} />
+        </div>
+      )}
+
+      <div className="gallery-scroll" hidden={setsMode}>
         {models.length === 0 && !loading && loadedOnce && (
           filtered ? (
             <div className="empty-state">
@@ -601,7 +671,8 @@ export default function Gallery({ filters, onFilterChange, onModelClick, showHid
               <ModelCard key={m.id} model={m} onClick={onModelClick}
                 bulkMode={bulkMode} selected={selectedIds.has(m.id)}
                 onToggle={toggleSelect} onHide={handleHideModel} onFavorite={handleFavorite}
-                showAttribution={!!filters.attributed} />
+                showAttribution={!!filters.attributed}
+                onRelated={showRelated} onSet={showSet} />
             ))}
           </div>
         )}
@@ -618,12 +689,13 @@ export default function Gallery({ filters, onFilterChange, onModelClick, showHid
         )}
       </div>
 
-      {bulkMode && selectedIds.size > 0 && (
+      {bulkMode && !setsMode && selectedIds.size > 0 && (
         <BulkActionBar selectedIds={selectedList} onClearSelection={clearSelection}
           onBulkStatus={handleBulkStatus} onBulkTag={handleBulkTag} onBulkHide={handleBulkHide}
           onSelectAll={() => setSelectedIds(new Set(models.map(m => m.id)))} totalVisible={models.length}
           collections={collections} onRefreshCollections={onRefreshCollections}
-          onEnrich={() => setEnrichIds(selectedList)} />
+          onEnrich={() => setEnrichIds(selectedList)}
+          setsEnabled={relationsOn} onSetsChanged={reload} />
       )}
 
       {enrichIds && (

@@ -9,6 +9,7 @@ import {
 import { formatTerm } from '../library';
 import { roleLabel, suggestionFolder } from '../folderRoles';
 import { useNotifyRescan } from './RoleMenu';
+import { relationLabel, setName, suggestionSetId, setSummaryLine } from '../relations';
 
 // Organize → Review: AI suggestions waiting for Casey (docs/ai-enrichment.md §5).
 // Grouped by type, filterable by creator and confidence band, decided one by
@@ -113,16 +114,86 @@ function MergeCard({ card, role }) {
   );
 }
 
+/** A proposed relation: from card, relation type, to card. */
+function RelationChange({ item }) {
+  return (
+    <span className="diff rel-diff">
+      <b className="rel-diff-card">{item.model?.name || '?'}</b>
+      <span className="rel-diff-type"> {relationLabel(item.field || item.proposed).toLowerCase()} </span>
+      <ins className="diff-new">{item.target?.name || '?'}</ins>
+      {item.target?.creator_name && item.target.creator_name !== item.model?.creator_name && (
+        <span className="attr-faint"> ({item.target.creator_name})</span>
+      )}
+    </span>
+  );
+}
+
+/** A proposed theme: name, counts and members, each with "Leave out". */
+function ThemeProposal({ item, busy }) {
+  const notify = useNotify();
+  const [members, setMembers] = useState(() => (Array.isArray(item.members) ? item.members.filter(Boolean) : []));
+  const [left, setLeft] = useState(0);
+  const [working, setWorking] = useState(null);
+  const sid = suggestionSetId(item);
+  const name = setName(item);
+  const counts = item.counts || {};
+  const leaveOut = async (m) => {
+    if (sid == null) return;
+    setWorking(m.id);
+    try {
+      await apiSend(`/api/sets/${encodeURIComponent(sid)}/members/${m.id}`, 'DELETE');
+      setMembers(prev => prev.filter(x => x.id !== m.id));
+      setLeft(n => n + 1);
+    } catch (e) { notify(`Couldn't leave out ${m.name}: ${errorMessage(e)}`); }
+    setWorking(null);
+  };
+  const cards = counts.cards != null ? Math.max(0, Number(counts.cards) - left) : null;
+  return (
+    <div className="theme-proposal">
+      <div className="theme-proposal-head">
+        <span className="set-chip set-theme">Theme</span>
+        <b className="theme-proposal-name">{name}</b>
+        <span className="attr-faint">{setSummaryLine({ creator: item.model?.creator_name || item.creator, counts: { ...counts, cards } })}</span>
+      </div>
+      {members.length > 0 && (
+        <ul className="theme-members" aria-label={`Members of ${name}`}>
+          {members.map(m => (
+            <li key={m.id} className="theme-member">
+              <span className="theme-member-name" title={m.name}>{m.name}</span>
+              {m.release_label && <span className="attr-faint theme-member-rel">{m.release_label}</span>}
+              <button type="button" className="link-btn theme-leave-out" disabled={busy || working != null || sid == null}
+                onClick={() => leaveOut(m)} aria-label={`Leave ${m.name} out of ${name}`}>Leave out</button>
+            </li>
+          ))}
+        </ul>
+      )}
+      {cards != null && cards > members.length && (
+        <div className="attr-faint">and {cards - members.length} more</div>
+      )}
+    </div>
+  );
+}
+
 function ReviewRow({ item, active, selected, onSelect, onDecide, busy, rowRef, onFocus }) {
   const isMerge = item.type === 'merge';
   const isRole = item.type === 'role';
-  const label = isMerge ? 'Same character' : item.type === 'rename' ? 'Name' : isRole ? 'Folder role' : (FIELD_LABELS[item.field] || item.field);
+  const isRelation = item.type === 'relation';
+  const isTheme = item.type === 'set';
+  const isMember = item.type === 'set-member';
+  const label = isMerge ? 'Same character' : item.type === 'rename' ? 'Name' : isRole ? 'Folder role'
+    : isRelation ? 'Related card' : isTheme ? 'Theme' : isMember ? 'Theme member' : (FIELD_LABELS[item.field] || item.field);
+  const rowName = isTheme ? setName(item) : (item.model?.name || '');
   return (
     <li ref={rowRef} className={`review-row ${active ? 'active' : ''} ${selected ? 'selected' : ''} ${isMerge ? 'is-merge' : ''}`}
-      tabIndex={active ? 0 : -1} onFocus={onFocus} aria-label={`${label}: ${item.model?.name || ''}`}>
+      tabIndex={active ? 0 : -1} onFocus={onFocus} aria-label={`${label}: ${rowName}`}>
       <input type="checkbox" className="review-check" checked={selected} onChange={() => onSelect(item.id)}
-        aria-label={`Select suggestion for ${item.model?.name || item.id}`} />
-      {isMerge ? (
+        aria-label={`Select suggestion for ${rowName || item.id}`} />
+      {isTheme ? (
+        <div className="review-body">
+          <ThemeProposal item={item} busy={busy} />
+          <div className="review-meta"><ConfidenceChip value={item.confidence} /><span className="review-reason">{item.reason}</span></div>
+        </div>
+      ) : isMerge ? (
         <div className="review-body">
           <div className="merge-compare">
             <MergeCard card={item.model} role="source" />
@@ -139,16 +210,19 @@ function ReviewRow({ item, active, selected, onSelect, onDecide, busy, rowRef, o
               <span className="review-name" title={item.model?.name}>{item.model?.name}</span>
               <span className="review-creator">{item.model?.creator_name}</span>
             </div>
-            <div className="review-change"><span className="review-field">{label}</span>{isRole ? <RoleChange item={item} /> : <ValueDiff item={item} />}</div>
+            <div className="review-change"><span className="review-field">{label}</span>{isRole ? <RoleChange item={item} />
+              : isRelation ? <RelationChange item={item} />
+                : isMember ? <span className="diff">Add to theme <ins className="diff-new">{setName(item)}</ins></span>
+                  : <ValueDiff item={item} />}</div>
             <div className="review-meta"><ConfidenceChip value={item.confidence} /><SourceChip source={item.source} /><span className="review-reason">{item.reason}</span></div>
           </div>
         </div>
       )}
       <div className="review-actions">
         <button className="org-btn org-btn-sm org-btn-success" disabled={busy} onClick={() => onDecide([item.id], 'accept', [item])}
-          aria-label={`Accept ${label} for ${item.model?.name}`}>✓ {isMerge ? 'Merge' : 'Accept'}</button>
+          aria-label={`Accept ${label} for ${rowName}`}>✓ {isMerge ? 'Merge' : 'Accept'}</button>
         <button className="org-btn org-btn-sm" disabled={busy} onClick={() => onDecide([item.id], 'reject', [item])}
-          aria-label={`Reject ${label} for ${item.model?.name}`}>✕ Reject</button>
+          aria-label={`Reject ${label} for ${rowName}`}>✕ Reject</button>
       </div>
     </li>
   );

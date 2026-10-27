@@ -347,7 +347,7 @@ describe('organizer export', () => {
 
   test('index lists the files with row counts and a cursor', async () => {
     const r = await request(app).get('/api/organizer/export');
-    expect(r.body.files.map(f => f.name)).toEqual(['genre_map.csv', 'filing_rules.csv', 'model_json.ndjson', 'moves.csv', 'folder_roles.csv']);
+    expect(r.body.files.map(f => f.name)).toEqual(['genre_map.csv', 'filing_rules.csv', 'model_json.ndjson', 'moves.csv', 'folder_roles.csv', 'relations.csv', 'sets.csv']);
     for (const f of r.body.files) expect(f).toEqual({ name: f.name, url: `/api/organizer/export/${f.name}`, rows: expect.any(Number) });
     expect(r.body.cursor).toBe(r.body.generatedAt);
   });

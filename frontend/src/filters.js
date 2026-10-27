@@ -1,11 +1,15 @@
 // Gallery filter state shape + helpers shared by App, Sidebar and Gallery.
 import { formatTerm, kindLabel, sourceLabel } from './library';
+import { RELATION_FILTERS, SET_KIND_FILTERS } from './relations';
 
 export const EMPTY_FILTERS = Object.freeze({
   search: '', creator: '', status: '', tags: '', franchise: '', collection: '', folder: '',
   has_thumbnail: false, recently_added: false, favorite: false,
   // Library metadata (works / attribution)
   library: '', studio: '', term: '', kind: '', source: '', attributed: '',
+  // Related cards and sets (docs/relations.md). *Name keys only label the chips.
+  inDiorama: false, features: false, hasReleases: false, hasAccessories: false, hasRelations: false,
+  relatedTo: '', relatedToName: '', set: '', setName: '', inSet: '', noTheme: false,
 });
 
 /** Query params for /api/models (and the CSV export) from the filter state. */
@@ -28,6 +32,15 @@ export function filterParams(filters = {}, { showHidden = false } = {}) {
     ...(f.kind && { kind: f.kind }),
     ...(f.source && { source: f.source }),
     ...(f.attributed && { attributed: f.attributed }),
+    ...(f.inDiorama && { inDiorama: '1' }),
+    ...(f.features && { features: '1' }),
+    ...(f.hasReleases && { hasReleases: '1' }),
+    ...(f.hasAccessories && { hasAccessories: '1' }),
+    ...(f.hasRelations && { hasRelations: '1' }),
+    ...(f.relatedTo && { relatedTo: String(f.relatedTo) }),
+    ...(f.set && { set: String(f.set) }),
+    ...(f.inSet && { inSet: f.inSet }),
+    ...(f.noTheme && { noTheme: '1' }),
     ...(showHidden && { show_hidden: '1' }),
   };
 }
@@ -62,6 +75,18 @@ export function activeFilterChips(filters = {}, { collections = [] } = {}) {
       clear: x => ({ ...x, tags: (x.tags || '').split(',').filter(t => t && t !== tag).join(',') }),
     });
   }
+  for (const r of RELATION_FILTERS) {
+    if (f[r.key]) chips.push({ key: r.key, label: r.label, value: '', clear: x => ({ ...x, [r.key]: false }) });
+  }
+  if (f.relatedTo) {
+    chips.push({ key: 'relatedTo', label: 'Related to', value: f.relatedToName || `#${f.relatedTo}`, clear: x => ({ ...x, relatedTo: '', relatedToName: '' }) });
+  }
+  if (f.set) chips.push({ key: 'set', label: 'Set', value: f.setName || `#${f.set}`, clear: x => ({ ...x, set: '', setName: '' }) });
+  if (f.inSet) {
+    const o = SET_KIND_FILTERS.find(k => k.value === f.inSet);
+    chips.push({ key: 'inSet', label: 'Sets', value: o ? o.label : f.inSet, clear: x => ({ ...x, inSet: '' }) });
+  }
+  if (f.noTheme) chips.push({ key: 'noTheme', label: 'Not in a theme', value: '', clear: x => ({ ...x, noTheme: false }) });
   if (f.favorite) chips.push({ key: 'favorite', label: 'Favorites', value: '★', clear: x => ({ ...x, favorite: false }) });
   if (f.has_thumbnail) chips.push({ key: 'has_thumbnail', label: 'Has thumbnail', value: '', clear: x => ({ ...x, has_thumbnail: false }) });
   if (f.recently_added) chips.push({ key: 'recently_added', label: 'New this scan', value: '', clear: x => ({ ...x, recently_added: false }) });

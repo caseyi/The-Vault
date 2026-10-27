@@ -1,7 +1,9 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   groupTermsByYear, formatTerm, KIND_OPTIONS, sourceLabel, ATTRIBUTION_OPTIONS,
 } from '../library';
+import { RELATION_FILTERS, SET_KIND_FILTERS, setChipLabel } from '../relations';
+import { apiGet } from '../api';
 
 // Sidebar filters for the library-metadata facets (library, kind, studio, genre,
 // term, source, attribution). Options and counts come from GET /api/facets; when
@@ -144,7 +146,87 @@ function sumCounts(list, names) {
   return any ? n : undefined;
 }
 
-export default function FacetFilters({ facets, franchises, filters, onFilterChange }) {
+/** Searches GET /api/sets for the set picker (current creator/studio filter). */
+export function SetPicker({ filters, onPick }) {
+  const [q, setQ] = useState('');
+  const [items, setItems] = useState(null);
+  const timer = useRef(null);
+  const creator = filters.creator || filters.studio || '';
+  useEffect(() => {
+    clearTimeout(timer.current);
+    if (!q.trim()) { setItems(null); return undefined; }
+    let alive = true;
+    timer.current = setTimeout(() => {
+      const qs = new URLSearchParams({ search: q.trim(), limit: '12', ...(creator && { creator }) });
+      apiGet(`/api/sets?${qs}`)
+        .then(d => { if (alive) setItems(Array.isArray(d && d.items) ? d.items : []); })
+        .catch(() => { if (alive) setItems([]); });
+    }, 200);
+    return () => { alive = false; clearTimeout(timer.current); };
+  }, [q, creator]);
+  return (
+    <div className="set-picker">
+      <input type="search" className="set-picker-input" value={q} onChange={e => setQ(e.target.value)}
+        placeholder={creator ? `Find a set by ${creator}` : 'Find a set'} aria-label="Find a set" />
+      {items && (
+        <div className="creator-list facet-list" role="group" aria-label="Matching sets">
+          {items.length === 0 && <div className="set-picker-empty">No sets match</div>}
+          {items.map(s => (
+            <button key={s.id} type="button" className={`creator-btn ${String(filters.set) === String(s.id) ? 'active' : ''}`}
+              aria-pressed={String(filters.set) === String(s.id)}
+              onClick={() => { onPick(s); setQ(''); }}>
+              <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', flex: 1 }}>{setChipLabel(s)}</span>
+              {s.creator && <span className="count">{s.creator}</span>}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** "Relations" and "Sets" sidebar sections; shown only when GET /api/relations/summary answered. */
+export function RelationFacets({ relations, filters, onFilterChange }) {
+  if (!relations) return null;
+  const counts = (relations && relations.filters) || {};
+  const setCounts = (relations && relations.sets) || {};
+  const relActive = RELATION_FILTERS.some(r => filters[r.key]);
+  const setsActive = !!(filters.inSet || filters.noTheme || filters.set);
+  const clearRel = () => onFilterChange(RELATION_FILTERS.reduce((f, r) => ({ ...f, [r.key]: false }), { ...filters }));
+  const kindCount = k => (k === 'release' || k === 'theme' ? setCounts[k] : counts[`inSet:${k}`]);
+  return (
+    <>
+      <FacetSection id="relations" label="Relations" active={relActive} onClear={relActive ? clearRel : null}>
+        <div className="facet-pills" role="group" aria-label="Relations">
+          {RELATION_FILTERS.map(r => {
+            const on = !!filters[r.key];
+            const n = counts[r.key];
+            return (
+              <button key={r.key} type="button" className={`facet-pill ${on ? 'active' : ''}`} aria-pressed={on}
+                onClick={() => onFilterChange({ ...filters, [r.key]: !on })}>
+                {r.label}{n != null && <span className="facet-pill-count">{Number(n).toLocaleString()}</span>}
+              </button>
+            );
+          })}
+        </div>
+      </FacetSection>
+      <FacetSection id="sets" label="Sets" active={setsActive}
+        onClear={setsActive ? () => onFilterChange({ ...filters, inSet: '', noTheme: false, set: '', setName: '' }) : null}>
+        <PillGroup label="Set kind" value={filters.inSet} onPick={v => onFilterChange({ ...filters, inSet: v })}
+          options={SET_KIND_FILTERS.map(o => ({ ...o, count: kindCount(o.value) }))} />
+        <div className="facet-pills" role="group" aria-label="Themes">
+          <button type="button" className={`facet-pill ${filters.noTheme ? 'active' : ''}`} aria-pressed={!!filters.noTheme}
+            onClick={() => onFilterChange({ ...filters, noTheme: !filters.noTheme })}>
+            Not in a theme{counts.noTheme != null && <span className="facet-pill-count">{Number(counts.noTheme).toLocaleString()}</span>}
+          </button>
+        </div>
+        <SetPicker filters={filters} onPick={s => onFilterChange({ ...filters, set: String(s.id), setName: setChipLabel(s) })} />
+      </FacetSection>
+    </>
+  );
+}
+
+export default function FacetFilters({ facets, franchises, filters, onFilterChange, relations }) {
   const set = (key) => (v) => onFilterChange({ ...filters, [key]: v });
   const clear = (key) => (filters[key] ? () => onFilterChange({ ...filters, [key]: '' }) : null);
   const hasFacets = !!facets;
@@ -208,6 +290,8 @@ export default function FacetFilters({ facets, franchises, filters, onFilterChan
             options={sources.map(s => ({ value: s.name, label: sourceLabel(s.name), count: s.count }))} />
         </FacetSection>
       )}
+
+      <RelationFacets relations={relations} filters={filters} onFilterChange={onFilterChange} />
 
       {hasFacets && (
         <FacetSection id="attribution" label="Attribution" defaultOpen={false} active={!!filters.attributed} onClear={clear('attributed')}>

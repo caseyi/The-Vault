@@ -9,6 +9,7 @@ import OrganizeModal from './components/OrganizeModal';
 import Modal, { useUniqueId } from './components/Modal';
 import { NoticeProvider, useNotify } from './components/Notices';
 import { EMPTY_FILTERS } from './filters';
+import { isRelationsSummary, setChipLabel } from './relations';
 import './App.css';
 
 const API = '';
@@ -56,6 +57,7 @@ function VaultApp() {
   const [tags, setTags] = useState([]);
   const [facets, setFacets] = useState(null); // null = older backend without /api/facets
   const [folderTree, setFolderTree] = useState(null);
+  const [relations, setRelations] = useState(null); // null = backend without /api/relations/summary
   const [density, setDensity] = useState(() => {
     try { return localStorage.getItem('vault_density') || 'comfortable'; } catch { return 'comfortable'; }
   });
@@ -139,6 +141,10 @@ function VaultApp() {
       .then(r => (r && r.ok === false ? null : r.json()))
       .then(d => setFacets(d && typeof d === 'object' && !Array.isArray(d) && !d.error ? d : null))
       .catch(() => setFacets(null));
+    fetch(`${API}/api/relations/summary`)
+      .then(r => (r && r.ok === false ? null : r.json()))
+      .then(d => setRelations(isRelationsSummary(d) ? d : null))
+      .catch(() => setRelations(null));
   }, []);
 
   useEffect(() => { fetchStats(); fetchQueueCount(); fetchCollections(); fetchWishlistCount(); fetchSuggestions(); }, [fetchStats, fetchQueueCount, fetchCollections, fetchWishlistCount, fetchSuggestions]);
@@ -196,6 +202,15 @@ function VaultApp() {
     });
   };
   const closeModel = () => { setSelectedModel(null); setView('gallery'); };
+  // From the detail page: show a set / a card's related cards in the gallery
+  const showSet = (set) => {
+    setFilters(f => ({ ...f, set: String(set.id), setName: set.label || setChipLabel(set) }));
+    closeModel();
+  };
+  const showRelated = (card) => {
+    setFilters(f => ({ ...f, relatedTo: String(card.id), relatedToName: card.name || '' }));
+    closeModel();
+  };
   // Logo / "Gallery" click: back to the unfiltered gallery
   const goHome = () => { closeDrawer(); setFilters({ ...EMPTY_FILTERS }); setShowHidden(false); closeModel(); };
   const openQueue = () => { closeDrawer(); setSelectedModel(null); setView('queue'); };
@@ -241,6 +256,7 @@ function VaultApp() {
         onRescanCreator={openScan}
         franchises={stats?.franchises || []}
         facets={facets}
+        relations={relations}
         collections={collections}
         queueCount={queueCount}
         onQueueClick={openQueue}
@@ -276,6 +292,7 @@ function VaultApp() {
             onRefreshCollections={fetchCollections}
             onOpenReview={openReview}
             onSuggestionsChange={fetchSuggestions}
+            relations={relations}
           />
         )}
         {view === 'detail' && selectedModel && (
@@ -288,6 +305,8 @@ function VaultApp() {
             onCollectionsChange={fetchCollections}
             onOpenModel={openModel}
             onSuggestionsChange={fetchSuggestions}
+            onShowSet={showSet}
+            onShowRelated={showRelated}
           />
         )}
         {view === 'queue' && (
