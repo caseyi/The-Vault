@@ -7,6 +7,8 @@ import RenderHintPanel from '../components/RenderHintPanel';
 import Modal from '../components/Modal';
 import AttributionPanel, { hasAttributionData, AiMark } from '../components/AttributionPanel';
 import FolderBreadcrumb from '../components/FolderBreadcrumb';
+import RelatedStrip from '../components/RelatedStrip';
+import { hasRelated } from '../relations';
 import MeshRenderPicker from '../components/MeshRenderPicker';
 import { detailImage, isMeshPreview } from '../thumbs';
 import { decideToasts, splitDecideErrors, isTermLabel } from '../enrich';
@@ -268,7 +270,7 @@ function useNarrow() {
   return narrow;
 }
 
-export default function ModelDetail({ modelId, onBack, onSaved, onQueueChange, collections, onCollectionsChange, onOpenModel, onSuggestionsChange }) {
+export default function ModelDetail({ modelId, onBack, onSaved, onQueueChange, collections, onCollectionsChange, onOpenModel, onSuggestionsChange, onShowSet, onShowRelated }) {
   const notify = useNotify();
   const [confirmUi, askConfirm] = useConfirm();
   const narrow = useNarrow();
@@ -562,7 +564,7 @@ export default function ModelDetail({ modelId, onBack, onSaved, onQueueChange, c
         </div>
       </div>
 
-      {Array.isArray(model.siblings) && model.siblings.length > 0 && (
+      {!hasRelated(model.related) && Array.isArray(model.siblings) && model.siblings.length > 0 && (
         <nav className="detail-siblings" aria-label="Other releases of this character">
           <span className="detail-siblings-label">Other releases</span>
           {model.siblings.map(sib => {
@@ -580,6 +582,10 @@ export default function ModelDetail({ modelId, onBack, onSaved, onQueueChange, c
       )}
 
       <div className="detail-scroll">
+        {hasRelated(model.related) && (
+          <RelatedStrip model={model} onOpenModel={onOpenModel} onChanged={refreshModel}
+            onShowSet={onShowSet} onShowRelated={onShowRelated} onSuggestionsChange={onSuggestionsChange} />
+        )}
         {/* Main layout — expands to 3 cols when assistant is open, 1 col on phones */}
         <div className={`detail-layout ${showAssistant ? 'with-assistant' : ''}`}>
 

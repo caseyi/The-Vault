@@ -755,6 +755,7 @@ const metaLib = require('./lib/meta');
 const folderRolesLib = require('./lib/folder-roles');
 const librariesLib = require('./lib/libraries');
 const picturesLib = require('./lib/pictures');
+const relationsLib = require('./lib/relations');
 
 function layoutMode() {
   return String(process.env.LAYOUT_MODE || 'layout').trim().toLowerCase() === 'legacy' ? 'legacy' : 'layout';
@@ -1506,6 +1507,11 @@ async function scanLibraryLayout(libraryPath, progressCallback, logger, { scope 
     const orphaned = db.prepare('DELETE FROM creators WHERE id NOT IN (SELECT DISTINCT creator_id FROM models WHERE creator_id IS NOT NULL)').run();
     if (orphaned.changes > 0) log('info', `Cleaned up ${orphaned.changes} orphaned creator(s)`);
     supersedeStaleSuggestions(log, roles);
+    // related cards and sets (docs/relations.md §2, §7): after the folds, keyed by work_key
+    let relations = null;
+    if (typeof db.transaction === 'function') {
+      try { relations = relationsLib.autoLink(db, { works: plan.works, scope, fix: meta && meta.fix, log }); } catch (e) { log('warn', `Related cards: ${e.message}`); }
+    }
     if (typeof db.setSetting === 'function') {
       db.setSetting('layout_regroup_done', db.getSetting('layout_regroup_done') || new Date().toISOString());
       if (!scope) {
@@ -1519,6 +1525,7 @@ async function scanLibraryLayout(libraryPath, progressCallback, logger, { scope 
     const scanMs = Date.now() - t0;
     log('info', `Skipped ${modelsSkipped} unchanged card(s)${folded ? `, folded ${folded} earlier model(s)` : ''} — ${Math.round(scanMs / 100) / 10}s (meta ${metaMs} ms)`);
     return { success: true, modelsFound, modelsAdded, modelsUpdated, modelsSkipped, folded, extracted: counters.extracted || 0, pictured: counters.pictured || 0, byKind, metaMs, scanMs, files: tree.fileCount,
+      relationsMs: relations ? relations.ms : null,
       // plain _Meta summary for the server's /api/meta and /api/attribution routes (not sent to clients)
       metaSummary: (() => { try { return metaSummaryLib.summarize(meta); } catch { return null; } })() };
   } catch (err) {

@@ -567,7 +567,8 @@ function folderWorks(root, tree, ctx) {
       const kids = container ? (tree.dirs.get(p)?.dirs || []).map(k => path.join(p, k)) : [p];
       for (const k of kids) {
         const n = tree.dirs.get(k);
-        if (n && n.dirs.length && !n.files.some(f => isPrintableName(f.name))) releases.push(k); // packs only: folders of items
+        // packs only: folders of items (a "myairbridge-Supported.zip" next to them is the whole pack, delivered again)
+        if (n && n.dirs.length && !n.files.some(f => isPrintableName(f.name) && !isPackDownload(f.name))) releases.push(k);
       }
     }
   }
@@ -656,7 +657,11 @@ function folderWorks(root, tree, ctx) {
     let w = works.get(key);
     if (!w) {
       w = { key, kind: m.kind, layout: m.release ? 'release' : (kind === 'tool' ? 'tool' : 'folder'), creator: root.creator, studio: null, name, character: null, group, editions: [], files: [], folders: [], sidecar: null, roots: new Map([[root.path, 0]]) };
-      if (m.release) { w.termHint = m.release.term; w.releaseLabel = m.release.label; }
+      if (m.release) {
+        w.termHint = m.release.term; w.releaseLabel = m.release.label;
+        // the pack this item came from (release sets, docs/relations.md §7.2)
+        w.release = { path: m.release.path, label: m.release.label, term: m.release.term || null, undated: !!m.release.undated };
+      }
       works.set(key, w);
     }
     w.folders.push(m.fullPath);
@@ -675,6 +680,28 @@ function folderWorks(root, tree, ctx) {
     }
     const sc = ctx.sidecarFor(m.fullPath, root.path);
     if (sc && !w.sidecar) w.sidecar = sc;
+  }
+  // A pack-publishing creator's loose downloads next to its packs ("Mice Danger_Unsupported.zip",
+  // "MiceDanger_Supports.zip"): one card per item, not one card named after the creator
+  const rootKey = `${root.creator}|${kind}|${kp}.`;
+  const rw = works.get(rootKey);
+  if (kind === 'model' && releases.length && rw) {
+    const loose = new Map();
+    const rest = [];
+    for (const f of rw.files) {
+      const nm = f.dir === root.path && PRINTABLE_RE.test(f.name) ? releaseItemName(f.name) : '';
+      const k = nm && !naming.isGenericText(nm) ? (naming.normKey(nm, ctx.fix) || slugify(nm)).replace(/\s+/g, ' ') : null;
+      if (!k) { rest.push(f); continue; }
+      if (!loose.has(k)) loose.set(k, { name: nm, files: [] });
+      loose.get(k).files.push(f);
+    }
+    if (loose.size > 1) {
+      works.delete(rootKey);
+      for (const [k, l] of loose) {
+        works.set(`${rootKey}/${k}`, { ...rw, key: `${rootKey}/${k}`, name: l.name, files: l.files, roots: new Map([[root.path, l.files.length]]), loosePack: true });
+      }
+      if (rest.length) works.set(rootKey, { ...rw, files: rest, roots: new Map([[root.path, rest.length]]) });
+    }
   }
   return [...works.values()];
 }
@@ -755,6 +782,11 @@ function deepCreatorRoots(roots, tree, overrides, log) {
     log('info', `"${name}" is marked as a creator: scanned as its own creator`);
   }
   return out;
+}
+
+/** "myairbridge-Supported.zip", "myairbridge-Renders …zip": transfer-service downloads of a whole pack, not items of it. */
+function isPackDownload(name) {
+  return ARCHIVE_RE.test(name) && /^myairbridge[-_\s]/i.test(name);
 }
 
 // ── planning ─────────────────────────────────────────────────────────────────
@@ -1332,5 +1364,5 @@ function realFolder(p) {
 module.exports = {
   walkTree, filesUnder, resolveRoots, planWorks, modelRootWorks, deepCreatorRoots, studioRecords, studioWorks, folderWorks, attributeWork,
   finalizeWorks, realFolder, editDistance, applyAliases, splitReleases, productRelease, releaseLabel, prettyName, inferModelName, releaseVariant, releaseItemName, commonDir, slugify,
-  TRANSPARENT, SKIP_DIR,
+  TRANSPARENT, SKIP_DIR, PRODUCT_FILLER, isPackDownload,
 };

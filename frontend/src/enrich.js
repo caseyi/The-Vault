@@ -10,6 +10,10 @@ export const REVIEW_GROUPS = [
   { id: 'editions', label: 'Editions', filter: { type: 'field', field: 'editions' }, count: s => s?.byField?.editions, optional: true },
   { id: 'tags', label: 'Tags', filter: { type: 'field', field: 'tags' }, count: s => s?.byField?.tags },
   { id: 'roles', label: 'Folder roles', filter: { type: 'role' }, count: s => s?.byType?.role, optional: true },
+  // Related cards and themes (docs/relations.md sections 3 and 7.3); hidden until the server has some
+  { id: 'relations', label: 'Related cards', filter: { type: 'relation' }, count: s => s?.byType?.relation, optional: true },
+  { id: 'themes', label: 'Themes', filter: { type: 'set' }, count: s => s?.byType?.set, optional: true },
+  { id: 'theme-members', label: 'Theme members', filter: { type: 'set-member' }, count: s => s?.byType?.['set-member'], optional: true },
 ];
 
 export const FIELD_LABELS = {

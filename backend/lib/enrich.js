@@ -918,6 +918,7 @@ function estimate(db, opts, { promptCtx, rates, model, ctx } = {}) {
 // ── review list ──────────────────────────────────────────────────────────────
 
 /** Shape a suggestions row for the API (contract shape). */
+const RELATION_TYPES = new Set(['relation', 'set', 'set-member']);
 function shapeSuggestion(db, r, cache = new Map()) {
   const card = (id) => {
     if (id == null) return null;
@@ -928,7 +929,11 @@ function shapeSuggestion(db, r, cache = new Map()) {
     return cache.get(id);
   };
   const out = { id: r.id, type: r.type, field: r.field, model: card(r.model_id) };
-  if (r.type === 'merge') out.target = card(r.target_id);
+  if (RELATION_TYPES.has(r.type)) {
+    // related cards and sets (docs/relations.md §3)
+    out.current = parseJSON(r.current, r.current); out.proposed = parseJSON(r.proposed, r.proposed);
+    require('./relations').shapeSuggestionExtra(db, r, out, card);
+  } else if (r.type === 'merge') out.target = card(r.target_id);
   else { out.current = parseJSON(r.current, r.current); out.proposed = parseJSON(r.proposed, r.proposed); }
   if (r.type === 'role') {
     out.path = r.path || null;
@@ -983,7 +988,7 @@ function listSuggestions(db, f = {}) {
 
 function summary(db) {
   const rows = db.prepare(`SELECT type, field, confidence FROM suggestions WHERE status = 'pending'`).all();
-  const out = { pending: rows.length, byType: { field: 0, merge: 0, rename: 0, role: 0 }, byField: {}, byConfidence: { high: 0, medium: 0, low: 0 } };
+  const out = { pending: rows.length, byType: { field: 0, merge: 0, rename: 0, role: 0, relation: 0, set: 0, 'set-member': 0 }, byField: {}, byConfidence: { high: 0, medium: 0, low: 0 } };
   for (const r of rows) {
     out.byType[r.type] = (out.byType[r.type] || 0) + 1;
     if (r.field) out.byField[r.field] = (out.byField[r.field] || 0) + 1;
@@ -1033,6 +1038,11 @@ function decide(db, ids, decision, { snapshot } = {}) {
     const s = db.prepare('SELECT * FROM suggestions WHERE id = ?').get(id);
     if (!s) { res.errors.push({ id, error: 'not found' }); continue; }
     if (s.status !== 'pending') { res.errors.push({ id, error: `already ${s.status}` }); continue; }
+    if (RELATION_TYPES.has(s.type)) {
+      // a relation / theme proposal: accepting links or activates, rejecting is remembered
+      try { const r = require('./relations').decideSuggestion(db, s, decision); res[r]++; } catch (e) { res.errors.push({ id, error: e.message }); }
+      continue;
+    }
     if (decision === 'reject') {
       db.prepare(`UPDATE suggestions SET status = 'rejected', decided_at = datetime('now') WHERE id = ?`).run(id);
       res.rejected++; continue;
@@ -1215,7 +1225,8 @@ function undoRun(db, runId) {
 
 /** Pending suggestions for one card (model detail). */
 function suggestionsFor(db, modelId) {
-  const rows = db.prepare(`SELECT * FROM suggestions WHERE status = 'pending' AND (model_id = ? OR target_id = ?) ORDER BY confidence DESC, id`).all(modelId, modelId);
+  // relation / set proposals are the detail's relatedPending (lib/relations.js), not repeated here
+  const rows = db.prepare(`SELECT * FROM suggestions WHERE status = 'pending' AND type NOT IN ('relation','set','set-member') AND (model_id = ? OR target_id = ?) ORDER BY confidence DESC, id`).all(modelId, modelId);
   const cache = new Map();
   return rows.map(r => shapeSuggestion(db, r, cache));
 }

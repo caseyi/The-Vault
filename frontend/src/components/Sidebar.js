@@ -43,7 +43,7 @@ function VersionTag({ appVersion, gitSha }) {
   );
 }
 
-export default function Sidebar({ open, onToggle, stats, creators, tags, filters, onFilterChange, onScanClick, onOrganizeClick, onHomeClick, showHidden, onToggleHidden, appVersion, gitSha, isMobile, onRescanCreator, franchises, facets, pendingSuggestions, onReviewClick, collections, queueCount, onQueueClick, onWishlistClick, wishlistCount, onCollectionClick, onCollectionsChange, recentlyViewed, onRecentClick, folderTree, onFolderSelect, density, onToggleDensity, theme, onToggleTheme, onTagsChange, scanRunning, scanCount, scanLast }) {
+export default function Sidebar({ open, onToggle, stats, creators, tags, filters, onFilterChange, onScanClick, onOrganizeClick, onHomeClick, showHidden, onToggleHidden, appVersion, gitSha, isMobile, onRescanCreator, franchises, facets, relations, pendingSuggestions, onReviewClick, collections, queueCount, onQueueClick, onWishlistClick, wishlistCount, onCollectionClick, onCollectionsChange, recentlyViewed, onRecentClick, folderTree, onFolderSelect, density, onToggleDensity, theme, onToggleTheme, onTagsChange, scanRunning, scanCount, scanLast }) {
   const [confirmUi, askConfirm] = useConfirm();
   const notify = useNotify();
   const [showTagManager, setShowTagManager] = useState(false);
@@ -295,7 +295,7 @@ export default function Sidebar({ open, onToggle, stats, creators, tags, filters
             </div>
 
             {/* Library / kind / studio / genre / term / source / attribution */}
-            <FacetFilters facets={facets} franchises={franchises} filters={filters} onFilterChange={onFilterChange} />
+            <FacetFilters facets={facets} franchises={franchises} filters={filters} onFilterChange={onFilterChange} relations={relations} />
 
             {/* Collections */}
             <div className="sidebar-section">

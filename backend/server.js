@@ -33,6 +33,8 @@ const folderRolesLib = require('./lib/folder-roles');
 const { folderRolesRouter } = require('./folder-roles-routes');
 const thumbs = require('./lib/thumbs');
 const pictures = require('./lib/pictures');
+const relationsLib = require('./lib/relations');
+const { relationsRouter, setsRouter } = require('./relations-routes');
 
 const app = wrapAsyncRoutes(express());
 const PORT = process.env.PORT || 3001;
@@ -61,6 +63,9 @@ app.get('/thumbs/*', thumbs.serveThumb);
 app.use('/api/organize', organizeRouter);
 // folder roles (docs/folder-roles.md): marks from _Meta/folder_roles.csv and the app
 app.use('/api/folder-roles', folderRolesRouter({ db, root: LIBRARY_PATH, getLibraries: () => librariesFor() }));
+// related cards and sets (docs/relations.md)
+app.use('/api/relations', relationsRouter({ db, isScanning: () => scanInProgress }));
+app.use('/api/sets', setsRouter({ db }));
 
 // ── Library metadata (_Meta) cache ────────────────────────────────────────────
 // /api/meta/* and /api/attribution/* use a plain summary of _Meta (lib/meta-summary.js).
@@ -359,6 +364,8 @@ function addLayoutFilters(q, where, params) {
   if (q.confidence) { where.push(`COALESCE(m.confidence, 'none') = ?`); params.push(String(q.confidence)); }
   if (q.attributed === 'yes') where.push(`m.confidence IN ('sidecar','exact','name')`);
   else if (q.attributed === 'no') where.push(`(m.confidence IS NULL OR m.confidence IN ('none','path'))`);
+  // related cards and sets: inDiorama, features, hasRelations, hasReleases, hasAccessories, relatedTo, set, inSet, noTheme
+  relationsLib.addFilters(db, q, where, params);
 }
 
 /** List item: existing fields + parsed layout fields; heavy JSON (products) only on the detail route. */
@@ -465,8 +472,11 @@ app.get('/api/models', (req, res) => {
     LIMIT ? OFFSET ?
   `).all(...params, limit, offset);
 
+  // relation badges and set chips: one grouped query per page
+  let badges = new Map();
+  try { badges = relationsLib.relBadges(db, models.map(m => m.id)); } catch { /* relations tables missing */ }
   res.json({
-    models: models.map(shapeModel),
+    models: models.map(m => ({ ...shapeModel(m), rel: badges.get(m.id) || { dioramas: 0, features: 0, releases: 0, accessories: 0, sets: [] } })),
     total,
     page,
     pages: Math.ceil(total / limit)
@@ -503,15 +513,27 @@ app.get('/api/models/:id(\\d+)', (req, res) => {
   if (attribution) { delete attribution.sig; delete attribution.autoFranchise; delete attribution.sourceUrl; delete attribution.foldedInto; }
   const en = parseJSON(model.enrichment, null);
   // other releases of the same creator + character ("Daredevil (2025)" next to "Daredevil (Netflix)")
+  // related cards (docs/relations.md §4); "Other releases" (siblings) are the release-of links
+  let related = null, relatedPending = [], siblings = null;
+  try {
+    const r = relationsLib.relatedFor(db, model);
+    related = r.related; siblings = r.siblings;
+    relatedPending = relationsLib.pendingFor(db, model.id, enrich.shapeSuggestion);
+  } catch { /* relations tables missing */ }
   const relBase = model.work_key && model.work_key.includes('|r:') ? model.work_key.slice(0, model.work_key.indexOf('|r:')) : null;
-  const siblings = relBase ? db.prepare(`SELECT id, name, release_term, release_label, editions FROM models
-      WHERE work_key LIKE ? ESCAPE '\\' AND id != ? AND folded_into IS NULL ORDER BY release_term, name`)
-    .all(`${likeEscape(relBase)}|r:%`, model.id).map(r => ({ ...r, editions: parseJSON(r.editions, []) })) : [];
+  if (!siblings || (!siblings.length && relBase && !db.prepare(`SELECT 1 FROM relations WHERE type = 'release-of' AND (from_id = ? OR to_id = ?) LIMIT 1`).get(model.id, model.id))) {
+    // not linked yet (no scan since the upgrade): the cards sharing the key before "|r:"
+    siblings = relBase ? db.prepare(`SELECT id, name, release_term, release_label, editions FROM models
+        WHERE work_key LIKE ? ESCAPE '\\' AND id != ? AND folded_into IS NULL ORDER BY release_term, name`)
+      .all(`${likeEscape(relBase)}|r:%`, model.id).map(r => ({ ...r, editions: parseJSON(r.editions, []) })) : [];
+  }
   const shaped = shapeModel(model);
   res.json({
     ...shaped,
     thumb_urls: shaped.images.map(i => thumbs.thumbUrl(i, 1280)),
     siblings,
+    related,
+    relatedPending,
     enrichment: en && en.at ? { at: en.at, model: en.model || null, runId: en.runId || null } : null,
     suggestions: enrich.suggestionsFor(db, model.id),
     folderRoles: folderRolesFor(model),

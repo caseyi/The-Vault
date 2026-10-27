@@ -76,6 +76,8 @@ function foldInto(db, sourceId, targetId, { reason = 'merge', alias = null } = {
     db.prepare(`UPDATE models SET hidden = 1, folder_hash = NULL, work_key = NULL, folded_into = ?, attribution = ?, file_count = 0, updated_at = datetime('now') WHERE id = ?`)
       .run(dst.id, JSON.stringify(sAttr), src.id);
   })();
+  // related cards and set memberships move to the receiving card (docs/relations.md §1)
+  try { require('./relations').resolveAll(db); } catch { /* relations tables missing (old schema in a test) */ }
   return { moved };
 }
 
