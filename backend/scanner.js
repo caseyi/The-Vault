@@ -913,7 +913,8 @@ function loadAliases() {
 
 /**
  * Values the scan must not overwrite (docs/ai-enrichment.md §2): fields the user set
- * (attribution.userFields) or accepted from the review list (provenance "ai-reviewed") keep the
+ * (attribution.userFields), accepted from the review list (provenance "ai-reviewed") or set by a
+ * review rule (provenance "review-rule", lib/review-rules.js) keep the
  * row's value; values the AI filled automatically ("ai") stay until the scan finds a value of its
  * own (sidecar, path, manifest…). Mutates `attribution` (provenance, userFields, enrichment trail).
  * @returns {{ character, group_name, editions, franchise? }} franchise undefined → franchiseAndTeam decides
@@ -932,10 +933,10 @@ function keptFields(w, base, prevAttr, attribution) {
   for (const f of ENRICH_FIELDS) {
     const prov = user.has(f) ? 'user' : prev[f];
     const scanProv = (attribution.fields || {})[f];
-    if (prov === 'ai-reviewed' && scanProv === 'sidecar') {
+    if ((prov === 'ai-reviewed' || prov === 'review-rule') && scanProv === 'sidecar') {
       // model.json is authoritative: it beats an accepted AI proposal (never the user's own value)
       if (f === 'franchise') out[f] = w.attr.genre || col[f];
-    } else if (prov === 'user' || prov === 'ai-reviewed') {
+    } else if (prov === 'user' || prov === 'ai-reviewed' || prov === 'review-rule') {
       out[f] = col[f]; fields[f] = prov;
     } else if (prov === 'ai') {
       const scanVal = f === 'franchise' ? (w.attr.genre || null) : scan[f];
@@ -1511,6 +1512,8 @@ async function scanLibraryLayout(libraryPath, progressCallback, logger, { scope 
     let relations = null;
     if (typeof db.transaction === 'function') {
       try { relations = relationsLib.autoLink(db, { works: plan.works, scope, fix: meta && meta.fix, log }); } catch (e) { log('warn', `Related cards: ${e.message}`); }
+      // review rules (lib/review-rules.js): set rules reach new cards, pending proposals follow the rules
+      try { const rr = require('./lib/review-rules').applyRules(db); if (rr.cardsSet) log('info', `Review rules set ${rr.cardsSet} card value(s)`); } catch (e) { log('warn', `Review rules: ${e.message}`); }
     }
     if (typeof db.setSetting === 'function') {
       db.setSetting('layout_regroup_done', db.getSetting('layout_regroup_done') || new Date().toISOString());

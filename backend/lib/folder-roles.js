@@ -250,6 +250,22 @@ function libRel(abs, libs = []) {
 }
 
 /**
+ * Is `abs` a library folder (or the library mount itself)? A library holds many creators, so the
+ * roles that would make it one creator or one card (creator, model, category) are refused there.
+ */
+const LIBRARY_ROLES_REFUSED = new Set(['creator', 'model', 'category']);
+function isLibraryFolder(abs, root, libs = []) {
+  const p = path.resolve(String(abs || ''));
+  if (root && p === path.resolve(root)) return true;
+  return libs.some(l => l && l.path && path.resolve(l.path) === p);
+}
+/** Why a role cannot go on this folder, or null. */
+function refusedRole(abs, role, root, libs = []) {
+  if (!LIBRARY_ROLES_REFUSED.has(role) || !isLibraryFolder(abs, root, libs)) return null;
+  return `A library folder holds many creators: it cannot be marked ${ROLE_LABEL[role]}. Mark the folders inside it instead.`;
+}
+
+/**
  * Every effective mark of a library root: its _Meta files (root and each library) over the DB.
  * @returns {{ merged: Map, files: object[] }}
  */
@@ -261,5 +277,5 @@ function effectiveRoles(db, root, libs = []) {
 module.exports = {
   effectiveRoles, CATEGORY_NAME,
   ROLES, ROLE_LABEL, FILE_NAME, normalizeRole, parseTags, cleanValue, resolveRel, readRolesFile, loadFileRoles, loadAppRoles,
-  mergeRoles, roleMaps, categoryValues, categoryFor, summaryLine, metaDirsFor, libRel,
+  mergeRoles, roleMaps, categoryValues, categoryFor, summaryLine, metaDirsFor, libRel, isLibraryFolder, refusedRole, LIBRARY_ROLES_REFUSED,
 };

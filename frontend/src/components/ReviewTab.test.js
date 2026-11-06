@@ -94,15 +94,16 @@ describe('Review tab', () => {
     expect(await screen.findByText('1 rejected')).toBeInTheDocument();
   });
 
-  test('filters: creator and confidence band go to the API', async () => {
+  test('filters: creator and the minimum-confidence slider go to the API', async () => {
     setup();
     renderTab();
     fireEvent.click(await screen.findByRole('tab', { name: /Genres/ }));
     await screen.findByRole('listitem', { name: 'Genre: Angela' });
-    fireEvent.change(screen.getByLabelText('Filter suggestions by confidence'), { target: { value: 'high' } });
+    fireEvent.change(screen.getByLabelText('Minimum confidence'), { target: { value: '0.8' } });
     await waitFor(() => expect(screen.queryByRole('listitem', { name: 'Genre: Angela' })).not.toBeInTheDocument());
     const q = new URLSearchParams(listUrls().slice(-1)[0].split('?')[1]);
-    expect(q.get('band')).toBe('high');
+    expect(q.get('minConfidence')).toBe('0.8');
+    expect(screen.getByText('80%+')).toBeInTheDocument();
     expect(q.get('field')).toBe('franchise');
     fireEvent.change(screen.getByLabelText('Filter suggestions by creator'), { target: { value: 'ZEZ' } });
     await waitFor(() => expect(new URLSearchParams(listUrls().slice(-1)[0].split('?')[1]).get('creator')).toBe('ZEZ'));
@@ -133,14 +134,15 @@ describe('Review tab', () => {
     expect(await screen.findByText('2 accepted')).toBeInTheDocument();
   });
 
-  test('"Accept all high-confidence" confirms with counts and uses decide-filter', async () => {
+  test('"Accept all" uses the slider floor, confirms with counts and uses decide-filter', async () => {
     setup();
     renderTab();
     fireEvent.click(await screen.findByRole('tab', { name: /Genres/ }));
     await screen.findByRole('listitem', { name: 'Genre: Ciri' });
-    fireEvent.click(screen.getByRole('button', { name: /Accept all high-confidence in Genres/ }));
-    const dlg = await screen.findByRole('dialog', { name: 'Accept 2 high-confidence genres?' });
-    expect(dlg).toHaveTextContent('1 lower-confidence suggestion stays in the list.');
+    fireEvent.change(screen.getByLabelText('Minimum confidence'), { target: { value: '0.8' } });
+    fireEvent.click(await screen.findByRole('button', { name: '✓ Accept all 80%+ in Genres' }));
+    const dlg = await screen.findByRole('dialog', { name: 'Accept 2 genres at 80%+?' });
+    expect(dlg).toHaveTextContent('Lower-confidence suggestions stay in the list.');
     fireEvent.click(within(dlg).getByRole('button', { name: 'Accept 2' }));
     await waitFor(() => expect(decideBodies[0]).toEqual(expect.objectContaining({
       url: '/api/suggestions/decide-filter', decision: 'accept',
@@ -153,7 +155,7 @@ describe('Review tab', () => {
     renderTab();
     fireEvent.click(await screen.findByRole('tab', { name: /Genres/ }));
     const first = await screen.findByRole('listitem', { name: 'Genre: Alan Scott' });
-    expect(screen.getByText(/move/).closest('.review-help')).toHaveTextContent('Keys: j/k move · a accept · r reject · x select');
+    expect(screen.getByText(/move/).closest('.review-help')).toHaveTextContent('Keys: j/k move · a accept · r reject · e edit · x select');
     first.focus();
     fireEvent.keyDown(first, { key: 'j' });
     const second = screen.getByRole('listitem', { name: 'Genre: Ciri' });

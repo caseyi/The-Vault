@@ -124,11 +124,17 @@ function resolveRoots(base, tree, { overrides = new Map(), containers = DEFAULT_
     if (ov === 'ignore') { log('info', `Skipping "${name}" (manual override: ignore)`); continue; }
     const lower = name.trim().toLowerCase();
     const alias = naming.canonicalCreator(name);
+    // a library folder holds many creators: a creator / model / category mark on it would turn the
+    // whole library into one creator or one card, so it is ignored (folder-roles.md §1)
+    if (libraryFolders && libraryFolders.has(p)) {
+      if (ov && ov !== 'passthrough') log('warn', `Ignoring the "${ov}" mark on library folder "${name}": a library is never a creator or a card`);
+      out.push(...resolveRoots(p, tree, { overrides, containers, log, depth: 0, libraryFolders }));
+      continue;
+    }
     if (ov === 'creator') { out.push({ type: alias && naming.STUDIO_CREATORS.has(alias) ? 'studio' : 'regular', name, creator: alias || name, path: p }); continue; }
     // folder role "model" (docs/folder-roles.md §1): the whole folder is one card, creator Unsorted
     if (ov === 'model') { out.push({ type: 'model', name, creator: LOOSE_CREATOR, path: p }); continue; }
     const sub = { overrides, containers, log, depth: depth + 1 };
-    if (libraryFolders && libraryFolders.has(p) && ov !== 'creator') { out.push(...resolveRoots(p, tree, { ...sub, depth: 0, libraryFolders })); continue; }
     // a category at the creator level is not a creator and its sub-folders are not creators: one
     // folder root of creator Unsorted (cards below it as usual, its loose files one card each)
     if (ov === 'category') { out.push({ type: 'regular', name, creator: LOOSE_CREATOR, path: p, category: true }); continue; }

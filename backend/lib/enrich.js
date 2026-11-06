@@ -27,6 +27,7 @@ const worksLib = require('./works');
 const { foldInto } = require('./fold');
 const fs = require('fs');
 const folderRoles = require('./folder-roles');
+const reviewRules = require('./review-rules');
 const { VARIANT_DIR, isExtVariantName } = require('./discovery');
 
 const PROMPT_VERSION = 'enrich-v1';
@@ -36,9 +37,9 @@ const EDITIONS = ['Sculpture', 'Bust', 'Accessory', 'Diorama'];
 const TEXT_FIELDS = ['character', 'franchise', 'group_name', 'editions', 'name', 'tags'];
 const COLUMNS = { character: 'character', franchise: 'franchise', group_name: 'group_name', editions: 'editions', name: 'name', tags: 'tags' };
 /** Provenances never overwritten automatically (§2): model.json, the genre folder, the creator's manifest, organizer rules, Drive. */
-const PROTECTED = new Set(['sidecar', 'path', 'manifest', 'rules', 'drive', 'role', 'user', 'ai-reviewed']);
+const PROTECTED = new Set(['sidecar', 'path', 'manifest', 'rules', 'drive', 'role', 'user', 'ai-reviewed', 'review-rule']);
 /** …and these are not even proposed again: explicit metadata, or a value the user set or accepted. */
-const NO_SUGGEST = new Set(['sidecar', 'user', 'ai-reviewed']);
+const NO_SUGGEST = new Set(['sidecar', 'user', 'ai-reviewed', 'review-rule']);
 // Approximations, on the safe side: JSON is token-dense (quotes, braces, ids)
 const CHARS_PER_TOKEN = 3.0;        // input evidence (compact JSON with names)
 const OUT_CHARS_PER_TOKEN = 2.7;    // model output JSON
@@ -375,7 +376,9 @@ function promptContext(db, metaSummary = {}) {
     if (groups[r.franchise].length < 15) groups[r.franchise].push(r.group_name);
   }
   const fixes = Object.entries((metaSummary.rules || {}).fix || {}).slice(0, 40).map(([a, b]) => `${a}→${b}`);
-  return { genres: [...genres], groups, fixes };
+  // Casey's rules from the Review tab (lib/review-rules.js): house style the model should follow
+  const hints = reviewRules.promptLines(reviewRules.loadRules(db));
+  return { genres: [...genres], groups, fixes, hints };
 }
 
 function systemPrompt(pc, { tagsOnly = false } = {}) {
@@ -409,7 +412,7 @@ ${groupLines || '- (none yet)'}
 - release / siblings: the creator released this character more than once; each release is its own card ("Daredevil (2025)", "Daredevil (Netflix)"). Never merge releases, never rename the "(…)" part away, and keep the character the same across siblings.
 - folderRole: only when the card has "folder" evidence and that folder is not one thing: a grouping of different models (Heroes, Terrain, Misc, a franchise) is "category"; one model whose parts were split into many tiny cards is "model". Leave it out when folder.role is already right.
 - needs_vision: true when only the render could tell what this is.
-- Known typo fixes: ${(pc.fixes || []).join(', ') || 'none'}.${tagsOnly ? '\nThis run only uses "tags"; other fields may be left out.' : ''}`;
+- Known typo fixes: ${(pc.fixes || []).join(', ') || 'none'}.${(pc.hints || []).length ? `\nThe owner's rules (always follow them):\n${pc.hints.join('\n')}` : ''}${tagsOnly ? '\nThis run only uses "tags"; other fields may be left out.' : ''}`;
 }
 
 function userPrompt(evs) {
@@ -616,7 +619,9 @@ function planActions(card, ans, ctx) {
     let dir = worksLib.realFolder(card.folder_path);
     for (let i = 0; i < (ans.folderRole.up || 0); i++) dir = path.dirname(dir);
     const current = ctx.roleOf ? ctx.roleOf(dir) || null : null;
-    if (current !== ans.folderRole.role && !ctx.rejected('role', 'folder_role', ans.folderRole.role, null, dir)) {
+    // never a creator / model / category mark on a library folder (it would swallow the library)
+    if (!folderRoles.refusedRole(dir, ans.folderRole.role, process.env.LIBRARY_PATH || '/library', librariesNow())
+      && current !== ans.folderRole.role && !ctx.rejected('role', 'folder_role', ans.folderRole.role, null, dir)) {
       suggest.push({ type: 'role', field: 'folder_role', current, proposed: ans.folderRole.role, path: dir, confidence: ans.folderRole.c, reason: why, source });
     }
   }
@@ -737,8 +742,10 @@ async function runEnrich(o) {
   const mode = o.tagsOnly ? 'tags' : 'full';
   const counts = { done: 0, total: cards.length, applied: 0, suggested: 0, merges: 0, errors: 0, visionUsed: 0, inTokens: 0, outTokens: 0, cancelled: false, fatal: null };
   const visionQueue = [];
+  const rules = o.rules || reviewRules.loadRules(db);
 
   const finishCard = (card, ans, sources = {}) => {
+    reviewRules.transformAnswer(rules, card, ans); // blocked values dropped, mapped ones rewritten
     const rejected = rejectedLookup(db, card.id);
     const roleOf = (o.ctxOpts && o.ctxOpts.roleOf) || o.roleOf || null;
     const plan = planActions(card, ans, { ...th, isKnownGenre, rejected, rejectedTags: rejected.tags, tagsOnly: o.tagsOnly, source: 'text', roleOf });
@@ -923,8 +930,9 @@ function shapeSuggestion(db, r, cache = new Map()) {
   const card = (id) => {
     if (id == null) return null;
     if (!cache.has(id)) {
-      const m = db.prepare(`SELECT m.id, m.name, m.thumbnail_path, COALESCE(m.kind, 'model') AS kind, m.folded_into, c.name AS creator_name FROM models m LEFT JOIN creators c ON c.id = m.creator_id WHERE m.id = ?`).get(id);
-      cache.set(id, m ? { id: m.id, name: m.name, creator_name: m.creator_name, thumbnail_path: m.thumbnail_path, kind: m.kind } : null);
+      const m = db.prepare(`SELECT m.id, m.name, m.thumbnail_path, COALESCE(m.kind, 'model') AS kind, m.folded_into, m.folder_path, c.name AS creator_name FROM models m LEFT JOIN creators c ON c.id = m.creator_id WHERE m.id = ?`).get(id);
+      // folder: the card's real folder, the scope a "cards in this folder" rule starts from
+      cache.set(id, m ? { id: m.id, name: m.name, creator_name: m.creator_name, thumbnail_path: m.thumbnail_path, kind: m.kind, folder: m.folder_path ? worksLib.realFolder(m.folder_path) : null } : null);
     }
     return cache.get(id);
   };
@@ -972,6 +980,10 @@ function suggestionWhere(f = {}) {
   else if (f.band === 'medium') where.push('s.confidence >= 0.65 AND s.confidence < 0.8');
   else if (f.band === 'low') where.push('s.confidence < 0.65');
   if (f.modelId) { where.push('s.model_id = ?'); params.push(Number(f.modelId)); }
+  // one answer group (GET /api/suggestions/groups `key`): the stored JSON of the proposed value
+  if (f.proposed != null && f.proposed !== '') { where.push('s.proposed = ?'); params.push(String(f.proposed)); }
+  // one tag of a tags proposal (tag groups)
+  if (f.tag) { where.push(`EXISTS (SELECT 1 FROM json_each(CASE WHEN json_valid(s.proposed) THEN s.proposed ELSE '[]' END) j WHERE LOWER(j.value) = LOWER(?))`); params.push(String(f.tag)); }
   return { sql: where.join(' AND '), params };
 }
 const SUGG_FROM = 'FROM suggestions s JOIN models m ON m.id = s.model_id LEFT JOIN creators c ON c.id = m.creator_id';
@@ -987,14 +999,82 @@ function listSuggestions(db, f = {}) {
 }
 
 function summary(db) {
-  const rows = db.prepare(`SELECT type, field, confidence FROM suggestions WHERE status = 'pending'`).all();
+  // joined like the list: a proposal whose card is gone is not counted (it could never be shown)
+  const rows = db.prepare(`SELECT s.type, s.field, s.confidence ${SUGG_FROM} WHERE s.status = 'pending'`).all();
   const out = { pending: rows.length, byType: { field: 0, merge: 0, rename: 0, role: 0, relation: 0, set: 0, 'set-member': 0 }, byField: {}, byConfidence: { high: 0, medium: 0, low: 0 } };
   for (const r of rows) {
     out.byType[r.type] = (out.byType[r.type] || 0) + 1;
     if (r.field) out.byField[r.field] = (out.byField[r.field] || 0) + 1;
     out.byConfidence[r.confidence >= 0.8 ? 'high' : r.confidence >= 0.65 ? 'medium' : 'low']++;
   }
+  out.maxConfidence = rows.reduce((m, r) => Math.max(m, Number(r.confidence) || 0), 0);
+  out.rules = reviewRules.loadRules(db).length;
   return out;
+}
+
+/**
+ * Pending field / rename proposals grouped by their answer ("Genre → Wildcard · 423 cards"), so a
+ * few decisions clear most of the list. Tags are grouped per tag. Filters as listSuggestions
+ * (type, field, creator, minConfidence, maxConfidence, band).
+ * @returns {{ total, suggestions, page, pages, items: { key, tag?, proposed, count, fromEmpty, minConfidence, maxConfidence, creators, samples }[] }}
+ */
+function groupSuggestions(db, f = {}) {
+  const type = f.type === 'rename' ? 'rename' : 'field';
+  const field = type === 'rename' ? 'name' : String(f.field || '');
+  if (!field) throw Object.assign(new Error('field required'), { status: 400 });
+  const page = Math.max(1, parseInt(f.page, 10) || 1);
+  const limit = Math.min(200, Math.max(1, parseInt(f.limit, 10) || 40));
+  const { sql, params } = suggestionWhere({ ...f, type, field, status: 'pending', proposed: null, tag: null });
+  const isTags = field === 'tags';
+  const emptyCur = `(s.current IS NULL OR s.current IN ('null', '""', '[]'))`;
+  const from = isTags ? `${SUGG_FROM}, json_each(CASE WHEN json_valid(s.proposed) THEN s.proposed ELSE '[]' END) j` : SUGG_FROM;
+  const keyExpr = isTags ? 'LOWER(j.value)' : 's.proposed';
+  const suggestions = db.prepare(`SELECT COUNT(*) n ${SUGG_FROM} WHERE ${sql}`).get(...params).n;
+  const total = db.prepare(`SELECT COUNT(DISTINCT ${keyExpr}) n ${from} WHERE ${sql}`).get(...params).n;
+  const rows = db.prepare(`SELECT ${keyExpr} AS k, COUNT(*) n, SUM(CASE WHEN ${emptyCur} THEN 1 ELSE 0 END) fe, MIN(s.confidence) lo, MAX(s.confidence) hi
+    ${from} WHERE ${sql} GROUP BY ${keyExpr} ORDER BY n DESC, hi DESC, k LIMIT ? OFFSET ?`).all(...params, limit, (page - 1) * limit);
+  const items = rows.map(r => {
+    const g = isTags ? { tag: r.k } : { proposed: r.k };
+    const w = suggestionWhere({ ...f, type, field, status: 'pending', ...g });
+    const samples = db.prepare(`SELECT s.id, s.current, s.confidence, m.id AS mid, m.name, m.thumbnail_path, c.name AS creator_name ${SUGG_FROM} WHERE ${w.sql}
+      ORDER BY s.confidence DESC, m.name LIMIT 8`).all(...w.params)
+      .map(x => ({ id: x.mid, suggestionId: x.id, name: x.name, thumbnail_path: x.thumbnail_path, creator_name: x.creator_name, current: parseJSON(x.current, x.current), confidence: x.confidence }));
+    const creators = db.prepare(`SELECT c.name, COUNT(*) n ${SUGG_FROM} WHERE ${w.sql} GROUP BY c.name ORDER BY n DESC LIMIT 3`).all(...w.params).map(x => ({ name: x.name, count: x.n }));
+    return {
+      key: r.k, ...(isTags ? { tag: r.k } : {}), proposed: isTags ? r.k : parseJSON(r.k, r.k), count: r.n, fromEmpty: r.fe || 0,
+      minConfidence: r.lo, maxConfidence: r.hi, creators, samples,
+    };
+  });
+  return { type, field, total, suggestions, page, pages: Math.max(1, Math.ceil(total / limit)), items };
+}
+
+/** Values already on cards for a field, most used first (autocomplete for edits and rules). */
+function knownValues(db, field, limit = 300) {
+  const col = { character: 'character', franchise: 'franchise', group_name: 'group_name', name: 'name' }[field];
+  const vis = `folded_into IS NULL AND COALESCE(hidden, 0) = 0`;
+  if (field === 'tags') {
+    return db.prepare(`SELECT LOWER(j.value) v, COUNT(*) n FROM models, json_each(CASE WHEN json_valid(tags) THEN tags ELSE '[]' END) j WHERE ${vis} GROUP BY LOWER(j.value) ORDER BY n DESC, v LIMIT ?`).all(limit).map(r => r.v);
+  }
+  if (field === 'editions') return [...EDITIONS];
+  if (!col) return [];
+  const out = db.prepare(`SELECT ${col} v, COUNT(*) n FROM models WHERE ${col} IS NOT NULL AND ${col} != '' AND ${vis} GROUP BY ${col} ORDER BY n DESC, v LIMIT ?`).all(limit).map(r => r.v);
+  if (field === 'franchise') for (const g of naming.GENRES) if (!out.includes(g)) out.push(g);
+  return out;
+}
+
+/** A value typed by Casey for a field, cleaned like an AI answer; undefined when invalid. */
+function cleanValue(field, v) {
+  if (field === 'tags') {
+    const arr = (Array.isArray(v) ? v : String(v || '').split(','))
+      .map(x => (typeof x === 'string' ? x.trim().toLowerCase().replace(/\s+/g, ' ') : '')).filter(x => x && x.length <= 40 && !FORMULA_START.test(x) && !/[<>]/.test(x));
+    return arr.length ? [...new Set(arr)].slice(0, TAG_CAP) : undefined;
+  }
+  if (field === 'editions') {
+    const arr = (Array.isArray(v) ? v : [v]).map(x => EDITIONS.find(e => e.toLowerCase() === String(x).trim().toLowerCase()));
+    return arr.length && arr.every(Boolean) ? EDITIONS.filter(e => arr.includes(e)) : undefined;
+  }
+  const c = cleanStr(typeof v === 'string' ? v : v == null ? '' : String(v), field === 'name' ? 100 : 80);
+  return c == null ? undefined : c;
 }
 
 /** Aliases for a merge: the source's work_key now resolves to the target's. */
@@ -1018,8 +1098,9 @@ function storeAlias(db, src, dst, source = 'merge') {
  * a rename sets the name and locks it; a merge folds the card into the target (lib/fold.js) and
  * stores an alias so the next scan keeps them together.
  */
-function decide(db, ids, decision, { snapshot } = {}) {
+function decide(db, ids, decision, { snapshot, value: edited } = {}) {
   const res = { accepted: 0, rejected: 0, merged: 0, superseded: 0, errors: [] };
+  if (edited !== undefined) res.edited = 0;
   if (!['accept', 'reject'].includes(decision)) throw new Error('decision must be "accept" or "reject"');
   // merges fold cards: a snapshot first (lib/backup), or no merge at all
   let mergesAllowed = true;
@@ -1052,6 +1133,7 @@ function decide(db, ids, decision, { snapshot } = {}) {
         // accepting writes the app mark; the next scan applies it (a _Meta file mark still wins)
         const role = folderRoles.normalizeRole(parseJSON(s.proposed, s.proposed));
         if (!role || !s.path) throw new Error('not a folder role proposal');
+        if (folderRoles.refusedRole(s.path, role, process.env.LIBRARY_PATH || '/library', librariesNow())) { supersede(id, 'a library folder is never a creator or a card'); continue; }
         let isDir = false;
         try { isDir = fs.statSync(s.path).isDirectory(); } catch { isDir = false; }
         if (!isDir) { supersede(id, 'the folder no longer exists'); continue; }
@@ -1088,6 +1170,13 @@ function decide(db, ids, decision, { snapshot } = {}) {
       }
       const f = s.field;
       let value = parseJSON(s.proposed, s.proposed);
+      // accepted with a value Casey typed instead: it is the user's own value from now on
+      let newProv = 'ai-reviewed';
+      if (edited !== undefined) {
+        const v = cleanValue(f, edited);
+        if (v === undefined) throw new Error(`"${Array.isArray(edited) ? edited.join(', ') : edited}" is not a valid ${f}`);
+        if (!sameValue(v, value)) { value = v; newProv = 'user'; res.edited++; }
+      }
       // the card may have changed since the proposal: a model.json / user / reviewed value wins,
       // and a proposal made against another value is stale
       const { value: now, prov } = fieldState(row, f);
@@ -1100,7 +1189,8 @@ function decide(db, ids, decision, { snapshot } = {}) {
         const set = new Set([...have, ...fieldAttr(row).removedTags].map(norm));
         value = [...have, ...value.filter(t => !set.has(norm(t)))].slice(0, Math.max(TAG_CAP, have.length));
       }
-      const attr = setAttrField(parseJSON(row.attribution, {}), f, 'ai-reviewed');
+      const attr = setAttrField(parseJSON(row.attribution, {}), f, newProv);
+      if (newProv === 'user' && f !== 'tags') attr.userFields = [...new Set([...(Array.isArray(attr.userFields) ? attr.userFields : []), f])];
       db.transaction(() => {
         if (s.type === 'rename') db.prepare(`UPDATE models SET name = ?, name_locked = 1, attribution = ?, updated_at = datetime('now') WHERE id = ?`).run(value, JSON.stringify(attr), row.id);
         else db.prepare(`UPDATE models SET ${COLUMNS[f]} = ?, attribution = ?, updated_at = datetime('now') WHERE id = ?`).run(toColumn(f, value), JSON.stringify(attr), row.id);
@@ -1112,10 +1202,56 @@ function decide(db, ids, decision, { snapshot } = {}) {
   return res;
 }
 
-function decideFilter(db, filter = {}, decision, opts) {
+function decideFilter(db, filter = {}, decision, opts = {}) {
+  if (filter.tag) return decideTag(db, filter, decision, opts);
   const { sql, params } = suggestionWhere({ ...filter, status: 'pending' });
   const ids = db.prepare(`SELECT s.id ${SUGG_FROM} WHERE ${sql} ORDER BY s.id`).all(...params).map(r => r.id);
   return decide(db, ids, decision, opts);
+}
+
+/**
+ * Decide one tag across pending tags proposals (a tag group). Each proposal is split: the decided
+ * tag becomes its own accepted / rejected row (rejected tags are never proposed again for that
+ * card), the rest of the proposal stays pending. `opts.value` accepts a different tag instead.
+ */
+function decideTag(db, filter, decision, { value: edited } = {}) {
+  if (!['accept', 'reject'].includes(decision)) throw new Error('decision must be "accept" or "reject"');
+  const tag = String(filter.tag || '');
+  const { sql, params } = suggestionWhere({ ...filter, type: 'field', field: 'tags', status: 'pending', tag });
+  const rows = db.prepare(`SELECT s.* ${SUGG_FROM} WHERE ${sql} ORDER BY s.id`).all(...params);
+  const res = { accepted: 0, rejected: 0, merged: 0, superseded: 0, errors: [] };
+  let use = null;
+  if (decision === 'accept' && edited !== undefined) {
+    const v = cleanValue('tags', Array.isArray(edited) ? edited : [edited]);
+    if (!v) throw Object.assign(new Error(`"${edited}" is not a valid tag`), { status: 400 });
+    use = v[0];
+    res.edited = norm(use) === norm(tag) ? 0 : rows.length;
+  }
+  const ins = db.prepare(`INSERT INTO suggestions (model_id, type, field, current, proposed, confidence, reason, source, run_id, status, decided_at)
+    VALUES (?, 'field', 'tags', ?, ?, ?, ?, ?, ?, ?, datetime('now'))`);
+  db.transaction(() => {
+    for (const s of rows) {
+      const prop = parseJSON(s.proposed, []);
+      const hit = (Array.isArray(prop) ? prop : []).find(t => norm(t) === norm(tag));
+      if (hit == null) continue;
+      const rest = prop.filter(t => t !== hit);
+      if (decision === 'accept') {
+        const row = db.prepare('SELECT * FROM models WHERE id = ?').get(s.model_id);
+        if (!row || row.folded_into != null) { res.errors.push({ id: s.id, error: 'card not found' }); continue; }
+        const have = parseJSON(row.tags, []);
+        const t = use || hit;
+        if (!have.some(x => norm(x) === norm(t)) && have.length < TAG_CAP) {
+          const attr = setAttrField(parseJSON(row.attribution, {}), 'tags', use && norm(use) !== norm(hit) ? 'user' : 'ai-reviewed');
+          db.prepare(`UPDATE models SET tags = ?, attribution = ?, updated_at = datetime('now') WHERE id = ?`).run(JSON.stringify([...have, t]), JSON.stringify(attr), row.id);
+        }
+        res.accepted++;
+      } else res.rejected++;
+      ins.run(s.model_id, s.current, JSON.stringify([hit]), s.confidence, s.reason, s.source, s.run_id, decision === 'accept' ? 'accepted' : 'rejected');
+      if (rest.length) db.prepare('UPDATE suggestions SET proposed = ? WHERE id = ?').run(JSON.stringify(rest), s.id);
+      else db.prepare(`UPDATE suggestions SET status = 'superseded', decided_at = datetime('now') WHERE id = ?`).run(s.id);
+    }
+  })();
+  return res;
 }
 
 /**
@@ -1236,6 +1372,6 @@ module.exports = {
   releaseOf, scopeWhere, selectCards, nearDuplicates, buildEvidence, evidenceSig, fileStems, pathSegments,
   promptContext, systemPrompt, userPrompt, validateResponse, extractJSON,
   fieldState, planActions, wantsVision, combineAnswers, applyAuto, addSuggestion, rejectedLookup, isKnownGenreFn,
-  runEnrich, estimate, usdFor, listSuggestions, summary, decide, decideFilter, unmerge, salvageObjects, fieldAttr, storeAlias, createRun, finishRun, listRuns, undoRun,
+  runEnrich, estimate, usdFor, listSuggestions, summary, groupSuggestions, decide, decideFilter, decideTag, cleanValue, knownValues, unmerge, salvageObjects, fieldAttr, storeAlias, createRun, finishRun, listRuns, undoRun,
   suggestionsFor, shapeSuggestion,
 };

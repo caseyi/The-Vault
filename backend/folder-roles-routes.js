@@ -28,6 +28,8 @@ function folderRolesRouter({ db, root, getLibraries }) {
     return {
       path: e.path, library: lr.library, rel: lr.rel, role: e.role, genre: e.genre || null, group: e.group || null,
       tags: e.tags || [], note: e.note || '', source: e.source, conflict: e.conflict || null,
+      // a mark the scan does not apply (creator / model / category on a library folder)
+      ignored: folderRoles.refusedRole(e.path, e.role, root, libs) ? 'library-folder' : null,
     };
   };
 
@@ -56,6 +58,8 @@ function folderRolesRouter({ db, root, getLibraries }) {
     }
     let p;
     try { p = confinePath(String(b.path)); } catch (e) { if (sendPathError(res, e)) return; throw e; }
+    const refused = folderRoles.refusedRole(p, role, root, libs);
+    if (refused) return res.status(400).json({ error: refused });
     const isCat = role === 'category';
     const genre = isCat ? folderRoles.cleanValue(b.genre) : null;
     const group = isCat ? folderRoles.cleanValue(b.group) : null;

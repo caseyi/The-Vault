@@ -507,6 +507,24 @@ const MIGRATIONS = [
     db.exec(`CREATE INDEX IF NOT EXISTS idx_suggestions_path ON suggestions(path)`);
     db.exec(`CREATE INDEX IF NOT EXISTS idx_suggestions_set ON suggestions(set_id)`);
   },
+  // 10: review rules (docs/ai-enrichment.md §11): Casey's nudges from the Review tab (block a value,
+  //     map one value to another, set a field for a creator or folder). lib/review-rules.js.
+  () => {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS review_rules (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        kind TEXT NOT NULL CHECK(kind IN ('block','map','set')),
+        field TEXT NOT NULL,
+        match TEXT,
+        value TEXT,
+        creator TEXT,
+        path TEXT,
+        note TEXT,
+        applied INTEGER DEFAULT 0,
+        created_at TEXT DEFAULT (datetime('now'))
+      )
+    `);
+  },
 ];
 
 db.getSetting = (key) => {
