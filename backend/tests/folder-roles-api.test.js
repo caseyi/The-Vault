@@ -139,17 +139,6 @@ describe('API and scan', () => {
     expect(db.prepare('SELECT * FROM folder_overrides WHERE path = ?').get(ARCH)).toBeUndefined();
   });
 
-  test('the old /api/organize/folder-overrides routes read and write the same rows', async () => {
-    const p = path.join(ARCH, 'Minis');
-    let r = await request(app).post('/api/organize/folder-overrides').send({ path: p, role: 'category', group: 'Minis', tags: ['mini'] });
-    expect(r.body.ok).toBe(true);
-    r = await request(app).get('/api/organize/folder-overrides');
-    expect(r.body.find(x => x.path === p)).toMatchObject({ role: 'category', group: 'Minis', tags: ['mini'] });
-    r = await request(app).post('/api/organize/folder-overrides').send({ path: p, role: 'nope' });
-    expect(r.status).toBe(400);
-    await request(app).post('/api/organize/folder-overrides').send({ path: p, role: null });
-  });
-
   test('fs-tree nodes carry role, source, conflict and category values', async () => {
     const r = await request(app).get('/api/organize/fs-tree').query({ path: path.join(ARCH, 'Misc'), depth: 1 });
     const t = r.body.children.find(c => c.name === 'Terrain');

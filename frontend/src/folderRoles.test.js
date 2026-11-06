@@ -26,12 +26,4 @@ describe('folderRoles helpers', () => {
     ]);
   });
 
-  test('older backend without /api/folder-roles falls back to folder-overrides', async () => {
-    global.fetch = jest.fn((url) => Promise.resolve(String(url) === '/api/folder-roles'
-      ? { ok: false, status: 404, headers: { get: () => 'text/html' }, text: () => Promise.resolve('Cannot POST'), json: () => Promise.reject(new Error('x')) }
-      : { ok: true, status: 200, headers: { get: () => 'application/json' }, json: () => Promise.resolve({ ok: true }) }));
-    const r = await saveFolderRole({ path: '/p', role: 'ignore' });
-    expect(r).toEqual({ ok: true, rescan: true });
-    expect(postsTo(global.fetch, '/api/organize/folder-overrides')).toEqual([{ path: '/p', role: 'ignore' }]);
-  });
 });

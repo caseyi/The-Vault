@@ -217,7 +217,6 @@ try { db.exec(`ALTER TABLE tablename ADD COLUMN col_name TYPE DEFAULT val`); } c
 |---|---|---|
 | POST | `/api/ai/assist` | Proxy to Claude API. Body: `{ modelId, action?, userMessage?, history[] }`. Requires `x-claude-key` header. |
 | POST | `/api/ai/search` | Web search via Claude with `web_search` tool. Body: `{ modelId?, query? }`. Returns `{ text, results[], citations[] }`. Requires `x-claude-key` header. |
-| GET | `/api/ai/generate-tags` | **SSE** - Batch AI tagging. Query: `key` (API key). Batches models in groups of 50, streams per-batch progress with token usage, example tags, hit rate. Auto-retries rate limits, stops on auth errors. |
 | GET | `/api/ai/find-images` | **SSE** - AI image finder. Query: `key`, `trial` (default `1`). Scores models by matchability, skips poor candidates (<20 pts), processes trial batch of 10 first. Streams per-model progress with confidence indicators. |
 | POST | `/api/ai/test-key` | Quick API key validation. Requires `x-claude-key` header. Returns `{ ok, model, usage, message }`. |
 
@@ -445,8 +444,7 @@ Supported archive formats: `.zip` (via adm-zip), `.rar` (via node-unrar-js, pure
 
 - Every streaming (SSE) route is listed in the regex location (`scan/stream`,
   `models/:id/scrape-stream`, `models/:id/scrape`, `creators/:id/reextract`,
-  `ai/generate-tags`, `ai/find-images`, `ai/vision-tags`,
-  `organize/auto-annotate`) with `proxy_buffering off`, `Connection ''`,
+  `ai/find-images`, `ai/enrich`, `thumbs/fill`) with `proxy_buffering off`, `Connection ''`,
   HTTP/1.1 and a 1-hour read timeout. The backend also sends
   `X-Accel-Buffering: no` and a `:` heartbeat every 15 s, so streams survive
   extra reverse proxies (e.g. Synology's).

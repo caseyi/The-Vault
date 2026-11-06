@@ -1525,120 +1525,12 @@ app.get('/api/ai/models', (req, res) => {
   });
 });
 
-// Rough cost preview before running a tagging job
-app.get('/api/ai/tag-estimate', (req, res) => {
-  const model = resolveTagModel(req.query.model);
-  const vision = req.query.vision === '1';
-  const rates = TAG_MODELS[model] || { inRate: 1, outRate: 5 };
-  const n = vision
-    ? db.prepare("SELECT COUNT(*) AS n FROM models WHERE thumbnail_path IS NOT NULL AND (hidden IS NULL OR hidden = 0)").get().n
-    : db.prepare("SELECT COUNT(*) AS n FROM models WHERE (hidden IS NULL OR hidden = 0)").get().n;
-  // Heuristic per-model token usage (vision adds ~1.5k tokens for the image)
-  const perIn = vision ? 1700 : 90;
-  const perOut = 45;
-  const estIn = n * perIn;
-  const estOut = n * perOut;
-  const estCost = (estIn / 1e6) * rates.inRate + (estOut / 1e6) * rates.outRate;
-  res.json({
-    model, vision, models: n,
-    estInputTokens: estIn, estOutputTokens: estOut,
-    estCostUsd: Math.round(estCost * 100) / 100,
-  });
-});
-
-// ── AI Vision Tagging (SSE) — uses the extracted render image ────────────────
-
+// Image types a render can be sent to the AI as (Enrich's vision fallback)
 const VISION_MEDIA = { '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.webp': 'image/webp', '.gif': 'image/gif' };
-
-app.get('/api/ai/vision-tags', guardSpend, async (req, res) => {
-  const apiKey = req.query.key || req.headers['x-claude-key'] || process.env.CLAUDE_API_KEY || '';
-  if (!apiKey) { res.status(401).json({ error: 'API key required' }); return; }
-  const model = resolveTagModel(req.query.model);
-  const trial = req.query.trial !== '0';
-  const TRIAL_LIMIT = 10;
-
-  const release = acquireOr409(res, 'vision-tags');
-  if (!release) return;
-  const sse = openSSE(req, res);
-  sse.onAbort(release);
-  const send = (data) => sse.send(data);
-  const log = (level, msg) => send({ level, msg, ts: new Date().toISOString() });
-  const finish = (data) => { release(); sse.end({ type: 'done', ...data }); };
-  try {
-
-  const all = db.prepare(`
-    SELECT m.id, m.name, m.tags, m.thumbnail_path, m.folder_path, c.name AS creator_name
-    FROM models m LEFT JOIN creators c ON c.id = m.creator_id
-    WHERE m.thumbnail_path IS NOT NULL AND (m.hidden IS NULL OR m.hidden = 0)
-    ORDER BY c.name, m.name
-  `).all();
-
-  if (all.length === 0) { log('info', 'No models with images to analyse.'); return finish({ success: true, tagged: 0, total: 0 }); }
-
-  const batch = trial ? all.slice(0, TRIAL_LIMIT) : all;
-  const remaining = trial ? all.length - batch.length : 0;
-  log('info', `Vision tagging ${batch.length} model(s) with ${model}${trial && remaining > 0 ? ` (trial — ${remaining} more after)` : ''}`);
-
-  const systemPrompt = `You are a 3D-print cataloguing assistant. You are shown a render/photo of a 3D model plus its file metadata. Identify what it is and return up to 7 short lowercase tags describing franchise, character, type (bust/miniature/terrain/prop/vehicle), and theme. You may prefix a tag with a facet when useful: "type:", "franchise:", "scale:", "tech:". Always include the creator name as a tag. Respond with ONLY JSON: {"tags":["..."],"name":"a cleaner display name or null"}`;
-
-  let tagged = 0, errors = 0;
-  for (let i = 0; i < batch.length; i++) {
-    if (sse.aborted) { log('warn', 'Client disconnected — stopping'); return release(); }
-    const m = batch[i];
-    // Only ever read images from IMAGES_DIR (thumbnail_path is user-editable)
-    const file = imageUrlToFile(m.thumbnail_path || '');
-    const ext = file ? path.extname(file).toLowerCase() : '';
-    const media = VISION_MEDIA[ext];
-    const label = `[${i + 1}/${batch.length}] ${m.creator_name || '?'} / ${m.name}`;
-
-    if (!file || !media || !fs.existsSync(file)) { log('warn', `${label} — image missing/unsupported, skipping`); continue; }
-    let b64;
-    try {
-      const buf = fs.readFileSync(file);
-      if (buf.length > 4_500_000) { log('warn', `${label} — image too large, skipping`); continue; }
-      b64 = buf.toString('base64');
-    } catch { log('warn', `${label} — could not read image`); continue; }
-
-    const meta = `File metadata:\n- name: ${m.name}\n- creator: ${m.creator_name || 'unknown'}\n- folder: ${realFolder(m.folder_path).replace(/^\/library\/?/, '')}`;
-    try {
-      const parsed = await callClaudeAPI(apiKey, {
-        model, max_tokens: 400, system: systemPrompt,
-        messages: [{ role: 'user', content: [
-          { type: 'image', source: { type: 'base64', media_type: media, data: b64 } },
-          { type: 'text', text: `${meta}\n\nTag this model.` },
-        ] }],
-      }, { timeoutMs: 60000, signal: sse.signal });
-
-      const text = (parsed.content || []).filter(b => b.type === 'text').map(b => b.text).join('\n');
-      const jsonMatch = text.match(/\{[\s\S]*\}/);
-      if (!jsonMatch) { log('error', `${label} — no JSON in response`); errors++; continue; }
-      const result = JSON.parse(jsonMatch[0]);
-      const newTags = Array.isArray(result.tags) ? result.tags.map(t => String(t).toLowerCase().trim()).filter(Boolean) : [];
-      if (!newTags.length) { log('warn', `${label} — no tags returned`); continue; }
-
-      const existing = (() => { try { return JSON.parse(m.tags || '[]'); } catch { return []; } })();
-      const merged = [...new Set([...existing, ...newTags])].slice(0, 7);
-      db.prepare("UPDATE models SET tags = ?, updated_at = datetime('now') WHERE id = ?").run(JSON.stringify(merged), m.id);
-      tagged++;
-      log('tag', `  ${m.name}: [${newTags.join(', ')}]`);
-    } catch (e) {
-      errors++;
-      log('error', `${label} — ${e.message}`);
-      if (e.message.includes('Invalid API key') || e.message.includes('lacks permission')) {
-        return finish({ success: false, error: e.message, tagged, total: batch.length });
-      }
-      if (e.message.includes('Rate limited')) { log('warn', 'Waiting 30s…'); await sse.sleep(30000); i--; continue; }
-    }
-  }
-
-  log(errors ? 'warn' : 'success', `Vision tagging done — ${tagged} tagged, ${errors} error(s)`);
-  finish({ success: true, tagged, total: batch.length, remaining, errors });
-  } finally { release(); }
-});
 
 // ── AI enrichment (docs/ai-enrichment.md) ────────────────────────────────────
 // Fills character/genre/group/editions/tags, proposes renames and merges, keeps a review list
-// and an undo log. /api/ai/generate-tags is an alias that runs it with tags only (old clients).
+// and an undo log.
 
 function enrichParams(q) {
   const scope = ['all', 'unattributed', 'creator', 'ids'].includes(q.scope) ? q.scope : (q.ids ? 'ids' : (q.creator ? 'creator' : 'all'));
@@ -1673,14 +1565,14 @@ app.get('/api/ai/enrich/estimate', async (req, res) => {
   res.json(out);
 });
 
-/** One enrichment run streamed over SSE. tagsOnly: the generate-tags alias. */
-async function streamEnrich(req, res, { tagsOnly = false, jobName = 'enrich' } = {}) {
+/** One enrichment run streamed over SSE. */
+async function streamEnrich(req, res) {
   const fake = enrich.fakeEnabled();
   const apiKey = req.query.key || req.headers['x-claude-key'] || process.env.CLAUDE_API_KEY || (fake ? 'fake' : '');
   if (!apiKey) { res.status(401).json({ error: 'API key required' }); return; }
   const model = resolveTagModel(req.query.model);
-  const params = tagsOnly ? { scope: 'all', tagsOnly: true } : enrichParams(req.query);
-  const release = acquireOr409(res, jobName);
+  const params = enrichParams(req.query);
+  const release = acquireOr409(res, 'enrich');
   if (!release) return;
   const sse = openSSE(req, res);
   sse.onAbort(release);
@@ -1692,16 +1584,16 @@ async function streamEnrich(req, res, { tagsOnly = false, jobName = 'enrich' } =
     try { const r = reviewRules.applyRules(db); if (r.cardsSet || r.rejected || r.rewritten) log('info', `Review rules: ${r.cardsSet} card value(s) set, ${r.rejected} pending proposal(s) blocked, ${r.rewritten} rewritten`); } catch (e) { log('warn', `Review rules: ${e.message}`); }
     const { promptCtx, evCtx } = await enrichContext();
     const sel = enrich.selectCards(db, params, evCtx);
-    runId = enrich.createRun(db, { model: fake ? `${model} (fake)` : model, scope: tagsOnly ? 'tags' : params.scope, params: { ...params, tagsOnly } });
+    runId = enrich.createRun(db, { model: fake ? `${model} (fake)` : model, scope: params.scope, params });
     log('info', `Enrich run #${runId}: ${sel.cards.length} card(s) to process, ${sel.skipped} unchanged since the last run`);
     if (!sel.cards.length) {
       enrich.finishRun(db, runId, { total: 0, unchanged: sel.skipped }, 'complete');
       release();
-      sse.end({ type: 'done', success: true, runId, applied: 0, suggested: 0, merges: 0, unchanged: sel.skipped, errors: 0, visionUsed: 0, actualInTokens: 0, actualOutTokens: 0, actualUsd: 0, tagged: 0, total: 0 });
+      sse.end({ type: 'done', success: true, runId, applied: 0, suggested: 0, merges: 0, unchanged: sel.skipped, errors: 0, visionUsed: 0, actualInTokens: 0, actualOutTokens: 0, actualUsd: 0, total: 0 });
       return;
     }
     const counts = await enrich.runEnrich({
-      db, cards: sel.cards, runId, model, apiKey, promptCtx, ctxOpts: evCtx, vision: params.vision, tagsOnly,
+      db, cards: sel.cards, runId, model, apiKey, promptCtx, ctxOpts: evCtx, vision: params.vision,
       client: enrich.getClient(log), log, progress: (p) => sse.send(p), aborted: () => sse.aborted, sleep: (ms) => sse.sleep(ms),
       signal: sse.signal, loadImage: loadRender,
     });
@@ -1718,8 +1610,7 @@ async function streamEnrich(req, res, { tagsOnly = false, jobName = 'enrich' } =
       type: 'done', success: ok, runId, applied: counts.applied, suggested: counts.suggested, merges: counts.merges,
       unchanged: sel.skipped, errors: counts.errors, visionUsed: counts.visionUsed,
       actualInTokens: counts.inTokens, actualOutTokens: counts.outTokens, actualUsd, ...(counts.stopped ? { stopped: counts.stopped } : {}),
-      // generate-tags clients read these
-      tagged: counts.applied, total: sel.cards.length, ...(counts.fatal || counts.stopped ? { error: counts.fatal || counts.stopped } : {}),
+      total: sel.cards.length, ...(counts.fatal || counts.stopped ? { error: counts.fatal || counts.stopped } : {}),
     });
   } catch (e) {
     if (runId) enrich.finishRun(db, runId, {}, 'error');
@@ -1730,8 +1621,6 @@ async function streamEnrich(req, res, { tagsOnly = false, jobName = 'enrich' } =
 }
 
 app.get('/api/ai/enrich', guardSpend, (req, res) => streamEnrich(req, res));
-// Old clients: "Generate tags" is Enrich with tags only (additive, never removes a tag, cap 12)
-app.get('/api/ai/generate-tags', guardSpend, (req, res) => streamEnrich(req, res, { tagsOnly: true, jobName: 'generate-tags' }));
 
 app.get('/api/ai/enrich/runs', (req, res) => res.json({ runs: enrich.listRuns(db, clampInt(req.query.limit, 50, 1, 500)) }));
 app.post('/api/ai/enrich/runs/:id(\\d+)/undo', (req, res) => {
@@ -1848,17 +1737,23 @@ app.get('/api/ai/find-images', guardSpend, async (req, res) => {
   const done = (data) => { release(); sse.end({ type: 'done', ...data }); };
   try {
 
-  // Get models without thumbnails
+  // A fallback (Casey, Nov 2026): only cards the thumbnail pipeline already tried and could not
+  // fill from renders in their zips or folder (thumb_attempt set, still no picture). Cards it has
+  // not looked at yet are left to it, since it costs nothing.
   const allModels = db.prepare(`
     SELECT m.id, m.uuid, m.name, m.folder_path, m.source_url, m.images, c.name as creator_name
     FROM models m LEFT JOIN creators c ON m.creator_id = c.id
-    WHERE m.thumbnail_path IS NULL AND (m.hidden IS NULL OR m.hidden = 0)
+    WHERE (m.thumbnail_path IS NULL OR m.thumbnail_path = '') AND (m.hidden IS NULL OR m.hidden = 0)
+      AND m.thumb_attempt IS NOT NULL AND m.thumb_attempt != ''
     ORDER BY c.name, m.name
   `).all();
+  const untried = db.prepare(`SELECT COUNT(*) n FROM models WHERE (thumbnail_path IS NULL OR thumbnail_path = '') AND (hidden IS NULL OR hidden = 0)
+    AND (thumb_attempt IS NULL OR thumb_attempt = '')`).get().n;
+  if (untried) log('info', `${untried} card(s) without a picture have not been through "Find missing pictures" yet (free, from renders in their files); they are skipped here`);
 
   if (allModels.length === 0) {
-    log('info', 'All models already have thumbnails!');
-    return done({ success: true, found: 0, scraped: 0, total: 0 });
+    log('info', untried ? 'Nothing for the web search yet: run "Find missing pictures" first.' : 'All models already have thumbnails!');
+    return done({ success: true, found: 0, scraped: 0, total: 0, untried });
   }
 
   // Score and sort by matchability — best candidates first

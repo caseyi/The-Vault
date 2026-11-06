@@ -170,24 +170,6 @@ describe('B3 rescans preserve user data', () => {
     expect(byPath('StudioB/Marvel/Avengers/Iron Man').franchise).toBe('MCU');
     expect(byPath('StudioA/Knight').name).toBe('Knight');
   });
-
-  test('AI annotate RENAME (by preview id) locks the name', async () => {
-    const knight = byPath('StudioA/Knight');
-    const prev = await request(app).post('/api/organize/annotate/preview').send({ directives: ['RENAME: Knight -> Sir Knight'] });
-    expect(prev.body.changes[0].id).toBe(knight.id);
-    const res = await request(app).post('/api/organize/annotate/apply').send({ changes: prev.body.changes });
-    expect(res.body.applied).toBe(1);
-    const k = byPath('StudioA/Knight');
-    expect(k.name).toBe('Sir Knight');
-    expect(k.name_locked).toBe(1);
-  });
-
-  test('annotate never guesses between ambiguous partial matches', async () => {
-    const prev = await request(app).post('/api/organize/annotate/preview').send({ directives: ['FRANCHISE: Model0 -> Foo'] });
-    expect(prev.body.changes[0].found).toBe(false); // Model01..05 all match "Model0"
-    const res = await request(app).post('/api/organize/annotate/apply').send({ directives: ['FRANCHISE: Model0 -> Foo'] });
-    expect(res.body.applied).toBe(0);
-  });
 });
 
 // ── B5: per-creator rescan processes every model in a chunk ───────────────────
@@ -251,13 +233,11 @@ describe('path confinement', () => {
     expect((await request(app).get('/api/organize/loose-files').query({ path: path.join(LIB, 'StudioA') })).status).toBe(200);
   });
 
-  test('classify-folders, group-files, folder-overrides and POST /api/scan are confined', async () => {
-    let res = await request(app).post('/api/organize/classify-folders').set('x-claude-key', 'sk-ant-test').send({ path: '/etc' });
-    expect(res.status).toBe(403);
-    res = await request(app).post('/api/organize/group-files').send({ path: OUTSIDE, groups: [{ name: 'g', files: ['secret.txt'] }], dryRun: false });
+  test('group-files, folder-roles and POST /api/scan are confined', async () => {
+    let res = await request(app).post('/api/organize/group-files').send({ path: OUTSIDE, groups: [{ name: 'g', files: ['secret.txt'] }], dryRun: false });
     expect(res.status).toBe(403);
     expect(fs.existsSync(path.join(OUTSIDE, 'secret.txt'))).toBe(true);
-    res = await request(app).post('/api/organize/folder-overrides').send({ path: '/etc', role: 'ignore' });
+    res = await request(app).post('/api/folder-roles').send({ path: '/etc', role: 'ignore' });
     expect(res.status).toBe(403);
     res = await request(app).post('/api/scan').send({ path: '/etc' });
     expect(res.status).toBe(403);
@@ -359,63 +339,6 @@ describe('B7 generated script', () => {
   });
 });
 
-// ── B6: apply-franchise ───────────────────────────────────────────────────────
-
-describe('B6 apply-franchise', () => {
-  let model;
-  beforeAll(async () => {
-    mk('StudioF/Model X/m.stl');
-    mk('StudioF/Model X/sub/n.stl');
-    mk('StudioF/Model Y/y.stl');
-    mk('StudioF/Blocked/Model Y/already.txt', 'x');
-    const creatorId = db.prepare('INSERT INTO creators (name, folder_path) VALUES (?, ?)').run('StudioF', path.join(LIB, 'StudioF')).lastInsertRowid;
-    await scanSingleCreator(path.join(LIB, 'StudioF'), creatorId, 'StudioF');
-    model = byPath('StudioF/Model X');
-    db.prepare(`UPDATE models SET franchise = '../../../outside' WHERE id = ?`).run(model.id);
-    db.prepare(`UPDATE models SET franchise = 'Blocked' WHERE id = ?`).run(byPath('StudioF/Model Y').id);
-  });
-
-  test('franchise is sanitised to one path segment; existing destinations are refused', async () => {
-    const iron = byPath('StudioB/Marvel/Avengers/Iron Man');
-    db.prepare(`UPDATE models SET franchise = 'Marvel' WHERE id = ?`).run(iron.id);
-    const res = await request(app).post('/api/organize/apply-franchise').send({ dryRun: true });
-    db.prepare(`UPDATE models SET franchise = ? WHERE id = ?`).run(iron.franchise, iron.id);
-    expect(res.body.moves.find(m => m.id === iron.id)).toBeUndefined();
-    const mv = res.body.moves.find(m => m.id === model.id);
-    expect(mv.to).toBe(path.join(LIB, 'StudioF', 'outside', 'Model X'));
-    expect(res.body.errors.some(e => /already exists/.test(e.error))).toBe(true);
-  });
-
-  test('read-only library → clear 409 before anything moves', async () => {
-    const spy = jest.spyOn(fs, 'accessSync').mockImplementation(() => { const e = new Error('read-only'); e.code = 'EROFS'; throw e; });
-    const res = await request(app).post('/api/organize/apply-franchise').send({ dryRun: false });
-    spy.mockRestore();
-    expect(res.status).toBe(409);
-    expect(res.body.readOnly).toBe(true);
-    expect(fs.existsSync(path.join(LIB, 'StudioF/Model X'))).toBe(true);
-  });
-
-  test('moves the folder and rewrites folder_path + model_files in one go', async () => {
-    const onlyThis = db.prepare(`UPDATE models SET franchise = NULL WHERE franchise IS NOT NULL AND id != ?`);
-    const saved = db.prepare('SELECT id, franchise FROM models WHERE franchise IS NOT NULL').all();
-    onlyThis.run(model.id);
-    try {
-      const res = await request(app).post('/api/organize/apply-franchise').send({ dryRun: false });
-      expect(res.status).toBe(200);
-      expect(res.body.summary.executed).toBe(1);
-      const newDir = path.join(LIB, 'StudioF', 'outside', 'Model X');
-      expect(fs.existsSync(path.join(newDir, 'sub', 'n.stl'))).toBe(true);
-      expect(db.prepare('SELECT folder_path FROM models WHERE id = ?').get(model.id).folder_path).toBe(newDir);
-      const files = db.prepare('SELECT filepath FROM model_files WHERE model_id = ?').all(model.id).map(f => f.filepath);
-      expect(files.every(f => f.startsWith(newDir + path.sep))).toBe(true);
-      expect(fs.existsSync(path.join(ROOT, 'outside', 'Model X'))).toBe(false);
-    } finally {
-      const restore = db.prepare('UPDATE models SET franchise = ? WHERE id = ?');
-      for (const r of saved) restore.run(r.franchise, r.id);
-    }
-  });
-});
-
 // ── B15: LIKE escaping, limit clamping, scan log ring buffer, cancel ─────────
 
 describe('B15 query hygiene', () => {
@@ -489,7 +412,7 @@ describe('B15 scan status ring buffer + cancel (worker thread)', () => {
 // ── Health (U13) ──────────────────────────────────────────────────────────────
 
 describe('organize health', () => {
-  test('variant-only names are not cross-creator dupes; copies are near-dupes', async () => {
+  test('variant-only names are not cross-creator dupes', async () => {
     const ins = db.prepare(`INSERT INTO models (uuid, name, creator_id, folder_path) VALUES (?, ?, ?, ?)`);
     const c1 = db.prepare(`SELECT id FROM creators WHERE name = 'StudioA'`).get().id;
     const c2 = db.prepare(`SELECT id FROM creators WHERE name = 'StudioB'`).get().id;
@@ -503,7 +426,6 @@ describe('organize health', () => {
     expect(res.status).toBe(200);
     expect(res.body.crossCreatorDupes.map(d => d.key)).not.toEqual(expect.arrayContaining(['supported']));
     expect(res.body.crossCreatorDupes.map(d => d.key)).not.toEqual(expect.arrayContaining(['resin']));
-    expect(res.body.duplicates.some(d => [d.a.name, d.b.name].sort().join('|') === 'StudioA - Samurai Oni 2024-04|StudioA - Samurai Oni 2024-04 (copy)')).toBe(true);
     db.prepare(`DELETE FROM models WHERE uuid IN ('h1','h2','h3','h4','h5','h6')`).run();
   });
 });
@@ -538,7 +460,7 @@ describe('contract', () => {
   test('only one AI batch job at a time (409)', async () => {
     const release = acquireAiJob('test-job');
     try {
-      const res = await request(app).get('/api/ai/generate-tags').query({ key: 'sk-ant-x' });
+      const res = await request(app).get('/api/ai/enrich').query({ key: 'sk-ant-x' });
       expect(res.status).toBe(409);
       expect(res.body.running.name).toBe('test-job');
     } finally { release(); }

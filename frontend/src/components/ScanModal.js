@@ -519,9 +519,9 @@ export default function ScanModal({ onClose, onScanComplete, filters, onOpenRevi
             onClick={() => findImages(true)}
             disabled={running || busyAi || !apiKey}
             className="btn-primary btn-ai btn-ai-blue"
-            title={apiKey ? 'Uses Claude API credits — finds missing thumbnails online (trial: 10 best candidates first)' : 'Add a Claude API key above to enable'}
+            title={apiKey ? 'Fallback, uses Claude API credits: searches the web for cards that "Find missing pictures" could not fill from their own files (trial: 10 best candidates first)' : 'Add a Claude API key above to enable'}
           >
-            {findingImages ? 'Finding…' : '$ Find Images (trial 10)'}
+            {findingImages ? 'Searching…' : '$ Web search for pictures (trial 10)'}
           </button>
           {imgResult && imgResult.remaining > 0 && (
             <button

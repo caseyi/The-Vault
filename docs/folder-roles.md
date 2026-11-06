@@ -145,7 +145,7 @@ Never auto-applied. Accepting writes the app mark; rejecting is remembered like 
 The fake model (`tests/fixtures/enrich-fake.js`) proposes roles for a few rebuilt-library cards
 (e.g. "STL Archive"-style mixes, "Heroes", "Terrain").
 
-The existing `POST /api/organize/classify-folders` (AI on the raw tree) learns the new roles too.
+(Nov 2026) The separate AI button (`POST /api/organize/classify-folders`) was removed: Enrich proposes roles into Review and the Suspect Folders list covers the rest.
 
 ## 6. API
 
@@ -155,7 +155,7 @@ The existing `POST /api/organize/classify-folders` (AI on the raw tree) learns t
 - `GET /api/organizer/export/folder_roles.csv` → app marks in the file format, with a leading
   `library` column (`library,path,role,genre,group,tags,note`), for the organizer to merge into each
   library's `_Meta/folder_roles.csv`. Listed in `GET /api/organizer/export`.
-- Old `GET/POST /api/organize/folder-overrides` keep working (they read/write the same DB rows; GET adds the new fields).
+- (Nov 2026) The old `GET/POST /api/organize/folder-overrides` routes were removed; use `/api/folder-roles`.
 - `GET /api/organize/fs-tree` nodes add `source`, `conflict`, `genre`, `group`, `tags`; accepts
   `path` + `depth` for lazy loading below depth 3.
 - Model detail adds `folderRoles: [{ path, rel, name, role, source }]` for each folder from the

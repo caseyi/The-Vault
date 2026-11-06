@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect, useCallback } from 'react';
+import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import FolderRoles from './FolderRoles';
 import Modal, { useUniqueId } from './Modal';
 import { useConfirm } from './ConfirmDialog';
@@ -10,14 +10,11 @@ const AttributionHealth = React.lazy(() => import('./AttributionHealth'));
 const ReviewTab = React.lazy(() => import('./ReviewTab'));
 const OrganizerExport = React.lazy(() => import('./OrganizerExport'));
 const SuspectFolders = React.lazy(() => import('./SuspectFolders'));
+const EnrichPanel = React.lazy(() => import('./EnrichPanel'));
 
 const READ_ONLY_TIP = 'Library is mounted read-only';
 
 // ── shared helpers ────────────────────────────────────────────────────────────
-
-function getApiKey() {
-  try { return localStorage.getItem('claude_api_key') || ''; } catch { return ''; }
-}
 
 function TabBar({ tabs, active, onChange, label }) {
   return (
@@ -34,424 +31,6 @@ function TabBar({ tabs, active, onChange, label }) {
           {t.badge > 0 && <span className="org-tab-badge" aria-label={`${t.badge} pending`}>{t.badge > 999 ? '999+' : t.badge}</span>}
         </button>
       ))}
-    </div>
-  );
-}
-
-// ── Annotate tab ──────────────────────────────────────────────────────────────
-
-const ANNOTATE_STORAGE_KEY = 'vault_annotate_session';
-
-const EXPORT_PREAMBLE = `You are helping organize a 3D printing STL file library called "The Vault".
-
-Analyze the library snapshot below and generate directives to improve organization.
-
-DIRECTIVE FORMAT (one per line, no extra text):
-  FRANCHISE: "Model Name" → franchise_name
-  TAG: "Model Name" → tag1, tag2, tag3
-  RENAME: "Old Name" → "New Name"
-  MERGE: "Duplicate Model" → "Keep This One"
-
-GUIDELINES:
-- Assign FRANCHISE for named characters/universes (Marvel, DC, Star Wars, Warhammer, TMNT, etc.)
-- Use lowercase TAG values: bust, full-figure, terrain, scenic, presupported, fdm, resin, etc.
-- RENAME only when the name is ambiguous, truncated, or poorly formatted
-- MERGE only when two entries appear to be the exact same model
-- Emit only directive lines — no commentary, no headers, no explanations
-
-After Claude replies, copy the directive lines and paste them into The Vault's Annotate tab.
-
---- LIBRARY SNAPSHOT ---
-`;
-
-function AnnotateTab({ target, onClearTarget }) {
-  const [creator, setCreator] = useState('');
-  const [pathFilter, setPathFilter] = useState('');
-  const [creators, setCreators] = useState([]);
-  const [running, setRunning] = useState(false);
-  const [statusMsg, setStatusMsg] = useState('');
-  const [directives, setDirectives] = useState([]);
-  const [selected, setSelected] = useState(new Set());
-  const [preview, setPreview] = useState(null);
-  const [applying, setApplying] = useState(false);
-  const [applyResult, setApplyResult] = useState(null);
-  const [error, setError] = useState('');
-  const [savedAt, setSavedAt] = useState(null);
-  const [exporting, setExporting] = useState(false);
-  const esRef = useRef(null);
-  const logRef = useRef(null);
-
-  // Restore saved session from localStorage on mount
-  useEffect(() => {
-    try {
-      const raw = localStorage.getItem(ANNOTATE_STORAGE_KEY);
-      if (raw) {
-        const { directives: saved, creator: savedCreator, savedAt: ts } = JSON.parse(raw);
-        if (saved?.length) {
-          setDirectives(saved);
-          setSelected(new Set(saved.map((_, i) => i)));
-          if (savedCreator) setCreator(savedCreator);
-          setSavedAt(ts);
-        }
-      }
-    } catch {}
-  }, []);
-
-  // Persist directives to localStorage whenever they change
-  useEffect(() => {
-    if (directives.length === 0) return;
-    try {
-      const ts = new Date().toISOString();
-      localStorage.setItem(ANNOTATE_STORAGE_KEY, JSON.stringify({ directives, creator, savedAt: ts }));
-      setSavedAt(ts);
-    } catch {}
-  }, [directives]); // eslint-disable-line
-
-  useEffect(() => {
-    fetch('/api/creators').then(r => r.json()).then(setCreators).catch(() => {});
-  }, []);
-
-  // Auto-scroll directive list
-  useEffect(() => {
-    if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
-  }, [directives.length]);
-
-  const clearSession = () => {
-    try { localStorage.removeItem(ANNOTATE_STORAGE_KEY); } catch {}
-    setDirectives([]);
-    setSelected(new Set());
-    setPreview(null);
-    setApplyResult(null);
-    setStatusMsg('');
-    setSavedAt(null);
-    setError('');
-  };
-
-  const run = useCallback(async () => {
-    const apiKey = getApiKey();
-    if (!apiKey) { setError('No Claude API key — set it in Settings first'); return; }
-
-    setError('');
-    setDirectives([]);
-    setSelected(new Set());
-    setPreview(null);
-    setApplyResult(null);
-    setSavedAt(null);
-    setRunning(true);
-    setStatusMsg('Connecting to Claude…');
-    try { localStorage.removeItem(ANNOTATE_STORAGE_KEY); } catch {}
-
-    if (esRef.current) esRef.current.close();
-
-    try {
-      const res = await fetch('/api/organize/auto-annotate', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'x-claude-key': apiKey },
-        body: JSON.stringify({
-        creator: creator || undefined,
-        pathFilter: pathFilter || undefined,
-        modelIds: target?.modelIds?.length ? target.modelIds : undefined,
-      }),
-      });
-
-      if (!res.ok) { setError(`Error ${res.status}: ${await res.text()}`); setRunning(false); setStatusMsg(''); return; }
-
-      setStatusMsg('Streaming directives from Claude…');
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      let buf = '';
-      let count = 0;
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buf += decoder.decode(value, { stream: true });
-        const lines = buf.split('\n');
-        buf = lines.pop();
-        for (const line of lines) {
-          if (!line.startsWith('data: ')) continue;
-          try {
-            const ev = JSON.parse(line.slice(6));
-            if (ev.type === 'directive' && ev.text) {
-              count++;
-              setDirectives(d => [...d, ev.text]);
-              setStatusMsg(`Received ${count} directive${count !== 1 ? 's' : ''}…`);
-            } else if (ev.type === 'done') {
-              setStatusMsg(`✓ Done — ${count} directive${count !== 1 ? 's' : ''} generated`);
-              setRunning(false);
-              // Auto-select all
-              setSelected(new Set(Array.from({ length: count }, (_, i) => i)));
-            } else if (ev.type === 'error') {
-              setError(ev.message);
-              setStatusMsg('');
-              setRunning(false);
-            }
-          } catch {}
-        }
-      }
-    } catch (e) {
-      setError(e.message);
-      setStatusMsg('');
-    }
-    setRunning(false);
-  }, [creator, pathFilter, target]);
-
-  const exportForClaude = useCallback(async () => {
-    setExporting(true);
-    setError('');
-    try {
-      const qp = new URLSearchParams();
-      if (creator) qp.set('creator', creator);
-      if (pathFilter) qp.set('pathFilter', pathFilter);
-      const qs = qp.toString() ? `?${qp}` : '';
-      const res = await fetch(`/api/organize/snapshot${qs}`);
-      if (!res.ok) throw new Error(`Snapshot error ${res.status}`);
-      const snapshot = await res.text();
-      const fullText = EXPORT_PREAMBLE + snapshot + '\n--- END SNAPSHOT ---\n';
-      const blob = new Blob([fullText], { type: 'text/plain' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      const suffix = (creator || pathFilter) ? '-' + (creator || pathFilter).replace(/\s+/g, '_').replace(/[^a-zA-Z0-9_-]/g, '') : '';
-      a.download = `vault-annotate-prompt${suffix}.txt`;
-      a.click();
-      URL.revokeObjectURL(url);
-    } catch (e) {
-      setError(`Export failed: ${e.message}`);
-    }
-    setExporting(false);
-  }, [creator, pathFilter]);
-
-  const pasteDirectives = useCallback((text) => {
-    const lines = text.split('\n')
-      .map(l => l.trim())
-      .filter(l => /^(FRANCHISE|TAG|RENAME|MERGE):/i.test(l));
-    if (!lines.length) { setError('No valid directives found in pasted text'); return; }
-    setDirectives(lines);
-    setSelected(new Set(lines.map((_, i) => i)));
-    setPreview(null);
-    setApplyResult(null);
-    setError('');
-    setStatusMsg(`Loaded ${lines.length} directive${lines.length !== 1 ? 's' : ''} from paste`);
-  }, []);
-
-  const selectAll = () => setSelected(new Set(directives.map((_, i) => i)));
-  const selectNone = () => setSelected(new Set());
-  const toggleOne = (i) => setSelected(s => { const n = new Set(s); n.has(i) ? n.delete(i) : n.add(i); return n; });
-
-  const previewSelected = useCallback(async () => {
-    const chosen = directives.filter((_, i) => selected.has(i));
-    if (!chosen.length) { setError('Select at least one directive'); return; }
-    setError('');
-    try {
-      const data = await apiSend('/api/organize/annotate/preview', 'POST', { directives: chosen });
-      setPreview(data);
-    } catch (e) { setError(`Preview failed: ${errorMessage(e)}`); }
-  }, [directives, selected]);
-
-  const applySelected = useCallback(async () => {
-    if (!preview) return;
-    setApplying(true);
-    setError('');
-    const chosen = directives.filter((_, i) => selected.has(i));
-    // Newer backends tag each preview change with an `id`; send those back so the
-    // server applies exactly what was previewed. Directives are still sent for
-    // older backends.
-    const ids = (preview.changes || []).filter(c => c.found && c.id != null).map(c => c.id);
-    const body = { directives: chosen };
-    if (ids.length) body.ids = ids;
-    try {
-      const data = await apiSend('/api/organize/annotate/apply', 'POST', body);
-      setApplyResult(data);
-      setPreview(null);
-    } catch (e) { setError(`Apply failed: ${errorMessage(e)}`); }
-    setApplying(false);
-  }, [directives, selected, preview]);
-
-  const typeColor = { FRANCHISE: 'var(--accent-text)', RENAME: 'var(--blue-text)', MERGE: 'var(--purple-text)', TAG: 'var(--green-text)' };
-
-  function directiveType(line) {
-    const m = line.match(/^(FRANCHISE|RENAME|MERGE|TAG):/i);
-    return m ? m[1].toUpperCase() : 'OTHER';
-  }
-
-  return (
-    <div className="org-tab-body">
-      <p className="org-desc">
-        Generate Claude AI directives to franchise-tag, rename, merge, and tag your entire library — then apply selectively.
-        Or export a prompt to paste into Claude manually and import the response.
-      </p>
-
-      {/* Target banner from health/franchise tab */}
-      {target?.modelIds?.length > 0 && (
-        <div style={{
-          display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px',
-          background: 'rgba(193,127,58,0.08)', border: '1px solid rgba(193,127,58,0.3)',
-          borderRadius: 6, marginBottom: 10,
-        }}>
-          <span style={{ fontSize: 12, color: 'var(--accent)', flex: 1 }}>
-            🎯 Targeting: <b>{target.label}</b>
-          </span>
-          <button className="org-btn org-btn-sm" onClick={onClearTarget}
-            style={{ color: 'var(--text-faint)' }}>✕ Clear</button>
-        </div>
-      )}
-
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
-        <div className="org-row" style={{ marginBottom: 0 }}>
-          <label className="org-label">Filter by creator</label>
-          <select className="org-select" aria-label="Filter by creator" value={creator} onChange={e => { setCreator(e.target.value); setPathFilter(''); }}>
-            <option value="">All creators</option>
-            {creators.map(c => <option key={c.id} value={c.name}>{c.name}</option>)}
-          </select>
-        </div>
-        <div className="org-row" style={{ marginBottom: 0 }}>
-          <label className="org-label">Filter by subfolder / path</label>
-          <input
-            className="org-select"
-            placeholder="e.g. Marvel, Star Wars, X-Men…"
-            aria-label="Filter by subfolder or path"
-            value={pathFilter}
-            onChange={e => { setPathFilter(e.target.value); setCreator(''); }}
-            style={{ fontFamily: 'var(--font-mono)', fontSize: 11 }}
-          />
-        </div>
-      </div>
-
-      {/* Action buttons */}
-      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-        <button className="org-btn org-btn-primary" onClick={run} disabled={running} style={{ flex: '1 1 auto' }}>
-          {running ? `⏳ ${statusMsg || 'Generating…'}` : '✦ Generate with AI'}
-        </button>
-        <button className="org-btn org-btn-secondary" onClick={exportForClaude} disabled={exporting} title="Download a .txt file to paste into Claude manually">
-          {exporting ? '⏳' : '📄'} Export for Claude
-        </button>
-      </div>
-
-      {/* Paste-back area (shown when no directives loaded yet or as an alternative) */}
-      {!running && directives.length === 0 && (
-        <div style={{ marginTop: 10 }}>
-          <label className="org-label">Paste Claude's response here to import directives</label>
-          <textarea
-            className="org-textarea"
-            aria-label="Paste Claude's response to import directives"
-            rows={5}
-            placeholder={"Paste Claude's output here — lines starting with FRANCHISE:, TAG:, RENAME:, or MERGE: will be imported automatically"}
-            onPaste={e => {
-              e.preventDefault();
-              pasteDirectives(e.clipboardData.getData('text'));
-            }}
-            onChange={e => { if (e.target.value.trim()) pasteDirectives(e.target.value); }}
-          />
-        </div>
-      )}
-
-      {/* Status line */}
-      {statusMsg && !error && (
-        <div style={{
-          fontSize: 11, fontFamily: 'var(--font-mono)', padding: '6px 10px',
-          background: 'rgba(193,127,58,0.06)', border: '1px solid rgba(193,127,58,0.2)',
-          borderRadius: 4, color: 'var(--accent)', marginTop: 4,
-        }}>
-          {statusMsg}
-        </div>
-      )}
-
-      {/* Saved indicator */}
-      {savedAt && directives.length > 0 && !running && (
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: 4 }}>
-          <span style={{ fontSize: 10, color: 'var(--text-faint)', fontFamily: 'var(--font-mono)' }}>
-            💾 Auto-saved {new Date(savedAt).toLocaleTimeString()}
-          </span>
-          <button className="org-btn org-btn-sm org-btn-danger" onClick={clearSession}>
-            ✕ Clear
-          </button>
-        </div>
-      )}
-
-      {error && <div className="org-error">{error}</div>}
-
-      {directives.length > 0 && (
-        <>
-          <div className="org-directive-header">
-            <span style={{ color: 'var(--text-muted)', fontSize: 12 }}>
-              {directives.length} directive{directives.length !== 1 ? 's' : ''} · {selected.size} selected
-            </span>
-            <div style={{ display: 'flex', gap: 6 }}>
-              <button className="org-btn org-btn-sm" onClick={selectAll}>All</button>
-              <button className="org-btn org-btn-sm" onClick={selectNone}>None</button>
-              <button className="org-btn org-btn-sm" onClick={() => {
-                const keep = new Set();
-                directives.forEach((d, i) => { if (['FRANCHISE','TAG'].includes(directiveType(d))) keep.add(i); });
-                setSelected(keep);
-              }}>FRANCHISE+TAG</button>
-            </div>
-          </div>
-
-          <div className="org-directive-list" ref={logRef}>
-            {directives.map((line, i) => {
-              const type = directiveType(line);
-              return (
-                <div
-                  key={i}
-                  role="checkbox"
-                  aria-checked={selected.has(i)}
-                  tabIndex={0}
-                  className={`org-directive ${selected.has(i) ? 'selected' : ''}`}
-                  onClick={() => toggleOne(i)}
-                  onKeyDown={e => { if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); toggleOne(i); } }}
-                >
-                  <span className="org-directive-check" aria-hidden="true">{selected.has(i) ? '☑' : '☐'}</span>
-                  <span className="org-directive-type" style={{ color: typeColor[type] || 'var(--text-faint)' }}>{type}</span>
-                  <span className="org-directive-text">{line.replace(/^[A-Z]+:\s*/i, '')}</span>
-                </div>
-              );
-            })}
-          </div>
-
-          <div style={{ display: 'flex', gap: 8, marginTop: 10 }}>
-            <button className="org-btn org-btn-secondary" onClick={previewSelected} disabled={!selected.size}>
-              🔍 Preview Changes
-            </button>
-            {preview && (
-              <button className="org-btn org-btn-success" onClick={applySelected} disabled={applying}>
-                {applying ? 'Applying…' : `✓ Apply ${preview.stats.found} Changes`}
-              </button>
-            )}
-          </div>
-
-          {preview && (
-            <div className="org-preview-box">
-              <div className="org-preview-header">Preview — {preview.stats.found} will apply · {preview.stats.notFound} not found</div>
-              <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', padding: '8px 12px', borderBottom: '1px solid var(--border)', fontSize: 11 }}>
-                {Object.entries(preview.stats.byType).map(([type, count]) => (
-                  <span key={type} style={{ color: typeColor[type] || 'var(--text-faint)' }}>{type}: {count}</span>
-                ))}
-              </div>
-              <div style={{ maxHeight: 180, overflowY: 'auto', padding: '8px 12px' }}>
-                {preview.changes.map((c, i) => (
-                  <div key={c.id ?? i} style={{ fontSize: 11, padding: '3px 0', borderBottom: '1px solid var(--border)', display: 'flex', gap: 8, alignItems: 'center' }}>
-                    <span style={{ color: typeColor[c.type] || 'var(--text-faint)', minWidth: 70, fontSize: 10 }}>{c.type}</span>
-                    <span style={{ color: c.found ? 'var(--text-main)' : 'var(--text-faint)', flex: 1 }}>
-                      {c.type === 'FRANCHISE' && `${c.modelName} → franchise: ${c.franchise}`}
-                      {c.type === 'RENAME' && `${c.oldName} → ${c.newName}`}
-                      {c.type === 'TAG' && `${c.modelName}: ${(c.tags || []).join(', ')}`}
-                      {c.type === 'MERGE' && `${c.srcName} → ${c.targetName} (advisory)`}
-                    </span>
-                    {!c.found && <span style={{ color: 'var(--red-text)', fontSize: 10 }}>NOT FOUND</span>}
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-
-          {applyResult && (
-            <div className="org-success-box">
-              ✓ Applied {applyResult.applied} changes · {applyResult.skipped} skipped
-            </div>
-          )}
-        </>
-      )}
     </div>
   );
 }
@@ -547,9 +126,9 @@ function DupGroup({ groupKey, models, label, busy, onResolve, libraryPath, backu
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '4px 8px 8px', flexWrap: 'wrap' }}>
         <button className="org-btn org-btn-success" disabled={busy || !keepId}
           onClick={() => onResolve(groupKey, keepId, models)}>
-          {busy ? 'Merging…' : `✓ Keep selected · hide ${others} other${others !== 1 ? 's' : ''}`}
+          {busy ? 'Merging…' : `✓ Keep selected · merge ${others} other${others !== 1 ? 's' : ''} into it`}
         </button>
-        <span className="org-hint-inline">Tags & collections fold into the kept model; the rest are hidden (not deleted).</span>
+        <span className="org-hint-inline">Files, tags and collections move to the kept card; undo with Unmerge under Review → History.</span>
       </div>
     </div>
   );
@@ -595,15 +174,63 @@ function FileDupRow({ d, libraryPath }) {
   );
 }
 
-function HealthTab({ onAnnotateThese, libraryPath, onOpenModel }) {
+const MISSING = [
+  { id: 'noFranchise', label: 'Genre', enrich: true },
+  { id: 'noTags', label: 'Tags', enrich: true },
+  { id: 'noThumbnail', label: 'Picture' },
+  { id: 'noSource', label: 'Source URL' },
+];
+
+/**
+ * Cards missing a genre, tags, a picture or a source URL. Genre and tags are filled by Enrich, run
+ * right here on just these cards; pictures come from Scan Library (free first, then the web search).
+ */
+function MissingInfo({ data, libraryPath, onOpenReview, onSummary }) {
+  const [which, setWhich] = useState('noFranchise');
+  const [enriching, setEnriching] = useState(false);
+  const def = MISSING.find(x => x.id === which) || MISSING[0];
+  const list = Array.isArray(data[which]) ? data[which] : [];
+  const ids = useMemo(() => list.map(m => m.id), [list]);
+  return (
+    <>
+      <div className="org-section-actions missing-info-bar">
+        <div className="seg" role="group" aria-label="Missing">
+          {MISSING.map(x => (
+            <button key={x.id} type="button" className={`seg-btn ${which === x.id ? 'active' : ''}`} aria-pressed={which === x.id}
+              onClick={() => { setWhich(x.id); setEnriching(false); }}>
+              {x.label} <span className="num">{(data.summary && data.summary[x.id]) ?? 0}</span>
+            </button>
+          ))}
+        </div>
+        {def.enrich && list.length > 0 && !enriching && (
+          <button className="org-btn org-btn-sm org-btn-accent" onClick={() => setEnriching(true)}>✦ Enrich these {list.length.toLocaleString()}</button>
+        )}
+        {which === 'noThumbnail' && list.length > 0 && (
+          <span className="org-hint-inline">Scan Library → <b>Find missing pictures</b> fills these from renders in their files (free); the web search there is for what it can't fill.</span>
+        )}
+      </div>
+      {enriching && (
+        <React.Suspense fallback={<div className="org-hint-inline">Loading…</div>}>
+          <div className="missing-enrich">
+            <EnrichPanel presetIds={ids} onOpenReview={onOpenReview}
+              onDone={() => apiGet('/api/suggestions/summary').then(onSummary).catch(() => {})} />
+          </div>
+        </React.Suspense>
+      )}
+      {list.length === 0
+        ? <div className="org-empty">Every card has a {def.label.toLowerCase()} 🎉</div>
+        : list.map(m => <ModelRow key={m.id} m={m} extra={relativeFolder(m.folder_path, libraryPath) || undefined} />)}
+    </>
+  );
+}
+
+function HealthTab({ libraryPath, onOpenReview, onSummary }) {
   const notify = useNotify();
   const [confirmUi, askConfirm] = useConfirm();
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [activeSection, setActiveSection] = useState('crossCreator');
-  const [thumbFixing, setThumbFixing] = useState(false);
-  const [thumbResult, setThumbResult] = useState('');
   const [integrityData, setIntegrityData] = useState(null);
   const [integrityLoading, setIntegrityLoading] = useState(false);
   const [resolvedKeys, setResolvedKeys] = useState(new Set()); // dup groups already handled this session
@@ -617,48 +244,37 @@ function HealthTab({ onAnnotateThese, libraryPath, onOpenModel }) {
   }, []);
   useEffect(() => { loadAttrSummary(); }, [loadAttrSummary]);
 
-  // Suspect folders (docs/folder-roles.md §4); undefined = loading, null = older backend
-  const [suspects, setSuspects] = useState(undefined);
-  const [suspectsError, setSuspectsError] = useState('');
-  const [showDismissed, setShowDismissed] = useState(false);
-  const loadSuspects = useCallback((dismissed) => {
-    setSuspectsError('');
-    apiGet(`/api/folder-roles/suspects?dismissed=${dismissed ? 1 : 0}`)
-      .then(d => setSuspects(d && Array.isArray(d.items) ? d : null))
-      .catch(e => {
-        if (e && e.status === 404) setSuspects(null);
-        else { setSuspectsError(errorMessage(e)); setSuspects(s => (s === undefined ? { items: [] } : s)); }
-      });
-  }, []);
-  useEffect(() => { loadSuspects(showDismissed); }, [loadSuspects, showDismissed]);
-
+  // Duplicates across creators fold like an accepted merge: alias + Unmerge (Review → History)
   const resolveDup = useCallback(async (groupKey, keepId, models) => {
     const drop = models.filter(m => m.id !== keepId);
     if (!drop.length) return;
     const keep = models.find(m => m.id === keepId);
     const n = drop.length;
     const ok = await askConfirm({
-      title: `Hide ${n} model${n !== 1 ? 's' : ''}?`,
+      title: `Merge ${n} card${n !== 1 ? 's' : ''} into "${keep?.name}"?`,
       message: (
         <>
-          <p>Keep <b>{keep?.name}</b>{keep?.creator_name ? ` (${keep.creator_name})` : ''} and hide {n === 1 ? 'the other copy' : `the other ${n} copies`}:</p>
+          <p>Keep <b>{keep?.name}</b>{keep?.creator_name ? ` (${keep.creator_name})` : ''} and fold {n === 1 ? 'the other copy' : `the other ${n} copies`} into it:</p>
           <ul className="confirm-list">
             {drop.map(m => <li key={m.id}>{m.name} <span className="confirm-dim">— {m.creator_name || '?'}{m.folder_path ? ` · ${relativeFolder(m.folder_path, libraryPath)}` : ''}</span></li>)}
           </ul>
-          <p>Files stay on disk; you can unhide them later.</p>
+          <p>Files, tags, notes and collections move to the kept card, and the next scan keeps them together. A database snapshot is taken first; undo with Unmerge under Review → History. Files on disk are not touched.</p>
         </>
       ),
-      confirmLabel: `Hide ${n} model${n !== 1 ? 's' : ''}`,
+      confirmLabel: `Merge ${n}`,
     });
     if (!ok) return;
     setResolvingKey(groupKey);
     try {
-      await apiSend('/api/organize/dedupe/resolve', 'POST', { keepId, dropIds: drop.map(m => m.id) });
-      setResolvedKeys(prev => new Set(prev).add(groupKey));
-      notify(`Kept "${keep?.name}", hid ${n} duplicate${n !== 1 ? 's' : ''}`, { type: 'success' });
+      const r = await apiSend('/api/organize/dedupe/resolve', 'POST', { keepId, dropIds: drop.map(m => m.id) });
+      const merged = Number(r && r.merged) || 0;
+      const errs = Array.isArray(r && r.errors) ? r.errors : [];
+      if (merged) setResolvedKeys(prev => new Set(prev).add(groupKey));
+      if (merged) notify(`Merged ${merged} card${merged !== 1 ? 's' : ''} into "${keep?.name}". Unmerge is under Review → History.`, { type: 'success' });
+      if (errs.length) notify(`${errs.length} not merged: ${errs.map(e => e.error).join('; ')}`, { type: 'info', duration: 9000 });
     } catch (e) {
       setError(errorMessage(e));
-      notify(`Couldn't resolve duplicates: ${errorMessage(e)}`);
+      notify(`Couldn't merge: ${errorMessage(e)}`);
     }
     setResolvingKey(null);
   }, [askConfirm, libraryPath, notify]);
@@ -686,16 +302,6 @@ function HealthTab({ onAnnotateThese, libraryPath, onOpenModel }) {
 
   useEffect(() => { run(); }, [run]);
 
-  const fixThumbnails = async () => {
-    setThumbFixing(true); setThumbResult('');
-    try {
-      const d = await apiSend('/api/organize/fix-thumbnails', 'POST');
-      setThumbResult(`✓ Fixed ${d.fixed}${d.extracted ? ` + extracted ${d.extracted} from archives` : ''}`);
-      run();
-    } catch (e) { setError(errorMessage(e)); }
-    setThumbFixing(false);
-  };
-
   const runIntegrity = async () => {
     setIntegrityLoading(true); setActiveSection('integrity');
     try {
@@ -704,88 +310,22 @@ function HealthTab({ onAnnotateThese, libraryPath, onOpenModel }) {
     setIntegrityLoading(false);
   };
 
+  const missingCount = data?.summary ? MISSING.filter(x => x.id !== 'noSource').reduce((n, x) => n + (data.summary[x.id] || 0), 0) : undefined;
   const sections = [
     ...(attrSummary ? [{ id: 'attribution', label: 'Attribution', icon: '🔖', count: attrSummary.gaps }] : []),
-    ...(suspects ? [{ id: 'suspects', label: 'Suspect Folders', icon: '⚑', count: suspects.items.filter(x => !x.dismissed).length }] : []),
     { id: 'crossCreator', label: 'X-Creator Dupes', icon: '🔀', count: data?.summary?.crossCreatorDupes },
-    { id: 'duplicates',   label: 'Similar Names',   icon: '⧉', count: data?.summary?.duplicatePairs },
+    { id: 'missing',      label: 'Missing Info',    icon: '🏷', count: missingCount },
     ...(data?.summary?.fileDuplicates !== undefined ? [{ id: 'fileDuplicates', label: 'Duplicate Files', icon: '⧉', count: data.summary.fileDuplicates }] : []),
     ...(data?.summary?.conflictFolders !== undefined ? [{ id: 'conflicts', label: 'Conflict Copies', icon: '⚠', count: data.summary.conflictFolders }] : []),
-    { id: 'export',       label: 'Organizer Export', icon: '⇪', noBadge: true },
-    { id: 'integrity',    label: 'Integrity',        icon: '🔍', count: integrityData?.summary?.missingFolders },
     { id: 'emptyFolders', label: 'Empty Folders',   icon: '📂', count: data?.summary?.emptyFolders },
-    { id: 'noThumbnail',  label: 'No Thumbnail',    icon: '🖼', count: data?.summary?.noThumbnail },
-    { id: 'noTags',       label: 'No Tags',          icon: '🏷', count: data?.summary?.noTags },
-    { id: 'noFranchise',  label: 'No Franchise',     icon: '🗂', count: data?.summary?.noFranchise },
-    { id: 'noSource',     label: 'No Source URL',    icon: '🔗', count: data?.summary?.noSource },
+    { id: 'integrity',    label: 'Integrity',        icon: '🔍', count: integrityData?.summary?.missingFolders },
   ];
 
   const folderExtra = (m) => relativeFolder(m.folder_path, libraryPath) || undefined;
 
-  // Quick-fix action bar for the current section
-  function renderSectionActions() {
-    if (!data) return null;
-    if (activeSection === 'noFranchise' && data.noFranchise.length > 0 && onAnnotateThese) {
-      return (
-        <div className="org-section-actions">
-          <span className="org-hint-inline">{data.noFranchise.length} models without franchise assignment</span>
-          <button className="org-btn org-btn-sm org-btn-accent"
-            onClick={() => onAnnotateThese(data.noFranchise.map(m => m.id), `${data.noFranchise.length} unfranchised models`)}>
-            ✦ Annotate These
-          </button>
-        </div>
-      );
-    }
-    if (activeSection === 'noTags' && data.noTags.length > 0 && onAnnotateThese) {
-      return (
-        <div className="org-section-actions">
-          <span className="org-hint-inline">{data.noTags.length} models without tags</span>
-          <button className="org-btn org-btn-sm org-btn-accent"
-            onClick={() => onAnnotateThese(data.noTags.map(m => m.id), `${data.noTags.length} untagged models`)}>
-            ✦ Annotate These
-          </button>
-        </div>
-      );
-    }
-    if (activeSection === 'noThumbnail' && data.noThumbnail.length > 0) {
-      return (
-        <div className="org-section-actions">
-          <span className="org-hint-inline">{data.noThumbnail.length} models missing thumbnails</span>
-          <button className="org-btn org-btn-sm org-btn-blue" onClick={fixThumbnails} disabled={thumbFixing}>
-            {thumbFixing ? '⏳' : '🖼'} Auto-Fix + Extract
-          </button>
-          {thumbResult && <span className="org-ok-text">{thumbResult}</span>}
-        </div>
-      );
-    }
-    if (activeSection === 'integrity') {
-      return (
-        <div className="org-section-actions">
-          <button className="org-btn org-btn-sm org-btn-blue" onClick={runIntegrity} disabled={integrityLoading}>
-            {integrityLoading ? '⏳ Checking…' : '↻ Re-run Check'}
-          </button>
-        </div>
-      );
-    }
-    return null;
-  }
-
   function renderSection() {
     if (!data) return null;
     switch (activeSection) {
-      case 'export':
-        return (
-          <React.Suspense fallback={<div className="org-hint-inline">Loading…</div>}>
-            <div className="attr-health"><OrganizerExport /></div>
-          </React.Suspense>
-        );
-      case 'suspects':
-        return (
-          <React.Suspense fallback={<div className="org-hint-inline">Loading…</div>}>
-            <SuspectFolders data={suspects} error={suspectsError} showDismissed={showDismissed}
-              onShowDismissed={setShowDismissed} onChange={() => loadSuspects(showDismissed)} onOpenModel={onOpenModel} />
-          </React.Suspense>
-        );
       case 'attribution':
         return attrSummary
           ? (
@@ -805,28 +345,8 @@ function HealthTab({ onAnnotateThese, libraryPath, onOpenModel }) {
               label={`"${g.key}" — ${g.models.length} copies across ${new Set(g.models.map(m => m.creator_name)).size} creators`} />
           ));
       }
-      case 'duplicates': {
-        const pairs = (data.duplicates || []).filter(p => !resolvedKeys.has(`dup-${p.a.id}-${p.b.id}`));
-        if (pairs.length && data.summary.backupCopies) {
-          return (<>
-            <BackupNote count={data.summary.backupCopies} />
-            {pairs.map(p => (
-              <DupGroup key={`dup-${p.a.id}-${p.b.id}`} groupKey={`dup-${p.a.id}-${p.b.id}`} models={[p.a, p.b]} libraryPath={libraryPath}
-                backupOf={backupLibraries(p, [p.a, p.b])}
-                busy={resolvingKey === `dup-${p.a.id}-${p.b.id}`} onResolve={resolveDup}
-                label={`${Math.round(p.score * 100)}% similar`} />
-            ))}
-          </>);
-        }
-        return pairs.length === 0
-          ? <div className="org-empty">No similar-name pairs to resolve 🎉</div>
-          : pairs.map(p => (
-            <DupGroup key={`dup-${p.a.id}-${p.b.id}`} groupKey={`dup-${p.a.id}-${p.b.id}`} models={[p.a, p.b]} libraryPath={libraryPath}
-              backupOf={backupLibraries(p, [p.a, p.b])}
-              busy={resolvingKey === `dup-${p.a.id}-${p.b.id}`} onResolve={resolveDup}
-              label={`${Math.round(p.score * 100)}% similar`} />
-          ));
-      }
+      case 'missing':
+        return <MissingInfo data={data} libraryPath={libraryPath} onOpenReview={onOpenReview} onSummary={onSummary} />;
       case 'fileDuplicates': {
         const list = data.fileDuplicates || [];
         return (<>
@@ -864,6 +384,7 @@ function HealthTab({ onAnnotateThese, libraryPath, onOpenModel }) {
             <div className="org-hint-inline" style={{ margin: 8 }}>
               {integrityData.summary.missingFolders} of {integrityData.summary.checked} folders not found on disk.
               These models may have been moved or deleted.
+              <button className="link-btn" onClick={runIntegrity} disabled={integrityLoading} style={{ marginLeft: 8 }}>↻ Re-run</button>
             </div>
             {integrityData.missingFolders.map(m => (
               <ModelRow key={m.id} m={m} extra={folderExtra(m)} onHide={hideOne} />
@@ -873,22 +394,6 @@ function HealthTab({ onAnnotateThese, libraryPath, onOpenModel }) {
         return data.emptyFolders.length === 0
           ? <div className="org-empty">No empty folders 🎉</div>
           : data.emptyFolders.map(m => <ModelRow key={m.id} m={m} extra={`${folderExtra(m) || ''} · ${m.file_count || 0} files`} onHide={hideOne} />);
-      case 'noThumbnail':
-        return data.noThumbnail.length === 0
-          ? <div className="org-empty">All models have thumbnails 🎉</div>
-          : data.noThumbnail.map(m => <ModelRow key={m.id} m={m} extra={folderExtra(m)} />);
-      case 'noTags':
-        return data.noTags.length === 0
-          ? <div className="org-empty">All models have tags 🎉</div>
-          : data.noTags.map(m => <ModelRow key={m.id} m={m} extra={folderExtra(m)} />);
-      case 'noFranchise':
-        return data.noFranchise.length === 0
-          ? <div className="org-empty">All models have a franchise 🎉</div>
-          : data.noFranchise.map(m => <ModelRow key={m.id} m={m} extra={folderExtra(m)} />);
-      case 'noSource':
-        return data.noSource.length === 0
-          ? <div className="org-empty">All models have a source URL 🎉</div>
-          : data.noSource.map(m => <ModelRow key={m.id} m={m} extra={folderExtra(m)} />);
       default: return null;
     }
   }
@@ -897,7 +402,8 @@ function HealthTab({ onAnnotateThese, libraryPath, onOpenModel }) {
     <div className="org-tab-body">
       {confirmUi}
       <p className="org-desc">
-        Scan your library for issues. Use the quick-fix buttons to jump directly to action.
+        Problems in the library itself: the same model under two creators, cards missing information, duplicate or conflicting files, and folders that are empty or gone.
+        Genre, tag and name suggestions are in Review.
       </p>
 
       <button className="org-btn org-btn-secondary" onClick={run} disabled={loading} style={{ marginBottom: 12 }}>
@@ -908,31 +414,18 @@ function HealthTab({ onAnnotateThese, libraryPath, onOpenModel }) {
 
       {data && (
         <>
-          <div className="org-health-summary">
-            <div className="org-health-stat"><span className="org-health-stat-num">{data.summary.total}</span><span>Total</span></div>
-            <button className="org-health-stat org-health-warn" onClick={() => setActiveSection('crossCreator')}>
-              <span className="org-health-stat-num org-num-blue">{data.summary.crossCreatorDupes ?? 0}</span><span>X-Dupes</span>
-            </button>
-            <button className="org-health-stat org-health-warn" onClick={() => setActiveSection('duplicates')}><span className="org-health-stat-num">{data.summary.duplicatePairs}</span><span>Similar</span></button>
-            <button className="org-health-stat org-health-warn" onClick={() => setActiveSection('noTags')}><span className="org-health-stat-num">{data.summary.noTags}</span><span>No Tags</span></button>
-            <button className="org-health-stat org-health-warn" onClick={() => setActiveSection('noThumbnail')}><span className="org-health-stat-num">{data.summary.noThumbnail}</span><span>No Thumb</span></button>
-            <button className="org-health-stat org-health-warn" onClick={() => setActiveSection('noFranchise')}><span className="org-health-stat-num">{data.summary.noFranchise}</span><span>No Franchise</span></button>
-          </div>
-
           <div className="org-health-sections" role="tablist" aria-label="Health checks">
-            {sections.map(s => (
-              <button key={s.id} role="tab" aria-selected={activeSection === s.id}
-                className={`org-health-section-btn ${activeSection === s.id ? 'active' : ''}`}
-                onClick={() => setActiveSection(s.id)}>
-                {s.icon} {s.label}
-                {!s.noBadge && <span className={`org-health-badge ${s.count > 0 ? 'warn' : 'ok'}`}>{s.count ?? '…'}</span>}
+            {sections.map(x => (
+              <button key={x.id} role="tab" aria-selected={activeSection === x.id}
+                className={`org-health-section-btn ${activeSection === x.id ? 'active' : ''}`}
+                onClick={() => setActiveSection(x.id)}>
+                {x.icon} {x.label}
+                <span className={`org-health-badge ${x.count > 0 ? 'warn' : 'ok'}`}>{x.count ?? '…'}</span>
               </button>
             ))}
           </div>
 
-          {renderSectionActions()}
-
-          <div className="org-health-list">
+          <div className={`org-health-list ${activeSection === 'missing' ? 'missing-list' : ''}`}>
             {renderSection()}
           </div>
         </>
@@ -1060,177 +553,9 @@ function GapTab() {
   );
 }
 
-// ── Franchise Browser tab ─────────────────────────────────────────────────────
+// ── Tools tab ─────────────────────────────────────────────────────────────────
 
-function FranchiseTab({ onAnnotateThese }) {
-  const [confirmUi, askConfirm] = useConfirm();
-  const [data, setData] = useState(null);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState('');
-  const [selected, setSelected] = useState(new Set());
-  const [franchiseInput, setFranchiseInput] = useState('');
-  const [filterText, setFilterText] = useState('');
-  const [applying, setApplying] = useState(false);
-  const [result, setResult] = useState('');
-  const [expanded, setExpanded] = useState(new Set(['__unassigned__']));
-
-  const load = useCallback(async () => {
-    setLoading(true); setError('');
-    try {
-      setData(await apiGet('/api/organize/franchise-browser'));
-    } catch (e) { setError(errorMessage(e)); }
-    setLoading(false);
-  }, []);
-
-  useEffect(() => { load(); }, [load]);
-
-  const toggleExpand = (key) =>
-    setExpanded(s => { const n = new Set(s); n.has(key) ? n.delete(key) : n.add(key); return n; });
-  const toggleModel = (id) =>
-    setSelected(s => { const n = new Set(s); n.has(id) ? n.delete(id) : n.add(id); return n; });
-  const selectGroup = (models) =>
-    setSelected(s => new Set([...s, ...models.map(m => m.id)]));
-
-  const applyFranchise = async () => {
-    if (!selected.size || !franchiseInput.trim()) return;
-    // Reassigning models that already have a franchise overwrites it: confirm first
-    const all = data ? [...data.unassigned, ...data.franchises.flatMap(f => f.models)] : [];
-    const overwriting = all.filter(m => selected.has(m.id) && m.franchise && m.franchise !== franchiseInput.trim()).length;
-    if (overwriting > 0) {
-      const ok = await askConfirm({
-        title: `Reassign ${selected.size} model${selected.size !== 1 ? 's' : ''}?`,
-        message: <p>{overwriting} of the selected models already belong to another franchise; they will be moved to <b>{franchiseInput.trim()}</b>.</p>,
-        confirmLabel: `Assign to ${selected.size}`,
-      });
-      if (!ok) return;
-    }
-    setApplying(true); setError(''); setResult('');
-    try {
-      const d = await apiSend('/api/organize/bulk-update', 'POST', { modelIds: [...selected], franchise: franchiseInput.trim() });
-      setResult(`✓ Assigned "${franchiseInput.trim()}" to ${d.updated} model${d.updated !== 1 ? 's' : ''}`);
-      setSelected(new Set()); setFranchiseInput(''); load();
-    } catch (e) { setError(e.message); }
-    setApplying(false);
-  };
-
-  const filter = filterText.toLowerCase();
-  const filterModels = (mods) => !filter ? mods
-    : mods.filter(m => m.name.toLowerCase().includes(filter) || (m.creator_name || '').toLowerCase().includes(filter));
-
-  // Plain render helpers (not nested components) so rows aren't remounted —
-  // and their thumbnails re-fetched — every time the selection changes.
-  function renderModelRow(m) {
-    const isSel = selected.has(m.id);
-    return (
-      <div key={m.id} className={`org-franchise-model${isSel ? ' selected' : ''}`} onClick={() => toggleModel(m.id)}
-        role="checkbox" aria-checked={isSel} tabIndex={0}
-        onKeyDown={e => { if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); toggleModel(m.id); } }}>
-        <span className="org-franchise-check" aria-hidden="true">{isSel ? '☑' : '☐'}</span>
-        {m.thumbnail_path
-          ? <img src={m.thumbnail_path} className="org-franchise-thumb" alt="" loading="lazy" />
-          : <span className="org-franchise-thumb-ph">🧩</span>}
-        <span className="org-franchise-model-name">{m.name}</span>
-        <span className="org-franchise-model-creator">{m.creator_name}</span>
-      </div>
-    );
-  }
-
-  function renderGroup({ groupKey, label, models, warn }) {
-    const filtered = filterModels(models);
-    if (filter && !filtered.length) return null;
-    const isOpen = expanded.has(groupKey);
-    return (
-      <div className="org-franchise-group" key={groupKey}>
-        <div className="org-franchise-header" onClick={() => toggleExpand(groupKey)}
-          role="button" tabIndex={0} aria-expanded={isOpen}
-          onKeyDown={e => { if ((e.key === 'Enter' || e.key === ' ') && e.target === e.currentTarget) { e.preventDefault(); toggleExpand(groupKey); } }}>
-          <span className={warn ? 'org-franchise-label warn' : 'org-franchise-label'}>{label}</span>
-          <span className={`org-franchise-count ${warn ? 'warn' : ''}`}>
-            {models.length}
-          </span>
-          <button className="org-btn org-btn-sm" style={{ marginLeft: 'auto', marginRight: 6, fontSize: 9 }}
-            onClick={e => { e.stopPropagation(); selectGroup(filtered); }}>
-            + Select all
-          </button>
-          {onAnnotateThese && groupKey === '__unassigned__' && (
-            <button className="org-btn org-btn-sm" style={{ marginRight: 6, fontSize: 9, color: 'var(--accent)', borderColor: 'var(--accent)' }}
-              onClick={e => { e.stopPropagation(); onAnnotateThese(filtered.map(m => m.id), `${filtered.length} unassigned models`); }}>
-              ✦ Annotate
-            </button>
-          )}
-          <span style={{ fontSize: 10, color: 'var(--text-faint)' }}>{isOpen ? '▾' : '▸'}</span>
-        </div>
-        {isOpen && (
-          <div>
-            {filtered.slice(0, 60).map(renderModelRow)}
-            {filtered.length > 60 && (
-              <div style={{ fontSize: 11, color: 'var(--text-faint)', padding: '4px 12px' }}>
-                +{filtered.length - 60} more — use filter to narrow down
-              </div>
-            )}
-          </div>
-        )}
-      </div>
-    );
-  }
-
-  return (
-    <div className="org-tab-body" style={{ paddingBottom: selected.size ? 60 : 0 }}>
-      {confirmUi}
-      <p className="org-desc">
-        Browse models by franchise. Select unassigned models and bulk-assign them, or select across franchises to reassign.
-      </p>
-
-      {data && (
-        <div style={{ display: 'flex', gap: 16, marginBottom: 10, fontSize: 12 }}>
-          <span style={{ color: 'var(--text-muted)' }}>Total <b style={{ color: 'var(--text)' }}>{data.total}</b></span>
-          <span style={{ color: 'var(--red-text)' }}>Unassigned <b>{data.unassigned.length}</b></span>
-          <span style={{ color: 'var(--green-text)' }}>Franchises <b>{data.franchises.length}</b></span>
-          <button className="org-btn org-btn-sm" style={{ marginLeft: 'auto' }} onClick={load}>↻ Refresh</button>
-        </div>
-      )}
-
-      <input className="org-select" placeholder="Filter by model name or creator…" aria-label="Filter by model name or creator" value={filterText}
-        onChange={e => setFilterText(e.target.value)}
-        style={{ marginBottom: 10, fontFamily: 'var(--font-mono)', fontSize: 11 }} />
-
-      {error && <div className="org-error">{error}</div>}
-      {loading && <div style={{ color: 'var(--text-faint)', fontSize: 12, padding: 8 }}>⏳ Loading…</div>}
-
-      {data && (
-        <div className="org-franchise-list">
-          {/* Unassigned always first */}
-          {data.unassigned.length > 0 && renderGroup({ groupKey: '__unassigned__', label: '⚠ Unassigned', models: data.unassigned, warn: true })}
-          {data.franchises.map(f => renderGroup({ groupKey: f.name, label: f.name, models: f.models }))}
-          {data.total === 0 && <div className="org-empty">No models found</div>}
-        </div>
-      )}
-
-      {result && <div className="org-success-box" style={{ marginTop: 8 }}>{result}</div>}
-
-      {/* Sticky action bar */}
-      {selected.size > 0 && (
-        <div className="org-franchise-actions">
-          <span style={{ fontSize: 12, color: 'var(--text-muted)', whiteSpace: 'nowrap' }}>{selected.size} selected</span>
-          <input className="org-select" placeholder="Franchise name…" aria-label="Franchise name to assign" value={franchiseInput}
-            onChange={e => setFranchiseInput(e.target.value)}
-            onKeyDown={e => { if (e.key === 'Enter') applyFranchise(); }}
-            style={{ flex: 1, fontFamily: 'var(--font-mono)', fontSize: 11 }} />
-          <button className="org-btn org-btn-success" onClick={applyFranchise}
-            disabled={applying || !franchiseInput.trim()}>
-            {applying ? '⏳' : '✓'} Assign
-          </button>
-          <button className="org-btn org-btn-sm org-btn-danger" onClick={() => setSelected(new Set())}
-            aria-label="Clear selection">✕</button>
-        </div>
-      )}
-    </div>
-  );
-}
-
-// ── Batch Actions tab ─────────────────────────────────────────────────────────
-
-// Module scope: a component defined inside BatchTab would remount its children
+// Module scope: a component defined inside a tab would remount its children
 // (and drop input focus) on every keystroke.
 function Section({ title, children }) {
   return (
@@ -1241,60 +566,20 @@ function Section({ title, children }) {
   );
 }
 
-function BatchTab() {
+/** Combine two creator entries (Tools). Files on disk are not touched. */
+function CreatorMerge() {
   const notify = useNotify();
   const [confirmUi, askConfirm] = useConfirm();
   const [creators, setCreators] = useState([]);
-  const [thumbStats, setThumbStats] = useState(null);
-  // Bulk tag/franchise
-  const [bulkCreatorId, setBulkCreatorId] = useState('');
-  const [bulkFranchise, setBulkFranchise] = useState('');
-  const [bulkTags, setBulkTags] = useState('');
-  const [bulkApplying, setBulkApplying] = useState(false);
-  const [bulkResult, setBulkResult] = useState('');
-  // Creator merge
   const [srcCreator, setSrcCreator] = useState('');
   const [dstCreator, setDstCreator] = useState('');
   const [merging, setMerging] = useState(false);
   const [mergeResult, setMergeResult] = useState('');
-  // Thumbnails
-  const [thumbFixing, setThumbFixing] = useState(false);
-  const [thumbResult, setThumbResult] = useState('');
   const [error, setError] = useState('');
-
-  useEffect(() => {
-    fetch('/api/creators').then(r => r.json()).then(setCreators).catch(() => {});
-    fetch('/api/organize/thumbnail-stats').then(r => r.json()).then(setThumbStats).catch(() => {});
+  const loadCreators = useCallback(() => {
+    apiGet('/api/creators').then(d => setCreators(Array.isArray(d) ? d : [])).catch(() => {});
   }, []);
-
-  const applyBulk = async () => {
-    if (!bulkCreatorId) { setError('Select a creator first'); return; }
-    const tags = bulkTags.split(',').map(t => t.trim().toLowerCase()).filter(Boolean);
-    if (!bulkFranchise && !tags.length) { setError('Enter a franchise and/or tags to apply'); return; }
-    const creator = creators.find(c => String(c.id) === String(bulkCreatorId));
-    const n = creator?.model_count ?? 0;
-    const ok = await askConfirm({
-      title: `Update all ${n} model${n !== 1 ? 's' : ''} by ${creator?.name || 'this creator'}?`,
-      message: (
-        <>
-          {bulkFranchise.trim() && <p>Every model's franchise will be set to <b>{bulkFranchise.trim()}</b>, replacing any franchise already assigned.</p>}
-          {tags.length > 0 && <p>Tags added: <b>{tags.join(', ')}</b> (existing tags are kept).</p>}
-        </>
-      ),
-      confirmLabel: `Apply to ${n} model${n !== 1 ? 's' : ''}`,
-      danger: !!bulkFranchise.trim(),
-    });
-    if (!ok) return;
-    setBulkApplying(true); setError(''); setBulkResult('');
-    try {
-      const body = { creatorId: parseInt(bulkCreatorId, 10) };
-      if (bulkFranchise) body.franchise = bulkFranchise.trim();
-      if (tags.length) body.tags = tags;
-      const d = await apiSend('/api/organize/bulk-update', 'POST', body);
-      setBulkResult(`✓ Updated ${d.updated} of ${d.total} models`);
-    } catch (e) { setError(errorMessage(e)); notify(`Bulk update failed: ${errorMessage(e)}`); }
-    setBulkApplying(false);
-  };
+  useEffect(() => { loadCreators(); }, [loadCreators]);
 
   const mergeCreators = async () => {
     if (!srcCreator || !dstCreator || srcCreator === dstCreator) {
@@ -1315,112 +600,44 @@ function BatchTab() {
       const d = await apiSend(`/api/creators/${srcCreator}/merge`, 'POST', { targetCreatorId: parseInt(dstCreator, 10) });
       setMergeResult(`✓ Merged "${d.sourceCreator}" → "${d.targetCreator}" (${d.moved} models moved)`);
       setSrcCreator(''); setDstCreator('');
-      fetch('/api/creators').then(r => r.json()).then(setCreators).catch(() => {});
+      loadCreators();
     } catch (e) { setError(errorMessage(e)); notify(`Merge failed: ${errorMessage(e)}`); }
     setMerging(false);
   };
 
-  const fixThumbnails = async () => {
-    setThumbFixing(true); setError(''); setThumbResult('');
-    try {
-      const d = await apiSend('/api/organize/fix-thumbnails', 'POST');
-      setThumbResult(`✓ Fixed ${d.fixed} thumbnails from existing images`);
-      fetch('/api/organize/thumbnail-stats').then(r => r.json()).then(setThumbStats).catch(() => {});
-    } catch (e) { setError(errorMessage(e)); }
-    setThumbFixing(false);
-  };
-
   return (
-    <div className="org-tab-body">
+    <Section title="🔀 Merge Creators">
       {confirmUi}
-      <p className="org-desc">
-        Bulk operations: apply franchise and tags to an entire creator's library, merge duplicate creators, and fix missing thumbnails.
-      </p>
-
       {error && <div className="org-error">{error}</div>}
-
-      {/* Bulk apply to creator */}
-      <Section title="⚡ Bulk Apply to Creator">
-        <div className="org-row">
-          <label className="org-label" htmlFor="bulk-creator">Creator</label>
-          <select id="bulk-creator" className="org-select" value={bulkCreatorId} onChange={e => setBulkCreatorId(e.target.value)}>
-            <option value="">Select creator…</option>
-            {creators.map(c => <option key={c.id} value={c.id}>{c.name} ({c.model_count} models)</option>)}
+      <div style={{ fontSize: 12, color: 'var(--text-faint)', marginBottom: 8 }}>
+        Combine two creator entries into one. All models from the source move to the target; the source creator is deleted.
+      </div>
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr auto 1fr', gap: 8, alignItems: 'center' }}>
+        <div>
+          <label className="org-label" htmlFor="merge-src" style={{ marginBottom: 4, display: 'block' }}>Merge FROM (will be deleted)</label>
+          <select id="merge-src" className="org-select" style={{ width: '100%' }} value={srcCreator} onChange={e => setSrcCreator(e.target.value)}>
+            <option value="">Source creator…</option>
+            {creators.map(c => <option key={c.id} value={c.id}>{c.name} ({c.model_count})</option>)}
           </select>
         </div>
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
-          <div className="org-row" style={{ marginBottom: 0 }}>
-            <label className="org-label" htmlFor="bulk-franchise">Set franchise (optional)</label>
-            <input id="bulk-franchise" className="org-select" placeholder="e.g. Marvel" value={bulkFranchise}
-              onChange={e => setBulkFranchise(e.target.value)}
-              style={{ fontFamily: 'var(--font-mono)', fontSize: 11 }} />
-          </div>
-          <div className="org-row" style={{ marginBottom: 0 }}>
-            <label className="org-label" htmlFor="bulk-tags">Add tags (comma-separated, optional)</label>
-            <input id="bulk-tags" className="org-select" placeholder="e.g. 28mm, resin, presupported" value={bulkTags}
-              onChange={e => setBulkTags(e.target.value)}
-              style={{ fontFamily: 'var(--font-mono)', fontSize: 11 }} />
-          </div>
+        <span style={{ color: 'var(--text-faint)', fontSize: 18, textAlign: 'center' }} aria-hidden="true">→</span>
+        <div>
+          <label className="org-label" htmlFor="merge-dst" style={{ marginBottom: 4, display: 'block' }}>Merge INTO (kept)</label>
+          <select id="merge-dst" className="org-select" style={{ width: '100%' }} value={dstCreator} onChange={e => setDstCreator(e.target.value)}>
+            <option value="">Target creator…</option>
+            {creators.filter(c => c.id !== parseInt(srcCreator, 10)).map(c => (
+              <option key={c.id} value={c.id}>{c.name} ({c.model_count})</option>
+            ))}
+          </select>
         </div>
-        <button className="org-btn org-btn-primary" onClick={applyBulk} disabled={bulkApplying || !bulkCreatorId} style={{ marginTop: 10 }}>
-          {bulkApplying ? '⏳ Applying…' : '⚡ Apply to All Models'}
-        </button>
-        {bulkResult && <div className="org-success-box" style={{ marginTop: 6 }}>{bulkResult}</div>}
-      </Section>
-
-      {/* Fix thumbnails */}
-      <Section title="🖼 Fix Missing Thumbnails">
-        {thumbStats ? (
-          <div style={{ display: 'flex', gap: 16, fontSize: 12, marginBottom: 10 }}>
-            <span style={{ color: 'var(--text-muted)' }}>No thumbnail: <b style={{ color: 'var(--red-text)' }}>{thumbStats.noThumb}</b></span>
-            <span style={{ color: 'var(--text-muted)' }}>Auto-fixable: <b style={{ color: 'var(--green-text)' }}>{thumbStats.fixable}</b></span>
-            <span style={{ color: 'var(--text-faint)', fontSize: 11 }}>(have images already extracted, just need linking)</span>
-          </div>
-        ) : (
-          <div style={{ color: 'var(--text-faint)', fontSize: 12, marginBottom: 10 }}>Loading stats…</div>
-        )}
-        <button className="org-btn org-btn-secondary" onClick={fixThumbnails}
-          disabled={thumbFixing || (thumbStats && thumbStats.fixable === 0)}>
-          {thumbFixing ? '⏳ Fixing…' : `🖼 Auto-Fix ${thumbStats?.fixable ?? '…'} Thumbnails`}
-        </button>
-        {thumbResult && <div className="org-success-box" style={{ marginTop: 6 }}>{thumbResult}</div>}
-        <div style={{ fontSize: 11, color: 'var(--text-faint)', marginTop: 6 }}>
-          For models with no images at all, use the ZIP extractor in the model detail view.
-        </div>
-      </Section>
-
-      {/* Creator merge */}
-      <Section title="🔀 Merge Creators">
-        <div style={{ fontSize: 12, color: 'var(--text-faint)', marginBottom: 8 }}>
-          Combine two creator entries into one. All models from the source move to the target; the source creator is deleted.
-        </div>
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr auto 1fr', gap: 8, alignItems: 'center' }}>
-          <div>
-            <label className="org-label" htmlFor="merge-src" style={{ marginBottom: 4, display: 'block' }}>Merge FROM (will be deleted)</label>
-            <select id="merge-src" className="org-select" style={{ width: '100%' }} value={srcCreator} onChange={e => setSrcCreator(e.target.value)}>
-              <option value="">Source creator…</option>
-              {creators.map(c => <option key={c.id} value={c.id}>{c.name} ({c.model_count})</option>)}
-            </select>
-          </div>
-          <span style={{ color: 'var(--text-faint)', fontSize: 18, textAlign: 'center' }} aria-hidden="true">→</span>
-          <div>
-            <label className="org-label" htmlFor="merge-dst" style={{ marginBottom: 4, display: 'block' }}>Merge INTO (kept)</label>
-            <select id="merge-dst" className="org-select" style={{ width: '100%' }} value={dstCreator} onChange={e => setDstCreator(e.target.value)}>
-              <option value="">Target creator…</option>
-              {creators.filter(c => c.id !== parseInt(srcCreator)).map(c => (
-                <option key={c.id} value={c.id}>{c.name} ({c.model_count})</option>
-              ))}
-            </select>
-          </div>
-        </div>
-        <button onClick={mergeCreators}
-          disabled={merging || !srcCreator || !dstCreator}
-          className="org-btn org-btn-secondary org-btn-danger" style={{ marginTop: 10 }}>
-          {merging ? '⏳ Merging…' : '🔀 Merge Creators'}
-        </button>
-        {mergeResult && <div className="org-success-box" style={{ marginTop: 6 }}>{mergeResult}</div>}
-      </Section>
-    </div>
+      </div>
+      <button onClick={mergeCreators}
+        disabled={merging || !srcCreator || !dstCreator}
+        className="org-btn org-btn-secondary org-btn-danger" style={{ marginTop: 10 }}>
+        {merging ? '⏳ Merging…' : '🔀 Merge Creators'}
+      </button>
+      {mergeResult && <div className="org-success-box" style={{ marginTop: 6 }}>{mergeResult}</div>}
+    </Section>
   );
 }
 
@@ -1688,40 +905,90 @@ function LooseTab({ libraryWritable }) {
   );
 }
 
-// Advanced — less-used tools grouped under one tab with secondary sub-tabs,
-// so the top level stays uncluttered.
-function AdvancedTab({ libraryWritable }) {
-  const [sub, setSub] = useState('batch');
-  const subTabs = [
-    { id: 'batch',  label: 'Bulk & Merge',       icon: '⚡' },
-    { id: 'roles',  label: 'Folder Roles',       icon: '🗃' },
-    { id: 'gaps',   label: 'Gap Analysis',       icon: '🔍' },
+/** Small section switcher inside a tab (Folders, Tools). */
+function SectionBar({ sections, active, onChange, label }) {
+  return (
+    <div className="org-health-sections" role="tablist" aria-label={label}>
+      {sections.map(x => (
+        <button key={x.id} role="tab" aria-selected={active === x.id}
+          className={`org-health-section-btn ${active === x.id ? 'active' : ''}`} onClick={() => onChange(x.id)}>
+          {x.icon} {x.label}{x.count != null && <span className={`org-health-badge ${x.count > 0 ? 'warn' : 'ok'}`}>{x.count}</span>}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+/** Folders: what each folder is (roles), folders that look wrong (suspects), and loose files to group. */
+function FoldersTab({ libraryWritable, onOpenModel }) {
+  const [sub, setSub] = useState('roles');
+  // Suspect folders (docs/folder-roles.md §4); undefined = loading, null = older backend
+  const [suspects, setSuspects] = useState(undefined);
+  const [suspectsError, setSuspectsError] = useState('');
+  const [showDismissed, setShowDismissed] = useState(false);
+  const loadSuspects = useCallback((dismissed) => {
+    setSuspectsError('');
+    apiGet(`/api/folder-roles/suspects?dismissed=${dismissed ? 1 : 0}`)
+      .then(d => setSuspects(d && Array.isArray(d.items) ? d : null))
+      .catch(e => {
+        if (e && e.status === 404) setSuspects(null);
+        else { setSuspectsError(errorMessage(e)); setSuspects(sv => (sv === undefined ? { items: [] } : sv)); }
+      });
+  }, []);
+  useEffect(() => { loadSuspects(showDismissed); }, [loadSuspects, showDismissed]);
+  const sections = [
+    { id: 'roles', label: 'Folder Roles', icon: '🗃' },
+    ...(suspects ? [{ id: 'suspects', label: 'Suspect Folders', icon: '⚑', count: suspects.items.filter(x => !x.dismissed).length }] : []),
     { id: 'unpack', label: 'Unpack Loose Files', icon: '📦' },
   ];
   return (
-    <div>
-      <div style={{ padding: '8px 16px 0' }}>
-        <TabBar tabs={subTabs} active={sub} onChange={setSub} label="Advanced tools" />
-      </div>
-      {sub === 'batch'  && <BatchTab />}
-      {sub === 'roles'  && <FolderRoles />}
-      {sub === 'gaps'   && <GapTab />}
+    <div className="org-tab-body">
+      <SectionBar sections={sections} active={sub} onChange={setSub} label="Folder tools" />
+      {sub === 'roles' && <FolderRoles />}
+      {sub === 'suspects' && (
+        <React.Suspense fallback={<div className="org-hint-inline">Loading…</div>}>
+          <SuspectFolders data={suspects} error={suspectsError} showDismissed={showDismissed}
+            onShowDismissed={setShowDismissed} onChange={() => loadSuspects(showDismissed)} onOpenModel={onOpenModel} />
+        </React.Suspense>
+      )}
       {sub === 'unpack' && <LooseTab libraryWritable={libraryWritable} />}
     </div>
   );
 }
 
+/** Tools: a list against the library, combine creators, export what the Vault learned. */
+function ToolsTab() {
+  const [sub, setSub] = useState('gaps');
+  const sections = [
+    { id: 'gaps', label: 'Gap Analysis', icon: '🔍' },
+    { id: 'creators', label: 'Merge Creators', icon: '🔀' },
+    { id: 'export', label: 'Organizer Export', icon: '⇪' },
+  ];
+  return (
+    <div className="org-tab-body">
+      <SectionBar sections={sections} active={sub} onChange={setSub} label="Tools" />
+      {sub === 'gaps' && <GapTab />}
+      {sub === 'creators' && <CreatorMerge />}
+      {sub === 'export' && (
+        <React.Suspense fallback={<div className="org-hint-inline">Loading…</div>}>
+          <div className="attr-health"><OrganizerExport /></div>
+        </React.Suspense>
+      )}
+    </div>
+  );
+}
+
 const TABS = [
-  { id: 'review',    label: 'Review',    icon: '✓' },
-  { id: 'annotate',  label: 'Annotate',  icon: '✦' },
-  { id: 'health',    label: 'Health',    icon: '⚕' },
-  { id: 'franchise', label: 'Franchise', icon: '🗂' },
-  { id: 'advanced',  label: 'Advanced',  icon: '⚙' },
+  { id: 'review',  label: 'Review',  icon: '✓' },
+  { id: 'health',  label: 'Health',  icon: '⚕' },
+  { id: 'folders', label: 'Folders', icon: '🗃' },
+  { id: 'tools',   label: 'Tools',   icon: '⚙' },
 ];
+const TAB_IDS = new Set(TABS.map(t => t.id));
 
 export default function OrganizeModal({ onClose, libraryWritable, libraryPath, initialTab, onSuggestionsChange, onOpenModel }) {
   const titleId = useUniqueId('org-title');
-  const [tab, setTab] = useState(initialTab || 'annotate');
+  const [tab, setTab] = useState(TAB_IDS.has(initialTab) ? initialTab : 'review');
   const [pending, setPending] = useState(null);
   const onSuggestionsChangeRef = useRef(onSuggestionsChange);
   onSuggestionsChangeRef.current = onSuggestionsChange;
@@ -1733,20 +1000,13 @@ export default function OrganizeModal({ onClose, libraryWritable, libraryPath, i
     apiGet('/api/suggestions/summary').then(updateSummary).catch(() => setPending(null));
   }, [updateSummary]);
   const tabs = TABS.map(t => (t.id === 'review' ? { ...t, badge: pending || 0 } : t));
-  // Shared target for health → annotate "Annotate These" flow
-  const [annotateTarget, setAnnotateTarget] = useState(null); // { modelIds, label }
-
-  const handleAnnotateThese = useCallback((modelIds, label) => {
-    setAnnotateTarget({ modelIds, label });
-    setTab('annotate');
-  }, []);
 
   return (
     <Modal onClose={onClose} labelledBy={titleId} overlayClassName="organize-overlay" className="organize-modal">
       <div className="org-header">
         <div>
           <div className="org-title" id={titleId}>🗂 ORGANIZE LIBRARY</div>
-          <div className="org-subtitle">Review AI suggestions · Annotate with AI · Health & fixes · Franchises · Advanced tools</div>
+          <div className="org-subtitle">Review AI suggestions · Health checks · Folders · Tools</div>
         </div>
         <button className="org-close" onClick={onClose} aria-label="Close Organize Library">✕</button>
       </div>
@@ -1762,10 +1022,9 @@ export default function OrganizeModal({ onClose, libraryWritable, libraryPath, i
           <ReviewTab onSummary={updateSummary} />
         </React.Suspense>
       )}
-      {tab === 'annotate'  && <AnnotateTab target={annotateTarget} onClearTarget={() => setAnnotateTarget(null)} />}
-      {tab === 'health'    && <HealthTab onAnnotateThese={handleAnnotateThese} libraryPath={libraryPath} onOpenModel={onOpenModel} />}
-      {tab === 'franchise' && <FranchiseTab onAnnotateThese={handleAnnotateThese} />}
-      {tab === 'advanced'  && <AdvancedTab libraryWritable={libraryWritable} />}
+      {tab === 'health'  && <HealthTab libraryPath={libraryPath} onOpenReview={() => setTab('review')} onSummary={updateSummary} />}
+      {tab === 'folders' && <FoldersTab libraryWritable={libraryWritable} onOpenModel={onOpenModel} />}
+      {tab === 'tools'   && <ToolsTab />}
     </Modal>
   );
 }

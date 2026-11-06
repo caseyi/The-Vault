@@ -24,14 +24,14 @@ const setup = (extra = []) => mockFetch([
 
 const openSuspects = async (props = {}) => {
   render(<NoticeProvider><OrganizeModal onClose={() => {}} {...props} /></NoticeProvider>);
-  fireEvent.click(screen.getByRole('tab', { name: /Health/ }));
+  fireEvent.click(screen.getByRole('tab', { name: /Folders/ }));
   const tab = await screen.findByRole('tab', { name: /Suspect Folders/ });
   expect(within(tab).getByText('2')).toBeInTheDocument();
   fireEvent.click(tab);
   return screen.findByRole('list', { name: 'Suspect folders' });
 };
 
-describe('Health → Suspect folders', () => {
+describe('Folders → Suspect folders', () => {
   test('lists reason, sample sub-folders and counts; one click marks the suggested role', async () => {
     const f = setup();
     const list = await openSuspects();
@@ -83,8 +83,8 @@ describe('Health → Suspect folders', () => {
       ['/api/folder-roles/suspects', { __status: 404 }],
     ], []);
     render(<NoticeProvider><OrganizeModal onClose={() => {}} /></NoticeProvider>);
-    fireEvent.click(screen.getByRole('tab', { name: /Health/ }));
-    await screen.findByText('Total');
+    fireEvent.click(screen.getByRole('tab', { name: /Folders/ }));
+    await screen.findByRole('tablist', { name: 'Folder tools' });
     await waitFor(() => expect(global.fetch.mock.calls.some(([u]) => String(u).includes('/api/folder-roles/suspects'))).toBe(true));
     expect(screen.queryByRole('tab', { name: /Suspect Folders/ })).not.toBeInTheDocument();
   });

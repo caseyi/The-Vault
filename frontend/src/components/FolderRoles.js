@@ -1,9 +1,9 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { apiGet, errorMessage } from '../api';
-import RoleMenu, { RescanButton, useNotifyRescan } from './RoleMenu';
-import { getFolderRoles, saveFolderRole, roleLabel, baseName } from '../folderRoles';
+import RoleMenu, { RescanButton } from './RoleMenu';
+import { getFolderRoles, roleLabel, baseName } from '../folderRoles';
 
-// Organize → Advanced → Folder Roles: tell the scanner what a folder is when its
+// Organize → Folders → Folder Roles: tell the scanner what a folder is when its
 // guess is wrong (docs/folder-roles.md §7). Marks from the library's
 // _Meta/folder_roles.csv are read-only here; the file wins over app marks.
 
@@ -63,10 +63,6 @@ function TreeNode({ node, depth, marks, onSaved }) {
   );
 }
 
-function getApiKey() {
-  try { return localStorage.getItem('claude_api_key') || ''; } catch { return ''; }
-}
-
 function MetaFiles({ files }) {
   if (!files || !files.length) {
     return <div className="org-hint-inline">No <code>_Meta/folder_roles.csv</code> found in the libraries. The organizer skill writes it.</div>;
@@ -88,16 +84,12 @@ function MetaFiles({ files }) {
 }
 
 export default function FolderRoles() {
-  const notifyRescan = useNotifyRescan();
   const [tree, setTree] = useState(null);
   const [marks, setMarks] = useState({}); // path -> mark saved in this session
   const [roleData, setRoleData] = useState(null); // GET /api/folder-roles
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [changes, setChanges] = useState(0);
-  const [suggestions, setSuggestions] = useState(null);
-  const [suggesting, setSuggesting] = useState(false);
-  const apiKey = getApiKey();
 
   const load = useCallback(async () => {
     setLoading(true); setError('');
@@ -115,37 +107,6 @@ export default function FolderRoles() {
     setChanges(n => n + 1);
   }, []);
 
-  const suggestWithAI = async () => {
-    setSuggesting(true); setError(''); setSuggestions(null);
-    try {
-      const r = await fetch('/api/organize/classify-folders', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...(apiKey && { 'x-claude-key': apiKey }) },
-        body: JSON.stringify({ path: tree?.path }),
-      });
-      const d = await r.json();
-      if (!r.ok) throw new Error(d.error || `Error ${r.status}`);
-      setSuggestions(d.suggestions || []);
-    } catch (e) { setError(e.message); }
-    setSuggesting(false);
-  };
-
-  const applySuggestions = async () => {
-    if (!suggestions?.length) return;
-    const next = {};
-    let failed = 0;
-    for (const s of suggestions) {
-      try {
-        await saveFolderRole({ path: s.path, role: s.role });
-        next[s.path] = { role: s.role, source: 'app', genre: null, group: null, tags: [] };
-      } catch { failed++; }
-    }
-    setMarks(prev => ({ ...prev, ...next }));
-    setChanges(n => n + Object.keys(next).length);
-    setSuggestions(null);
-    notifyRescan(`Applied ${Object.keys(next).length} AI suggestion${Object.keys(next).length !== 1 ? 's' : ''}${failed ? `, ${failed} failed` : ''}. They apply on the next scan.`, failed ? 'info' : 'success');
-  };
-
   const marked = (roleData && Array.isArray(roleData.roles)) ? roleData.roles : [];
 
   return (
@@ -157,15 +118,13 @@ export default function FolderRoles() {
         {' '}<b>Model</b>: exactly one card. <b>Ignore</b>: skip it. Marks from the library&apos;s <code>_Meta/folder_roles.csv</code> win
         and are read-only here. Changes apply on the next scan.
       </p>
+      <p className="org-hint-inline">
+        Not sure which folders need a role? <b>Suspect Folders</b> lists the ones that look wrong, and Enrich proposes roles into Review.
+      </p>
 
       <div className="role-toolbar">
         <button type="button" className="org-btn org-btn-sm" onClick={load} disabled={loading}>
           {loading ? 'Loading…' : '↻ Refresh folder tree'}
-        </button>
-        <button type="button" className="org-btn org-btn-sm role-ai-btn" onClick={suggestWithAI}
-          disabled={suggesting || !apiKey || !tree}
-          title={apiKey ? 'Uses Claude API credits: suggest folder roles from the structure' : 'Add a Claude API key (in the Scan dialog) to enable'}>
-          {suggesting ? 'Thinking…' : '✦ $ Suggest roles (AI)'}
         </button>
         <a className="attr-link role-export-link" href="/api/organizer/export/folder_roles.csv" download="folder_roles.csv">
           ⬇ Export app marks<span className="sr-only"> as folder_roles.csv for the organizer</span>
@@ -176,30 +135,6 @@ export default function FolderRoles() {
         <div className="role-rescan-bar" role="status">
           <span>{changes} change{changes !== 1 ? 's' : ''} saved. They apply on the next scan.</span>
           <RescanButton />
-        </div>
-      )}
-
-      {suggestions && (
-        <div className="role-ai-box">
-          <div className="role-ai-head">
-            <span>{suggestions.length} suggestion{suggestions.length !== 1 ? 's' : ''}</span>
-            {suggestions.length > 0 && (
-              <button type="button" className="org-btn org-btn-sm org-btn-success" onClick={applySuggestions}>✓ Apply all</button>
-            )}
-            <button type="button" className="org-btn org-btn-sm" onClick={() => setSuggestions(null)}>Dismiss</button>
-          </div>
-          {suggestions.length === 0
-            ? <div className="org-hint-inline">No confident suggestions. The structure looks fine, or set roles by hand below.</div>
-            : (
-              <ul className="role-ai-list">
-                {suggestions.map((s, i) => (
-                  <li key={i}>
-                    <span className="role-chip">{roleLabel(s.role)}</span> {baseName(s.path)}
-                    {s.reason && <span className="attr-faint">: {s.reason}</span>}
-                  </li>
-                ))}
-              </ul>
-            )}
         </div>
       )}
 

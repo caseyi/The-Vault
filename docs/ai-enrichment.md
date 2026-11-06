@@ -120,7 +120,7 @@ them to `/Volumes/STL Archive-1/...` or `/Volumes/3dPrint/...`.
   `POST /api/suggestions/decide-filter` `{filter, decision, value?}`. `value` accepts with a typed
   value. Filters add `proposed` (a group key) and `tag` (one tag of tags proposals).
 - `GET|POST /api/review-rules`, `DELETE /api/review-rules/:id?revert=1`, `POST /api/review-rules/apply` (§11).
-- `/api/ai/generate-tags` stays as an alias that runs Enrich with tags only, for old clients.
+- (Nov 2026) The old `/api/ai/generate-tags` alias, `/api/ai/vision-tags` and `/api/ai/tag-estimate` were removed: Enrich (with its vision fallback) replaces them.
 
 ## 9. Releases (same character, different releases)
 
