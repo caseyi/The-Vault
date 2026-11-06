@@ -590,7 +590,7 @@ function planActions(card, ans, ctx) {
       const no = new Set([...(cur || []), ...fieldAttr(card).removedTags, ...((ctx.rejectedTags && ctx.rejectedTags()) || [])].map(norm));
       const add = a.v.filter(t => !no.has(norm(t))).slice(0, Math.max(0, TAG_CAP - (cur || []).length));
       if (!add.length) continue;
-      const min = ctx.tagsOnly ? ctx.suggest : ctx.auto; // generate-tags clients expect tags applied
+      const min = ctx.tagsOnly ? ctx.suggest : ctx.auto; // a tags-only run applies tags at the suggest threshold
       // tags the user edited are theirs: proposals only
       if (a.c >= min && prov !== 'user') apply.push({ field: 'tags', value: [...(cur || []), ...add], added: add, c: a.c });
       else if (a.c >= ctx.suggest && !ctx.tagsOnly) suggest.push({ type: 'field', field: 'tags', current: cur || [], proposed: add, confidence: a.c, reason: why, source });
@@ -1202,6 +1202,43 @@ function decide(db, ids, decision, { snapshot, value: edited } = {}) {
   return res;
 }
 
+/**
+ * Fold duplicate cards into one by hand (Health → X-Creator Dupes): the same as an accepted merge
+ * suggestion, across creators too. A snapshot first; each fold stores an alias (so the next scan
+ * keeps them together) and is recorded as an accepted merge, so History → Unmerge can undo it.
+ * Different releases of a character, or a work and a diorama, are refused.
+ * @returns {{ merged: number, errors: {id, error}[], suggestionIds: number[] }}
+ */
+function foldCards(db, keepId, dropIds, { reason = 'duplicate', snapshot } = {}) {
+  const res = { merged: 0, errors: [], suggestionIds: [] };
+  const keep = db.prepare('SELECT * FROM models WHERE id = ?').get(keepId);
+  if (!keep) throw Object.assign(new Error('Keeper card not found'), { status: 404 });
+  if (keep.folded_into != null) throw Object.assign(new Error(`Keeper card was folded into #${keep.folded_into}`), { status: 409 });
+  const take = snapshot || ((label) => require('./backup').snapshot(label, { db }));
+  if (!take('pre-merge')) throw Object.assign(new Error('Could not write the backup taken before merging (check BACKUP_DIR); nothing was merged'), { status: 500 });
+  for (const id of dropIds) {
+    try {
+      const row = db.prepare('SELECT * FROM models WHERE id = ?').get(id);
+      if (!row) throw new Error('card not found');
+      if (row.id === keep.id) throw new Error('a card is not merged into itself');
+      if (row.folded_into != null) throw new Error(`card was already folded into #${row.folded_into}`);
+      if ((row.kind || 'model') !== (keep.kind || 'model')) throw new Error(`a ${row.kind || 'model'} card is not merged into a ${keep.kind || 'model'} card`);
+      const ra = releaseOf(row.work_key), rb = releaseOf(keep.work_key);
+      if ((ra.release || rb.release) && ra.release !== rb.release) throw new Error('these cards are different releases of the character; they stay separate');
+      db.transaction(() => {
+        const alias = storeAlias(db, row, keep, 'merge');
+        foldInto(db, row.id, keep.id, { reason: 'merge', alias: alias || null });
+        const sid = db.prepare(`INSERT INTO suggestions (model_id, type, target_id, confidence, reason, source, status, decided_at)
+          VALUES (?, 'merge', ?, 1, ?, 'user', 'accepted', datetime('now'))`).run(row.id, keep.id, String(reason).slice(0, 300)).lastInsertRowid;
+        res.suggestionIds.push(Number(sid));
+        db.prepare(`UPDATE suggestions SET status = 'superseded', decided_at = datetime('now') WHERE (model_id = ? OR target_id = ?) AND status = 'pending'`).run(row.id, row.id);
+      })();
+      res.merged++;
+    } catch (e) { res.errors.push({ id, error: e.message }); }
+  }
+  return res;
+}
+
 function decideFilter(db, filter = {}, decision, opts = {}) {
   if (filter.tag) return decideTag(db, filter, decision, opts);
   const { sql, params } = suggestionWhere({ ...filter, status: 'pending' });
@@ -1372,6 +1409,6 @@ module.exports = {
   releaseOf, scopeWhere, selectCards, nearDuplicates, buildEvidence, evidenceSig, fileStems, pathSegments,
   promptContext, systemPrompt, userPrompt, validateResponse, extractJSON,
   fieldState, planActions, wantsVision, combineAnswers, applyAuto, addSuggestion, rejectedLookup, isKnownGenreFn,
-  runEnrich, estimate, usdFor, listSuggestions, summary, groupSuggestions, decide, decideFilter, decideTag, cleanValue, knownValues, unmerge, salvageObjects, fieldAttr, storeAlias, createRun, finishRun, listRuns, undoRun,
+  runEnrich, estimate, usdFor, listSuggestions, summary, groupSuggestions, decide, decideFilter, decideTag, foldCards, cleanValue, knownValues, unmerge, salvageObjects, fieldAttr, storeAlias, createRun, finishRun, listRuns, undoRun,
   suggestionsFor, shapeSuggestion,
 };

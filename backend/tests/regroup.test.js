@@ -272,17 +272,6 @@ describe('nits', () => {
     const plain = await request(app).get('/api/models?limit=500');
     expect(plain.body.models.map(m => m.id)).not.toContain(tool.id);
   });
-  test('apply-franchise moves cards that share the folder under "#slug" paths with it', async () => {
-    const cid = db.prepare('SELECT id FROM creators WHERE name = ?').get(Q).id;
-    mk('StudioR/Gob/gob.stl');
-    const a = db.prepare(`INSERT INTO models (uuid, name, creator_id, folder_path, franchise, kind) VALUES ('r-gob', 'Gob', ?, ?, 'Fantasy', 'model')`).run(cid, P('StudioR/Gob')).lastInsertRowid;
-    const b = db.prepare(`INSERT INTO models (uuid, name, creator_id, folder_path, kind) VALUES ('r-gob2', 'Gob Bust', ?, ?, 'work')`).run(cid, P('StudioR/Gob#work-gob-bust')).lastInsertRowid;
-    db.prepare(`UPDATE models SET franchise = NULL WHERE id NOT IN (?, ?)`).run(a, b);
-    const r = await request(app).post('/api/organize/apply-franchise').send({ dryRun: false });
-    expect(r.status).toBe(200);
-    expect(row(a).folder_path).toBe(P('StudioR/Fantasy/Gob'));
-    expect(row(b).folder_path).toBe(P('StudioR/Fantasy/Gob#work-gob-bust'));
-  });
 });
 
 describe('S2, S6, S7: _Meta status, health, gaps', () => {

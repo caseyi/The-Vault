@@ -44,10 +44,7 @@ export function baseName(p) {
   return parts.length ? parts[parts.length - 1] : String(p || '');
 }
 
-/**
- * POST /api/folder-roles. role '' or null clears the app mark.
- * Falls back to the older /api/organize/folder-overrides on a backend without the new route.
- */
+/** POST /api/folder-roles. role '' or null clears the app mark. */
 export async function saveFolderRole({ path, role, genre, group, tags, note }) {
   const body = { path, role: role || null };
   if (role === 'category') {
@@ -56,15 +53,7 @@ export async function saveFolderRole({ path, role, genre, group, tags, note }) {
     if (tags !== undefined) body.tags = splitTags(tags);
   }
   if (note !== undefined) body.note = note;
-  try {
-    return await apiSend('/api/folder-roles', 'POST', body);
-  } catch (e) {
-    if (e instanceof ApiError && e.status === 404 && !(e.body && typeof e.body === 'object' && e.body.error)) {
-      await apiSend('/api/organize/folder-overrides', 'POST', { path, role: role || '' });
-      return { ok: true, rescan: true };
-    }
-    throw e;
-  }
+  return apiSend('/api/folder-roles', 'POST', body);
 }
 
 export const getFolderRoles = () => apiGet('/api/folder-roles');

@@ -386,7 +386,7 @@ describe('S12 spend guard', () => {
     if (status === 403) expect(r.body.error).toMatch(/API|another site/);
   });
 
-  test.each(['/api/ai/generate-tags', '/api/ai/vision-tags', '/api/ai/find-images'])('%s is guarded too', async (u) => {
+  test.each(['/api/ai/find-images'])('%s is guarded too', async (u) => {
     expect((await request(app).get(u)).status).toBe(403);
     expect((await request(app).get(`${u}?key=t`).set('Sec-Fetch-Site', 'cross-site')).status).toBe(403);
   });

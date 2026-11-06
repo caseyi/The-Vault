@@ -24,7 +24,7 @@
 the-vault/
 ├── backend/
 │   ├── server.js        # Express API - most endpoints
-│   ├── organize.js      # /api/organize/* router (health, dedupe, AI annotate, scripts)
+│   ├── organize.js      # /api/organize/* router (health, X-creator fold, gap analysis, loose files)
 │   ├── scanner.js       # Library indexer - folder discovery, hashing, image extraction
 │   ├── scan-worker.js   # Runs scans in a worker thread
 │   ├── scraper.js       # Web scraper - Printables, MMF, Thingiverse, Cults3D, Gumroad
@@ -66,11 +66,10 @@ the-vault/
 ### SSE Streaming
 All long-running operations use Server-Sent Events (SSE) for real-time progress:
 - Library scanning (`GET /api/scan/stream`)
-- AI tag generation (`GET /api/ai/generate-tags`)
 - AI image finding (`GET /api/ai/find-images`)
 - Web scraping (`GET /api/models/:id/scrape-stream`)
 - Creator re-extraction (`GET`/`POST /api/creators/:id/reextract`)
-- Vision tagging (`GET /api/ai/vision-tags`), web scrape (`POST /api/models/:id/scrape` with `Accept: text/event-stream`), AI annotate (`POST /api/organize/auto-annotate`)
+- AI enrichment (`GET /api/ai/enrich`), picture search (`GET /api/thumbs/fill`), web scrape (`POST /api/models/:id/scrape` with `Accept: text/event-stream`)
 
 Every stream goes through `backend/lib/sse.js` (`openSSE`): it sets `X-Accel-Buffering: no`, sends a `:` heartbeat every 15 s and flags client disconnects so work stops.
 

@@ -89,7 +89,7 @@ function originPolicy() {
 }
 
 /**
- * Guard for GET routes that spend API credits (/api/ai/enrich, generate-tags, vision-tags,
+ * Guard for GET routes that spend API credits (/api/ai/enrich,
  * find-images). A GET can be triggered by any page (an <img> or a link), so:
  *  - Sec-Fetch-Site: cross-site, or a Referer from another site → 403 (unless the Origin is allowed)
  *  - no key in the request (key param / x-claude-key) → only same-origin requests may use the

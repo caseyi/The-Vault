@@ -2,13 +2,15 @@
  * organize.js — Library organisation routes for The Vault
  *
  * Routes mounted at /api/organize:
- *   GET  /snapshot            – text snapshot of library (filterable by creator)
- *   POST /auto-annotate       – SSE: send snapshot to Claude, stream directives
- *   POST /annotate/preview    – parse directives, return DB diff preview
- *   POST /annotate/apply      – apply previewed changes to DB
- *   GET  /health              – find duplicates, empties, missing thumbnails
- *   POST /apply-franchise     – move model folders into franchise/ subdirs, update DB
- *   POST /gap-analysis        – compare Gumroad CSV against library, find missing
+ *   GET  /health              – duplicates across creators, empties, missing info, file hygiene
+ *   POST /dedupe/resolve      – fold duplicate cards into one (an accepted merge: alias + Unmerge)
+ *   POST /gap-analysis        – compare a list of names (Gumroad CSV) against the library
+ *   GET  /integrity           – cards whose folders are gone
+ *   GET  /loose-files, POST /group-files – unpack loose files into folders (script when read-only)
+ *   GET  /fs-tree, /franchises – folder tree for Folder Roles, genre list
+ *
+ * Genre, name and tag edits, merges and folder-role proposals live in Enrich and the Review tab
+ * (lib/enrich.js, lib/review-rules.js); the older Annotate / Franchise / bulk tools were removed.
  */
 
 'use strict';
@@ -17,21 +19,17 @@ const express  = require('express');
 const fs       = require('fs');
 const path     = require('path');
 const db       = require('./db');
-const { pickRenderArchives, analyzeFolder, extractImagesFromArchive, analysisFromFiles, realFolder } = require('./scanner');
+const { realFolder } = require('./scanner');
 const librariesLib = require('./lib/libraries');
 const folderRolesLib = require('./lib/folder-roles');
-const { callClaudeAPI, claudeStream } = require('./lib/claude');
-const { confinePath, tryConfine, sendPathError, isSafeSegment } = require('./lib/paths');
-const { openSSE } = require('./lib/sse');
-const { acquireOr409 } = require('./lib/jobs');
+const { confinePath, sendPathError, isSafeSegment } = require('./lib/paths');
 const { shellQuote, toHostPath } = require('./lib/shell');
-const { findSimilarNames, isVariantOnlyName } = require('./lib/similar');
+const { isVariantOnlyName } = require('./lib/similar');
 const { wrapAsyncRoutes } = require('./lib/middleware');
 
 const router = wrapAsyncRoutes(express.Router());
 
 const LIBRARY_PATH  = process.env.LIBRARY_PATH || '/library';
-const CLAUDE_MODEL  = process.env.CLAUDE_MODEL  || 'claude-haiku-4-5-20251001';
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -84,387 +82,16 @@ function similarity(a, b) {
   return maxLen ? 1 - levenshtein(na, nb) / maxLen : 1;
 }
 
-/** Escape LIKE wildcards (use with ESCAPE '\\'). */
-const likeEscape = (v) => String(v).replace(/[\\%_]/g, '\\$&');
-
 /** Confine a request path or answer 400/403. Returns the path, or null if a response was sent. */
 function confinedOr4xx(res, p) {
   try { return confinePath(p); } catch (e) { if (sendPathError(res, e)) return null; throw e; }
 }
 
-/**
- * Find ONE model by name for an AI directive: exact (case-insensitive) match
- * first; otherwise a LIKE match only when it is unambiguous. Never guesses.
- */
-function findModelByName(name, cols = 'id, name') {
-  const n = String(name || '').trim();
-  if (!n) return null;
-  const exact = db.prepare(`SELECT ${cols} FROM models WHERE name = ? COLLATE NOCASE AND (hidden IS NULL OR hidden = 0) LIMIT 2`).all(n);
-  if (exact.length === 1) return exact[0];
-  if (exact.length > 1) return null; // ambiguous
-  const fuzzy = db.prepare(`SELECT ${cols} FROM models WHERE name LIKE ? ESCAPE '\\' AND (hidden IS NULL OR hidden = 0) LIMIT 2`).all(`%${likeEscape(n)}%`);
-  return fuzzy.length === 1 ? fuzzy[0] : null;
-}
-
 // ── snapshot ──────────────────────────────────────────────────────────────────
-
-/**
- * GET /api/organize/snapshot
- * Query params: creator (filter by creator name), format (txt|json)
- *
- * Returns a text/JSON snapshot of all models, suitable for pasting into Claude.
- */
-router.get('/snapshot', (req, res) => {
-  const { creator, pathFilter, format = 'txt' } = req.query;
-
-  let query = `
-    SELECT m.id, m.name, m.folder_path, m.file_count, m.has_stl, m.franchise, m.team,
-           m.tags, m.thumbnail_path, m.source_url, m.notes,
-           c.name AS creator_name
-    FROM models m
-    LEFT JOIN creators c ON m.creator_id = c.id
-    WHERE (m.hidden IS NULL OR m.hidden = 0)
-  `;
-  const params = [];
-
-  if (creator) {
-    query += " AND c.name LIKE ? ESCAPE '\\'";
-    params.push(`%${likeEscape(creator)}%`);
-  }
-  if (pathFilter) {
-    query += " AND m.folder_path LIKE ? ESCAPE '\\'";
-    params.push(`%${likeEscape(pathFilter)}%`);
-  }
-
-  query += ' ORDER BY c.name, m.name';
-
-  const models = db.prepare(query).all(...params);
-
-  if (format === 'json') return res.json(models);
-
-  // Build WickedSync-style text snapshot
-  const lines = [`# The Vault — Library Snapshot`, `# Generated: ${new Date().toISOString()}`, `# Total models: ${models.length}`, ''];
-
-  // Group by creator
-  const byCreator = {};
-  for (const m of models) {
-    const key = m.creator_name || '(no creator)';
-    if (!byCreator[key]) byCreator[key] = [];
-    byCreator[key].push(m);
-  }
-
-  for (const [cname, cmodels] of Object.entries(byCreator)) {
-    lines.push(`## ${cname} (${cmodels.length} models)`);
-    for (const m of cmodels) {
-      const tags = (() => { try { return JSON.parse(m.tags || '[]').join(', '); } catch { return ''; } })();
-      const franchise = m.franchise ? ` [franchise: ${m.franchise}]` : ' [franchise: none]';
-      const team = m.team ? ` [team: ${m.team}]` : '';
-      const thumb = m.thumbnail_path ? ' ✓thumb' : ' ✗thumb';
-      lines.push(`  - ${m.name}${franchise}${team}${thumb} | files:${m.file_count} | tags:${tags || 'none'}`);
-    }
-    lines.push('');
-  }
-
-  res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-  res.send(lines.join('\n'));
-});
 
 // ── auto-annotate (SSE) ───────────────────────────────────────────────────────
 
-/**
- * POST /api/organize/auto-annotate
- * Body: { creator?, snapshot? }  — snapshot overrides generated one
- * Headers: x-claude-key
- *
- * Streams FRANCHISE/RENAME/MERGE/TAG directives from Claude Haiku via SSE.
- */
-router.post('/auto-annotate', async (req, res) => {
-  const apiKey = req.headers['x-claude-key'] || process.env.CLAUDE_API_KEY || '';
-  if (!apiKey) return res.status(401).json({ error: 'API key required' });
-
-  // Build snapshot from DB if not provided
-  let snapshot = req.body?.snapshot;
-  if (!snapshot) {
-    const { creator, pathFilter, modelIds } = req.body || {};
-    let query = `
-      SELECT m.id, m.name, m.folder_path, m.file_count, m.franchise, m.team, m.tags,
-             c.name AS creator_name
-      FROM models m
-      LEFT JOIN creators c ON m.creator_id = c.id
-      WHERE (m.hidden IS NULL OR m.hidden = 0)
-    `;
-    const params = [];
-    if (creator) { query += " AND c.name LIKE ? ESCAPE '\\'"; params.push(`%${likeEscape(creator)}%`); }
-    if (pathFilter) { query += " AND m.folder_path LIKE ? ESCAPE '\\'"; params.push(`%${likeEscape(pathFilter)}%`); }
-    if (Array.isArray(modelIds) && modelIds.length) {
-      query += ` AND m.id IN (${modelIds.map(() => '?').join(',')})`;
-      params.push(...modelIds);
-    }
-    query += ' ORDER BY c.name, m.name';
-
-    const models = db.prepare(query).all(...params);
-    const byCreator = {};
-    for (const m of models) {
-      const key = m.creator_name || '(no creator)';
-      if (!byCreator[key]) byCreator[key] = [];
-      byCreator[key].push(m);
-    }
-
-    const lines = [`# Library Snapshot — ${models.length} models`, ''];
-    for (const [cname, cmodels] of Object.entries(byCreator)) {
-      lines.push(`## ${cname}`);
-      for (const m of cmodels) {
-        const tags = (() => { try { return JSON.parse(m.tags || '[]').join(', '); } catch { return ''; } })();
-        const franchise = m.franchise ? ` [franchise: ${m.franchise}]` : ' [franchise: none]';
-        const team = m.team ? ` [team: ${m.team}]` : '';
-        lines.push(`  - ${m.name}${franchise}${team} | files:${m.file_count} | tags:${tags || 'none'}`);
-      }
-      lines.push('');
-    }
-    snapshot = lines.join('\n');
-  }
-
-  const systemPrompt = `You are a 3D print library organizer. You are given a snapshot of a library of 3D-printable model folders.
-Each model entry shows its current franchise assignment and existing tags.
-
-Your job is to output a list of organizational directives — one per line — using these formats:
-
-FRANCHISE: <model name> -> <franchise name>
-  (assign or correct a model's franchise/universe group, e.g. "Star Wars", "Warhammer 40K", "Marvel", "TMNT")
-
-RENAME: <old name> -> <new name>
-  (suggest a cleaner folder name — fix typos, standardise abbreviations)
-
-MERGE: <model name> -> <target model name>
-  (flag potential duplicates that could be merged)
-
-TAG: <model name> -> <tag1>, <tag2>, ...
-  (suggest ADDITIONAL tags to add — only suggest tags not already present)
-  (useful tags: bust, full-figure, terrain, scenic, presupported, fdm, resin, character, vehicle, diorama, creature)
-
-Rules:
-- Only output directives, no explanation, no commentary
-- Be conservative with RENAME — only rename if clearly wrong or truncated
-- Be generous with FRANCHISE — most character/IP models belong to a recognisable franchise
-- For TAG: only emit if you have useful tags to ADD beyond what's already there
-- For FRANCHISE: if [franchise: none] and you can identify one, always emit a directive
-- Skip models that already look well-organised (have a franchise and good tags)
-- One directive per line
-- Use the exact model name from the snapshot in your directives`;
-
-  const userContent = `Here is my 3D print library snapshot. Generate organisational directives — focusing on franchise assignment for unassigned models and adding missing tags:\n\n${snapshot}`;
-
-  // One AI batch job at a time; stop (and stop paying) when the client leaves
-  const release = acquireOr409(res, 'auto-annotate');
-  if (!release) return;
-  const sse = openSSE(req, res);
-  sse.onAbort(release);
-  const send = (data) => sse.send(data);
-
-  try {
-    let buffer = '';
-
-    await claudeStream(apiKey, {
-      model: CLAUDE_MODEL,
-      max_tokens: 4096,
-      system: systemPrompt,
-      messages: [{ role: 'user', content: userContent }],
-    }, (chunk) => {
-      // Parse SSE lines from Claude's streaming response
-      const lines = chunk.split('\n');
-      for (const line of lines) {
-        if (!line.startsWith('data: ')) continue;
-        try {
-          const event = JSON.parse(line.slice(6));
-          if (event.type === 'content_block_delta' && event.delta?.type === 'text_delta') {
-            const text = event.delta.text || '';
-            buffer += text;
-
-            // Emit complete lines as directives
-            const parts = buffer.split('\n');
-            buffer = parts.pop(); // keep incomplete last line
-            for (const part of parts) {
-              const directive = part.trim();
-              if (directive) send({ type: 'directive', text: directive });
-            }
-          } else if (event.type === 'message_stop') {
-            // Flush remaining buffer
-            if (buffer.trim()) send({ type: 'directive', text: buffer.trim() });
-            buffer = '';
-          } else if (event.type === 'error') {
-            send({ type: 'error', message: event.error?.message || 'Claude error' });
-          }
-        } catch {}
-      }
-    }, { signal: sse.signal });
-
-    // Flush any remaining
-    if (buffer.trim()) send({ type: 'directive', text: buffer.trim() });
-    send({ type: 'done' });
-  } catch (e) {
-    send({ type: 'error', message: e.message });
-  } finally {
-    release();
-  }
-
-  sse.end();
-});
-
 // ── annotate preview / apply ──────────────────────────────────────────────────
-
-/**
- * POST /api/organize/annotate/preview
- * Body: { directives: string[] }
- *
- * Parses directives and returns a preview of what would change in the DB.
- * Does NOT write anything.
- */
-router.post('/annotate/preview', (req, res) => {
-  const { directives = [] } = req.body || {};
-  if (!Array.isArray(directives)) return res.status(400).json({ error: 'directives must be an array' });
-
-  const changes = [];
-
-  for (const raw of directives) {
-    const line = raw.trim();
-    if (!line || line.startsWith('#')) continue;
-
-    // FRANCHISE: <name> -> <franchise>
-    let m = line.match(/^FRANCHISE:\s*(.+?)\s*(?:→|->|>)\s*(.+)$/i);
-    if (m) {
-      const modelName = m[1].trim(), franchise = m[2].trim();
-      const model = findModelByName(modelName, 'id, name, franchise');
-      changes.push({ type: 'FRANCHISE', directive: line, modelName, franchise, id: model?.id, modelId: model?.id, matchedName: model?.name || null, current: model?.franchise || null, found: !!model });
-      continue;
-    }
-
-    // RENAME: <old> -> <new>
-    m = line.match(/^RENAME:\s*(.+?)\s*(?:→|->|>)\s*(.+)$/i);
-    if (m) {
-      const oldName = m[1].trim(), newName = m[2].trim();
-      const model = findModelByName(oldName);
-      changes.push({ type: 'RENAME', directive: line, oldName, newName, id: model?.id, modelId: model?.id, matchedName: model?.name || null, current: model?.name || null, found: !!model });
-      continue;
-    }
-
-    // MERGE: <name> -> <target>
-    m = line.match(/^MERGE:\s*(.+?)\s*(?:→|->|>)\s*(.+)$/i);
-    if (m) {
-      const srcName = m[1].trim(), targetName = m[2].trim();
-      const src = findModelByName(srcName);
-      const target = findModelByName(targetName);
-      changes.push({ type: 'MERGE', directive: line, srcName, targetName, id: src?.id, srcId: src?.id, targetId: target?.id, found: !!(src && target) });
-      continue;
-    }
-
-    // TAG: <name> -> <tag1>, <tag2>
-    m = line.match(/^TAG:\s*(.+?)\s*(?:→|->|>)\s*(.+)$/i);
-    if (m) {
-      const modelName = m[1].trim(), tagsRaw = m[2].trim();
-      const tags = tagsRaw.split(',').map(t => t.trim()).filter(Boolean);
-      const model = findModelByName(modelName, 'id, name, tags');
-      const currentTags = (() => { try { return JSON.parse(model?.tags || '[]'); } catch { return []; } })();
-      changes.push({ type: 'TAG', directive: line, modelName, tags, id: model?.id, modelId: model?.id, matchedName: model?.name || null, current: currentTags, found: !!model });
-      continue;
-    }
-  }
-
-  const stats = {
-    total: changes.length,
-    found: changes.filter(c => c.found).length,
-    notFound: changes.filter(c => !c.found).length,
-    byType: { FRANCHISE: 0, RENAME: 0, MERGE: 0, TAG: 0 },
-  };
-  for (const c of changes) if (stats.byType[c.type] !== undefined) stats.byType[c.type]++;
-
-  res.json({ changes, stats });
-});
-
-/**
- * POST /api/organize/annotate/apply
- * Body: { changes?: previewChange[], directives?: string[], types?: string[] }
- *
- * Preferred: pass `changes` straight from /annotate/preview — each item is
- * applied to the model ID the preview resolved (id / modelId), so what you
- * reviewed is exactly what gets written. Legacy: `directives` are re-parsed and
- * matched by name (exact, or an unambiguous partial match — never a guess).
- * RENAME only updates the `name` column (and locks it against rescans).
- * MERGE is advisory only (flagged, not applied). Returns a summary.
- */
-router.post('/annotate/apply', (req, res) => {
-  const { directives = [], changes, types = ['FRANCHISE', 'RENAME', 'TAG'] } = req.body || {};
-  if (changes !== undefined && !Array.isArray(changes)) return res.status(400).json({ error: 'changes must be an array' });
-  if (!Array.isArray(directives)) return res.status(400).json({ error: 'directives must be an array' });
-  if (!Array.isArray(types)) return res.status(400).json({ error: 'types must be an array' });
-
-  const results = { applied: 0, skipped: 0, errors: [], details: [] };
-  const getById = db.prepare('SELECT id, name, tags FROM models WHERE id = ?');
-  const setFranchise = db.prepare(`UPDATE models SET franchise = ?, updated_at = datetime('now') WHERE id = ?`);
-  const setName = db.prepare(`UPDATE models SET name = ?, name_locked = 1, updated_at = datetime('now') WHERE id = ?`);
-  const setTags = db.prepare(`UPDATE models SET tags = ?, updated_at = datetime('now') WHERE id = ?`);
-
-  // Normalise both input styles to { type, model, value }
-  const ops = [];
-  if (Array.isArray(changes)) {
-    for (const c of changes) {
-      const type = String(c?.type || '').toUpperCase();
-      const id = c?.id ?? c?.modelId ?? c?.srcId;
-      if (type === 'MERGE') { ops.push({ type, advisory: true, text: c.directive || '' }); continue; }
-      const model = id != null ? getById.get(id) : null;
-      if (type === 'FRANCHISE') ops.push({ type, model, label: c.modelName, value: String(c.franchise || '').trim() });
-      else if (type === 'RENAME') ops.push({ type, model, label: c.oldName, value: String(c.newName || '').trim() });
-      else if (type === 'TAG') ops.push({ type, model, label: c.modelName, value: (Array.isArray(c.tags) ? c.tags : []).map(t => String(t).trim()).filter(Boolean) });
-      else ops.push({ type: 'OTHER' });
-    }
-  } else {
-    for (const raw of directives) {
-      const line = String(raw || '').trim();
-      if (!line || line.startsWith('#')) continue;
-      let m = line.match(/^(FRANCHISE|RENAME|TAG|MERGE):\s*(.+?)\s*(?:→|->|>)\s*(.+)$/i);
-      if (!m) { ops.push({ type: 'OTHER' }); continue; }
-      const type = m[1].toUpperCase(), left = m[2].trim(), right = m[3].trim();
-      if (type === 'MERGE') { ops.push({ type, advisory: true, text: line }); continue; }
-      const found = findModelByName(left);
-      const model = found ? getById.get(found.id) : null;
-      if (type === 'TAG') ops.push({ type, model, label: left, value: right.split(',').map(t => t.trim()).filter(Boolean) });
-      else ops.push({ type, model, label: left, value: right });
-    }
-  }
-
-  const applyInTx = db.transaction(() => {
-    for (const op of ops) {
-      if (op.type === 'MERGE') {
-        results.skipped++;
-        results.details.push({ type: 'MERGE', advisory: true, text: op.text });
-        continue;
-      }
-      if (op.type === 'OTHER' || !types.includes(op.type) || !op.model) { results.skipped++; continue; }
-      const { model } = op;
-      if (op.type === 'FRANCHISE') {
-        if (!op.value) { results.skipped++; continue; }
-        setFranchise.run(op.value, model.id);
-        results.details.push({ type: 'FRANCHISE', id: model.id, name: model.name, value: op.value });
-      } else if (op.type === 'RENAME') {
-        if (!op.value) { results.skipped++; continue; }
-        setName.run(op.value, model.id);
-        results.details.push({ type: 'RENAME', id: model.id, old: model.name, new: op.value });
-      } else if (op.type === 'TAG') {
-        const existing = (() => { try { return JSON.parse(model.tags || '[]'); } catch { return []; } })();
-        const merged = [...new Set([...existing, ...op.value])];
-        setTags.run(JSON.stringify(merged), model.id);
-        results.details.push({ type: 'TAG', id: model.id, name: model.name, tags: merged });
-      }
-      results.applied++;
-    }
-  });
-
-  try {
-    applyInTx();
-    res.json(results);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
 
 // ── health scan ───────────────────────────────────────────────────────────────
 
@@ -488,9 +115,6 @@ router.get('/health', async (req, res) => {
     WHERE (m.hidden IS NULL OR m.hidden = 0) AND COALESCE(m.kind, 'model') != 'tool'
     ORDER BY m.name
   `).all();
-
-  // Similar-name duplicates — normalised, bucketed, capped and yielding (see lib/similar.js)
-  const duplicates = await findSimilarNames(models);
 
   const emptyFolders  = models.filter(m => !m.file_count || m.file_count === 0);
   const noThumbnail   = models.filter(m => !m.thumbnail_path);
@@ -554,7 +178,6 @@ router.get('/health', async (req, res) => {
   res.json({
     summary: {
       total: models.length,
-      duplicatePairs: duplicates.length,
       emptyFolders: emptyFolders.length,
       noThumbnail: noThumbnail.length,
       noSource: noSource.length,
@@ -565,7 +188,6 @@ router.get('/health', async (req, res) => {
       backupCopies,
       conflictFolders: conflictFolders.length,
     },
-    duplicates,
     crossCreatorDupes,
     emptyFolders,
     noThumbnail,
@@ -576,140 +198,6 @@ router.get('/health', async (req, res) => {
     backupCopies,
     conflictFolders,
   });
-});
-
-// ── apply-franchise ───────────────────────────────────────────────────────────
-
-/** Turn a franchise label into ONE safe folder name (no separators, no dots-only, no control chars). */
-function franchiseFolderName(franchise) {
-  const clean = String(franchise || '')
-    .replace(/[\/\\\x00-\x1f\x7f]+/g, ' ')
-    .replace(/^[.\s]+/, '')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .slice(0, 120);
-  return isSafeSegment(clean) ? clean : null;
-}
-
-function isReadOnlyError(e) {
-  return e && (e.code === 'EROFS' || e.code === 'EACCES' || e.code === 'EPERM');
-}
-
-/**
- * POST /api/organize/apply-franchise
- * Body: { dryRun?: boolean }  (default dryRun=true for safety)
- *
- * For every model that has a `franchise` value, moves the model folder into
- * `<parent>/<franchise>/<model-folder>` and updates models.folder_path and
- * model_files.filepath (for it and any nested models) in one transaction.
- *
- * Refuses to overwrite an existing destination, confines every path to the
- * library, and stops with a clear error when the library is read-only (the
- * default Docker mount is :ro).
- */
-router.post('/apply-franchise', (req, res) => {
-  const dryRun = req.body?.dryRun !== false; // safe default: dry run
-
-  // Studio works (identity-grouped cards) and works sharing a folder ("<folder>#<slug>")
-  // are filed by the organizer, never moved from here: their folder holds other cards' files.
-  const models = db.prepare(`
-    SELECT id, name, folder_path, franchise
-    FROM models
-    WHERE franchise IS NOT NULL AND franchise != ''
-      AND (hidden IS NULL OR hidden = 0)
-      AND COALESCE(kind, 'model') NOT IN ('work', 'diorama', 'tool')
-      AND instr(folder_path, '#') = 0
-    ORDER BY length(folder_path) DESC
-  `).all();
-
-  if (!dryRun) {
-    try {
-      fs.accessSync(LIBRARY_PATH, fs.constants.W_OK);
-    } catch (e) {
-      return res.status(409).json({
-        error: `The library is read-only (${e.code || e.message}). Folder moves need a writable library mount — remove ":ro" from the library volume in docker-compose.yml, or use the dry run and move folders yourself.`,
-        code: e.code || 'EROFS', readOnly: true,
-      });
-    }
-  }
-
-  const getPath = db.prepare('SELECT folder_path FROM models WHERE id = ?');
-  const [sepLo, sepHi] = [path.sep, String.fromCharCode(path.sep.charCodeAt(0) + 1)];
-  // the folder, everything below it, and cards that share it under a virtual "<folder>#<slug>"
-  // path (works in the same folder, folded rows "<folder>#folded-<id>")
-  const rehomeModels = db.prepare(`
-    UPDATE models SET folder_path = ? || substr(folder_path, ?), updated_at = datetime('now')
-    WHERE folder_path = ? OR (folder_path > ? AND folder_path < ?) OR (folder_path > ? AND folder_path < ?)
-  `);
-  const rehomeFiles = db.prepare(`
-    UPDATE model_files SET filepath = ? || substr(filepath, ?)
-    WHERE filepath > ? AND filepath < ?
-  `);
-  const moveInDb = db.transaction((from, to) => {
-    const cut = from.length + 1; // substr is 1-based: keep everything after `from`
-    rehomeModels.run(to, cut, from, from + sepLo, from + sepHi, from + '#', from + '$');
-    rehomeFiles.run(to, cut, from + sepLo, from + sepHi);
-  });
-
-  const moves = [];
-  const errors = [];
-  let executed = 0;
-  let stoppedReadOnly = null;
-
-  for (const m of models) {
-    const current = getPath.get(m.id)?.folder_path || m.folder_path; // may have moved with a parent
-    const folder = franchiseFolderName(m.franchise);
-    if (!folder) { errors.push({ id: m.id, name: m.name, error: `Franchise "${m.franchise}" is not a usable folder name` }); continue; }
-
-    const parent = path.dirname(current);
-    const base = path.basename(current);
-    // Skip if the model already sits inside a folder with that name anywhere
-    // below the library root (e.g. franchise "Marvel" derived from
-    // creator/Marvel/Avengers/X must not become .../Avengers/Marvel/X).
-    const ancestors = path.relative(LIBRARY_PATH, parent).split(path.sep).map(p => p.toLowerCase());
-    if (ancestors.includes(folder.toLowerCase())) continue;
-
-    const newParent = path.join(parent, folder);
-    const newPath = path.join(newParent, base);
-    if (!tryConfine(current) || !tryConfine(newPath)) {
-      errors.push({ id: m.id, name: m.name, error: 'Path is outside the library' });
-      continue;
-    }
-    const move = { id: m.id, name: m.name, franchise: m.franchise, folder, from: current, to: newPath };
-
-    if (fs.existsSync(newPath)) {
-      errors.push({ id: m.id, name: m.name, error: `Destination already exists: ${newPath}` });
-      continue;
-    }
-    moves.push(move);
-    if (dryRun) continue;
-
-    if (!fs.existsSync(current)) { errors.push({ id: m.id, name: m.name, error: 'Source folder no longer exists' }); continue; }
-    try {
-      fs.mkdirSync(newParent, { recursive: true });
-      fs.renameSync(current, newPath);
-    } catch (e) {
-      errors.push({ id: m.id, name: m.name, error: e.message, code: e.code });
-      if (isReadOnlyError(e)) { stoppedReadOnly = e; break; }
-      continue;
-    }
-    try {
-      moveInDb(current, newPath);
-      executed++;
-    } catch (e) {
-      // Keep disk and DB consistent: undo the move if the DB update failed
-      try { fs.renameSync(newPath, current); } catch {}
-      errors.push({ id: m.id, name: m.name, error: `Database update failed, move undone: ${e.message}` });
-    }
-  }
-
-  const body = { dryRun, moves, errors, summary: { planned: moves.length, executed, errors: errors.length } };
-  if (stoppedReadOnly) {
-    body.error = `Stopped: the library is not writable (${stoppedReadOnly.code}). ${executed} folder(s) were moved before this.`;
-    body.readOnly = true;
-    return res.status(409).json(body);
-  }
-  res.json(body);
 });
 
 // ── gap analysis ──────────────────────────────────────────────────────────────
@@ -793,157 +281,9 @@ router.get('/franchises', (req, res) => {
 
 // ── franchise browser ─────────────────────────────────────────────────────────
 
-/**
- * GET /api/organize/franchise-browser
- * Returns { total, unassigned: model[], franchises: [{name,count,models}] }
- */
-router.get('/franchise-browser', (req, res) => {
-  const models = db.prepare(`
-    SELECT m.id, m.name, m.franchise, m.tags, m.thumbnail_path,
-           c.name AS creator_name, c.id AS creator_id
-    FROM models m
-    LEFT JOIN creators c ON m.creator_id = c.id
-    WHERE (m.hidden IS NULL OR m.hidden = 0)
-    ORDER BY m.franchise, c.name, m.name
-  `).all();
-
-  const unassigned = models.filter(m => !m.franchise);
-  const byFranchise = {};
-  for (const m of models) {
-    if (!m.franchise) continue;
-    if (!byFranchise[m.franchise]) byFranchise[m.franchise] = [];
-    byFranchise[m.franchise].push(m);
-  }
-  const franchises = Object.entries(byFranchise)
-    .map(([name, mods]) => ({ name, count: mods.length, models: mods }))
-    .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
-
-  res.json({ total: models.length, unassigned, franchises });
-});
-
 // ── bulk update ───────────────────────────────────────────────────────────────
 
-/**
- * POST /api/organize/bulk-update
- * Body: { modelIds?, creatorId?, franchise?, tags?, tagsMode? }
- * Applies franchise and/or tags to all targeted models. Tags are merged by default.
- */
-router.post('/bulk-update', (req, res) => {
-  const { modelIds, creatorId, franchise, tags, tagsMode = 'merge' } = req.body || {};
-
-  let targetIds = Array.isArray(modelIds) ? modelIds : [];
-  if (!targetIds.length && creatorId) {
-    targetIds = db.prepare('SELECT id FROM models WHERE creator_id = ?').all(creatorId).map(r => r.id);
-  }
-  if (!targetIds.length) return res.status(400).json({ error: 'No models targeted' });
-
-  let updated = 0;
-  db.transaction(() => {
-    for (const id of targetIds) {
-      const model = db.prepare('SELECT id, tags FROM models WHERE id = ?').get(id);
-      if (!model) continue;
-      const updates = [];
-      const params = [];
-      if (franchise !== undefined) {
-        updates.push('franchise = ?');
-        params.push(franchise || null);
-      }
-      if (tags && tags.length) {
-        let existing = [];
-        if (tagsMode === 'merge') { try { existing = JSON.parse(model.tags || '[]'); } catch {} }
-        const merged = [...new Set([...existing, ...tags])];
-        updates.push('tags = ?');
-        params.push(JSON.stringify(merged));
-      }
-      if (updates.length) {
-        updates.push("updated_at = datetime('now')");
-        params.push(id);
-        db.prepare(`UPDATE models SET ${updates.join(', ')} WHERE id = ?`).run(...params);
-        updated++;
-      }
-    }
-  })();
-  res.json({ updated, total: targetIds.length });
-});
-
 // ── thumbnail stats / fix ─────────────────────────────────────────────────────
-
-/**
- * GET /api/organize/thumbnail-stats
- */
-router.get('/thumbnail-stats', (req, res) => {
-  const total   = db.prepare(`SELECT COUNT(*) as n FROM models WHERE hidden IS NULL OR hidden = 0`).get().n;
-  const noThumb = db.prepare(`SELECT COUNT(*) as n FROM models WHERE (hidden IS NULL OR hidden = 0) AND (thumbnail_path IS NULL OR thumbnail_path = '')`).get().n;
-  const fixable = db.prepare(`
-    SELECT COUNT(*) as n FROM models
-    WHERE (hidden IS NULL OR hidden = 0)
-      AND (thumbnail_path IS NULL OR thumbnail_path = '')
-      AND images IS NOT NULL AND images != '[]' AND images != ''
-  `).get().n;
-  res.json({ total, noThumb, fixable });
-});
-
-/**
- * POST /api/organize/fix-thumbnails
- * For every model that has images[] in DB but no thumbnail, set the first image.
- */
-router.post('/fix-thumbnails', async (req, res) => {
-  // Pass 1: models that already have images[] in DB but no thumbnail_path
-  const withImages = db.prepare(`
-    SELECT id, images FROM models
-    WHERE (hidden IS NULL OR hidden = 0)
-      AND (thumbnail_path IS NULL OR thumbnail_path = '')
-      AND images IS NOT NULL AND images != '[]' AND images != ''
-  `).all();
-
-  let fixed = 0;
-  db.transaction(() => {
-    for (const m of withImages) {
-      try {
-        const imgs = JSON.parse(m.images);
-        if (imgs && imgs.length) {
-          db.prepare(`UPDATE models SET thumbnail_path = ?, updated_at = datetime('now') WHERE id = ?`).run(imgs[0], m.id);
-          fixed++;
-        }
-      } catch {}
-    }
-  })();
-
-  // Pass 2: models with no images at all — try to extract from render archives
-  const noImages = db.prepare(`
-    SELECT m.id, m.uuid, m.folder_path, m.render_zip_hint, m.work_key,
-           c.render_zip_hint AS creator_hint
-    FROM models m LEFT JOIN creators c ON c.id = m.creator_id
-    WHERE (m.hidden IS NULL OR m.hidden = 0)
-      AND (m.thumbnail_path IS NULL OR m.thumbnail_path = '')
-      AND (m.images IS NULL OR m.images = '[]' OR m.images = '')
-      AND m.folder_path IS NOT NULL
-  `).all();
-
-  let extracted = 0;
-  for (const m of noImages) {
-    try {
-      const folder = realFolder(m.folder_path);
-      if (!tryConfine(folder) || !fs.existsSync(folder)) continue;
-      const hint = m.render_zip_hint || m.creator_hint || null;
-      const dbFiles = m.work_key ? db.prepare('SELECT filename, filepath, filesize, variant FROM model_files WHERE model_id = ?').all(m.id).filter(f => tryConfine(f.filepath)) : [];
-      const analysis = dbFiles.length ? analysisFromFiles(dbFiles) : analyzeFolder(folder, null);
-      const archives = pickRenderArchives(analysis, hint);
-      const imgs = [];
-      for (const archPath of archives) {
-        imgs.push(...await extractImagesFromArchive(archPath, m.uuid));
-        if (imgs.length) break;
-      }
-      if (imgs.length) {
-        db.prepare(`UPDATE models SET images = ?, thumbnail_path = ?, thumb_source = 'archive', updated_at = datetime('now') WHERE id = ?`)
-          .run(JSON.stringify(imgs), imgs[0], m.id);
-        extracted++;
-      }
-    } catch {}
-  }
-
-  res.json({ fixed, extracted, total: withImages.length + noImages.length });
-});
 
 /**
  * GET /api/organize/integrity
@@ -1229,32 +569,6 @@ router.post('/group-files', (req, res) => {
 // The app's folder marks (creator | passthrough | category | model | ignore), docs/folder-roles.md.
 // The same DB rows as /api/folder-roles (which also shows the _Meta/folder_roles.csv marks).
 
-router.get('/folder-overrides', (req, res) => {
-  res.json(db.prepare('SELECT path, role, genre, grp, tags, note, created_at, updated_at FROM folder_overrides ORDER BY path').all()
-    .map(({ grp, tags, ...r }) => ({ ...r, group: grp || null, tags: (() => { try { return JSON.parse(tags || '[]'); } catch { return []; } })() })));
-});
-
-router.post('/folder-overrides', (req, res) => {
-  const role = folderRolesLib.normalizeRole(req.body?.role);
-  if (!req.body?.path) return res.status(400).json({ error: 'path required' });
-  if (!role) {
-    if (role === undefined) return res.status(400).json({ error: 'invalid role' });
-    // Clearing is always allowed (even for a stale path outside the library)
-    db.prepare('DELETE FROM folder_overrides WHERE path = ?').run(String(req.body.path));
-    return res.json({ ok: true, cleared: true });
-  }
-  const p = confinedOr4xx(res, String(req.body.path));
-  if (!p) return;
-  const isCat = role === 'category';
-  const tags = isCat ? folderRolesLib.parseTags(req.body.tags) : [];
-  db.prepare(`INSERT INTO folder_overrides (path, role, genre, grp, tags, note, updated_at) VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
-    ON CONFLICT(path) DO UPDATE SET role = excluded.role, genre = excluded.genre, grp = excluded.grp, tags = excluded.tags,
-      note = COALESCE(excluded.note, folder_overrides.note), updated_at = excluded.updated_at`)
-    .run(p, role, isCat ? folderRolesLib.cleanValue(req.body.genre) : null, isCat ? folderRolesLib.cleanValue(req.body.group) : null,
-      tags.length ? JSON.stringify(tags) : null, folderRolesLib.cleanValue(req.body.note, 200));
-  res.json({ ok: true });
-});
-
 // Raw filesystem tree (bounded) for the folder-roles UI — shows the ACTUAL
 // directory structure (not the indexed grouping) so misclassifications are fixable.
 router.get('/fs-tree', (req, res) => {
@@ -1293,96 +607,21 @@ router.get('/fs-tree', (req, res) => {
   res.json(tree);
 });
 
-// AI-assisted folder classification — sends Claude a compact text tree (names +
-// counts only, no file contents) and returns suggested roles to review & apply.
-router.post('/classify-folders', async (req, res) => {
-  const apiKey = req.headers['x-claude-key'] || process.env.CLAUDE_API_KEY || '';
-  if (!apiKey) return res.status(401).json({ error: 'API key required' });
-  const base = confinedOr4xx(res, String(req.body?.path || LIBRARY_PATH));
-  if (!base) return;
-  const maxDepth = 3;
-
-  const lines = [];
-  function walk(dir, depth) {
-    let entries;
-    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
-    entries = entries.filter(e => !e.name.startsWith('@') && !e.name.startsWith('#') && !e.name.startsWith('.'));
-    const dirs = entries.filter(e => e.isDirectory());
-    const files = entries.length - dirs.length;
-    lines.push(`${'  '.repeat(depth)}${path.basename(dir)} [${dirs.length} folders, ${files} files] :: ${dir}`);
-    if (depth < maxDepth) for (const d of dirs.slice(0, 80)) walk(path.join(dir, d.name), depth + 1);
-  }
-  walk(base, 0);
-  const treeText = lines.join('\n').slice(0, 12000);
-
-  const system = `You classify folders in a 3D-print library so a scanner groups models correctly. For each folder, decide a role:
-- "creator": a creator/studio whose subfolders are that creator's models: the scanner should STOP here.
-- "passthrough": a wrapper, download dump or mount root the scanner should descend THROUGH (e.g. "Downloads", "Gumroad", "STL Archive").
-- "category": a grouping folder of different models (e.g. "Marvel", "X-Men", "Terrain", "Heroes"): never one card; its name becomes the genre or group of the models below it.
-- "model": one model whose parts or variants sit in many sub-folders: exactly one card.
-- "ignore": junk/system folders to skip.
-Use folder NAMES as the main signal (e.g. "...Studios"/"...3D Models" = creator; "Gumroad Downloads" = passthrough). Only include folders where you have a clear opinion; skip obvious individual model folders. Respond with ONLY a JSON array: [{"path":"<full path exactly as given after ::>","role":"creator|passthrough|category|model|ignore","reason":"short"}]`;
-  const user = `Folder tree (indentation = depth; each line ends with " :: <full path>"):\n\n${treeText}`;
-
-  try {
-    let parsed;
-    try {
-      parsed = await callClaudeAPI(apiKey, {
-        model: CLAUDE_MODEL, max_tokens: 2000, system,
-        messages: [{ role: 'user', content: user }],
-      }, { timeoutMs: 90000 });
-    } catch (e) {
-      return res.status(502).json({ error: e.message });
-    }
-    const text = (parsed.content || []).filter(b => b.type === 'text').map(b => b.text).join('\n');
-    const m = text.match(/\[[\s\S]*\]/);
-    const suggestions = (m ? JSON.parse(m[0]) : [])
-      .map(s => (s && s.role === 'container' ? { ...s, role: 'passthrough' } : s))
-      .filter(s => s && s.path && folderRolesLib.ROLES.includes(s.role));
-    res.json({ suggestions });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// Resolve a duplicate set: keep one model, hide the rest. Non-destructive —
-// consolidates tags + collection memberships into the keeper and adopts a
-// thumbnail if it lacks one; the dropped models are hidden, never deleted.
+/**
+ * POST /api/organize/dedupe/resolve  { keepId, dropIds[] }
+ * Health → X-Creator Dupes: fold the duplicates into the card that stays, as an accepted merge
+ * (lib/enrich.js foldCards): a snapshot first, tags / notes / collections / queue carried over, an
+ * alias so the next scan keeps them together, and Unmerge under Review → History.
+ */
 router.post('/dedupe/resolve', (req, res) => {
   const { keepId, dropIds } = req.body || {};
-  if (!keepId || !Array.isArray(dropIds) || dropIds.length === 0) {
+  if (!Number.isInteger(Number(keepId)) || !Array.isArray(dropIds) || !dropIds.length) {
     return res.status(400).json({ error: 'keepId and dropIds[] required' });
   }
-  const keep = db.prepare('SELECT * FROM models WHERE id = ?').get(keepId);
-  if (!keep) return res.status(404).json({ error: 'Keeper model not found' });
-
-  const placeholders = dropIds.map(() => '?').join(',');
-  const drops = db.prepare(`SELECT * FROM models WHERE id IN (${placeholders})`).all(...dropIds);
-
-  db.transaction(() => {
-    const tags = new Set();
-    try { for (const t of JSON.parse(keep.tags || '[]')) tags.add(t); } catch {}
-    let thumb = keep.thumbnail_path;
-
-    for (const d of drops) {
-      try { for (const t of JSON.parse(d.tags || '[]')) tags.add(t); } catch {}
-      if (!thumb && d.thumbnail_path) thumb = d.thumbnail_path;
-      // Move the dropped model's collection memberships onto the keeper
-      const cols = db.prepare('SELECT collection_id FROM collection_models WHERE model_id = ?').all(d.id);
-      for (const c of cols) {
-        try {
-          db.prepare('INSERT OR IGNORE INTO collection_models (collection_id, model_id) VALUES (?, ?)')
-            .run(c.collection_id, keepId);
-        } catch {}
-      }
-      db.prepare("UPDATE models SET hidden = 1, updated_at = datetime('now') WHERE id = ?").run(d.id);
-    }
-
-    db.prepare("UPDATE models SET tags = ?, thumbnail_path = ?, updated_at = datetime('now') WHERE id = ?")
-      .run(JSON.stringify([...tags].slice(0, 12)), thumb || null, keepId);
-  })();
-
-  res.json({ success: true, kept: keepId, hidden: dropIds.length });
+  try {
+    const r = require('./lib/enrich').foldCards(db, Number(keepId), dropIds.map(Number).filter(Number.isInteger), { reason: 'duplicate across creators (Health)' });
+    res.json({ success: r.merged > 0, kept: Number(keepId), merged: r.merged, errors: r.errors, suggestionIds: r.suggestionIds });
+  } catch (e) { res.status(e.status || 500).json({ error: e.message }); }
 });
 
 module.exports = router;

@@ -2756,3 +2756,9 @@ button.set-chip:hover, button.set-chip:focus-visible { color: var(--text); borde
   .answer-group .review-actions { flex-direction: row; flex-wrap: wrap; flex-basis: 100%; }
   .conf-slider input[type="range"] { width: 90px; }
 }
+
+/* Organize → Health → Missing Info (Nov 2026 trim) */
+.missing-info-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 8px; }
+.missing-info-bar .seg-btn .num { font-family: var(--font-mono); color: var(--text-muted); margin-left: 4px; }
+.missing-enrich { padding: 0 8px 8px; }
+.organize-modal .org-health-list.missing-list { max-height: 60vh; }

@@ -59,7 +59,7 @@ test('sidebar links to Review when suggestions are pending', () => {
   expect(screen.getByRole('button', { name: /Review suggestions/ })).toHaveTextContent('120');
 });
 
-test('Organize: Review tab (lazy) carries the pending badge; Health has the organizer export', async () => {
+test('Organize: opens on Review (lazy) with the pending badge; Tools has the organizer export', async () => {
   const onSuggestionsChange = jest.fn();
   render(<NoticeProvider><OrganizeModal onClose={() => {}} initialTab="review" onSuggestionsChange={onSuggestionsChange} /></NoticeProvider>);
   const tab = screen.getByRole('tab', { name: /Review/ });
@@ -67,7 +67,7 @@ test('Organize: Review tab (lazy) carries the pending badge; Health has the orga
   expect(await within(tab).findByLabelText('120 pending')).toBeInTheDocument();
   expect(await screen.findByRole('tablist', { name: 'Suggestion groups' })).toBeInTheDocument();
   expect(onSuggestionsChange).toHaveBeenCalledWith(summary);
-  fireEvent.click(screen.getByRole('tab', { name: /Health/ }));
+  fireEvent.click(screen.getByRole('tab', { name: /Tools/ }));
   fireEvent.click(await screen.findByRole('tab', { name: /Organizer Export/ }));
   expect(await screen.findByText('moves.csv', { selector: '.org-export-name' })).toBeInTheDocument();
 });

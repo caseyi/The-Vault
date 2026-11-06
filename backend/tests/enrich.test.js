@@ -1,7 +1,7 @@
 /**
  * AI enrichment (docs/ai-enrichment.md, CONTRACT3): evidence, signatures, validation, the apply
  * policy, the review list, merges (fold + alias + rescan), undo, organizer export, the
- * generate-tags alias, the one-AI-job lock and client disconnects. No real API key: the Claude
+ * the one-AI-job lock and client disconnects. No real API key: the Claude
  * client is the dev fake model (tests/fixtures/enrich-fake.js) or an inline stub.
  */
 const fs = require('fs');
@@ -392,29 +392,15 @@ describe('organizer export', () => {
   });
 });
 
-// ── generate-tags alias, the AI lock, disconnects ───────────────────────────
+// ── the AI lock, disconnects ───────────────────────────
 
 describe('jobs', () => {
-  test('/api/ai/generate-tags runs Enrich with tags only (old clients)', async () => {
-    const thing = byName('Mystery Thing');
-    const before = db.prepare('SELECT character, franchise, tags FROM models WHERE id = ?').get(thing.id);
-    const r = await request(app).get('/api/ai/generate-tags?key=t');
-    const done = sseEvents(r.text).pop();
-    expect(done).toMatchObject({ type: 'done', success: true, tagged: expect.any(Number), total: expect.any(Number), runId: expect.any(Number) });
-    const after = db.prepare('SELECT character, franchise FROM models WHERE id = ?').get(thing.id);
-    expect(after).toEqual({ character: before.character, franchise: before.franchise });
-    const run = (await request(app).get('/api/ai/enrich/runs')).body.runs.find(x => x.id === done.runId);
-    expect(run.scope).toBe('tags');
-    expect(db.prepare(`SELECT COUNT(*) n FROM suggestions WHERE run_id = ?`).get(done.runId).n).toBe(0);
-  });
-
   test('409 while another AI job runs', async () => {
-    const release = acquireAiJob('vision-tags');
+    const release = acquireAiJob('find-images');
     try {
       const r = await request(app).get('/api/ai/enrich?key=t&scope=all&force=1');
       expect(r.status).toBe(409);
-      expect(r.body).toMatchObject({ error: expect.stringMatching(/Another AI job/), running: { name: 'vision-tags' } });
-      expect((await request(app).get('/api/ai/generate-tags?key=t')).status).toBe(409);
+      expect(r.body).toMatchObject({ error: expect.stringMatching(/Another AI job/), running: { name: 'find-images' } });
     } finally { release(); }
   });
 
