@@ -205,6 +205,20 @@ export default function FolderRoles() {
 
       {error && <div className="org-error" style={{ marginTop: 8 }}>{error}</div>}
 
+      {roleData && marked.some(m => m.ignored) && (
+        <div className="org-warn role-ignored-warn" role="status">
+          {marked.filter(m => m.ignored).map(m => (
+            <div key={m.path} className="role-marked-row">
+              <span>
+                <b>{m.rel || baseName(m.path) || m.library}</b> is a library folder marked {roleLabel(m.role)}. A library holds many
+                creators, so the scan ignores this mark. Clear it to tidy up (set it to Auto).
+              </span>
+              <RoleMenu path={m.path} name={m.rel || baseName(m.path)} mark={marks[m.path] || markOf(m)} onSaved={onSaved} />
+            </div>
+          ))}
+        </div>
+      )}
+
       {roleData && (
         <details className="role-marked">
           <summary>Marked folders <span className="attr-faint">{marked.length}</span></summary>
@@ -216,6 +230,7 @@ export default function FolderRoles() {
                   <span className="role-marked-path" title={m.path}>
                     {m.library && <span className="attr-faint">{m.library} · </span>}{m.rel || m.path}
                   </span>
+                  {m.ignored && <span className="role-conflict" title="A library folder is never a creator or a card; the scan ignores this mark">ignored</span>}
                   <RoleMenu path={m.path} name={m.rel || baseName(m.path)} mark={marks[m.path] || markOf(m)} onSaved={onSaved} />
                 </li>
               ))}

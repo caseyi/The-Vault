@@ -28,6 +28,7 @@ const { openSSE } = require('./lib/sse');
 const { acquireOr409 } = require('./lib/jobs');
 const { callClaudeAPI } = require('./lib/claude');
 const enrich = require('./lib/enrich');
+const reviewRules = require('./lib/review-rules');
 const organizerExport = require('./lib/organizer-export');
 const folderRolesLib = require('./lib/folder-roles');
 const { folderRolesRouter } = require('./folder-roles-routes');
@@ -1687,6 +1688,8 @@ async function streamEnrich(req, res, { tagsOnly = false, jobName = 'enrich' } =
   let runId = null;
   try {
     if (fake) console.warn('[enrich] ENRICH_FAKE=1: using the dev fake model, not Claude');
+    // set rules first: cards added since the last run get their values before the AI sees them
+    try { const r = reviewRules.applyRules(db); if (r.cardsSet || r.rejected || r.rewritten) log('info', `Review rules: ${r.cardsSet} card value(s) set, ${r.rejected} pending proposal(s) blocked, ${r.rewritten} rewritten`); } catch (e) { log('warn', `Review rules: ${e.message}`); }
     const { promptCtx, evCtx } = await enrichContext();
     const sel = enrich.selectCards(db, params, evCtx);
     runId = enrich.createRun(db, { model: fake ? `${model} (fake)` : model, scope: tagsOnly ? 'tags' : params.scope, params: { ...params, tagsOnly } });
@@ -1736,21 +1739,42 @@ app.post('/api/ai/enrich/runs/:id(\\d+)/undo', (req, res) => {
 });
 
 app.get('/api/suggestions', (req, res) => res.json(enrich.listSuggestions(db, req.query)));
+// values already used for a field (autocomplete when editing a proposal or writing a rule)
+app.get('/api/suggestions/values', (req, res) => res.json({ field: req.query.field || null, values: enrich.knownValues(db, String(req.query.field || '')) }));
+// answer groups: "Genre → Wildcard · 423 cards" (docs/ai-enrichment.md §5)
+app.get('/api/suggestions/groups', (req, res) => {
+  try { res.json(enrich.groupSuggestions(db, req.query)); } catch (e) { res.status(e.status || 500).json({ error: e.message }); }
+});
 app.get('/api/suggestions/summary', (req, res) => res.json(enrich.summary(db)));
 app.post('/api/suggestions/:id(\\d+)/unmerge', (req, res) => {
   try { res.json(enrich.unmerge(db, Number(req.params.id))); } catch (e) { res.status(e.status || 500).json({ error: e.message }); }
 });
 app.post('/api/suggestions/decide', (req, res) => {
-  const { ids, decision } = req.body || {};
+  const { ids, decision, value } = req.body || {};
   if (!Array.isArray(ids) || !ids.length) return res.status(400).json({ error: 'ids array required' });
   if (!['accept', 'reject'].includes(decision)) return res.status(400).json({ error: 'decision must be "accept" or "reject"' });
-  res.json(enrich.decide(db, ids.map(Number).filter(Number.isInteger), decision));
+  // value: accept with a value Casey typed instead of the proposal (becomes a user value)
+  res.json(enrich.decide(db, ids.map(Number).filter(Number.isInteger), decision, value !== undefined && decision === 'accept' ? { value } : {}));
 });
 app.post('/api/suggestions/decide-filter', (req, res) => {
-  const { filter, decision } = req.body || {};
+  const { filter, decision, value } = req.body || {};
   if (!['accept', 'reject'].includes(decision)) return res.status(400).json({ error: 'decision must be "accept" or "reject"' });
-  res.json(enrich.decideFilter(db, filter || {}, decision));
+  try { res.json(enrich.decideFilter(db, filter || {}, decision, value !== undefined && decision === 'accept' ? { value } : {})); } catch (e) { res.status(e.status || 500).json({ error: e.message }); }
 });
+
+// Review rules (docs/ai-enrichment.md §11): block / map / set nudges, applied at once and on every run
+app.get('/api/review-rules', (req, res) => res.json({ items: reviewRules.listRules(db) }));
+app.post('/api/review-rules', (req, res) => {
+  try {
+    const rule = reviewRules.createRule(db, req.body || {}, { root: LIBRARY_PATH });
+    const applied = reviewRules.applyRules(db, { rules: [db.prepare('SELECT * FROM review_rules WHERE id = ?').get(rule.id)] });
+    res.status(201).json({ rule: reviewRules.listRules(db).find(r => r.id === rule.id) || rule, applied });
+  } catch (e) { res.status(e.status || 500).json({ error: e.message }); }
+});
+app.delete('/api/review-rules/:id(\\d+)', (req, res) => {
+  try { res.json(reviewRules.deleteRule(db, Number(req.params.id), { revert: req.query.revert === '1' || req.query.revert === 'true' })); } catch (e) { res.status(e.status || 500).json({ error: e.message }); }
+});
+app.post('/api/review-rules/apply', (req, res) => res.json(reviewRules.applyRules(db)));
 
 // ── Organizer export (docs/ai-enrichment.md §7) ──────────────────────────────
 

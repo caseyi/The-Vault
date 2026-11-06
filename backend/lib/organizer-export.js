@@ -69,7 +69,7 @@ function trust(m, f) {
   const user = new Set(Array.isArray(attr.userFields) ? attr.userFields : []);
   if (user.has(f)) return { ok: true, confidence: 1, prov: 'user' };
   const prov = (attr.fields || {})[f] || null;
-  if (prov === 'sidecar' || prov === 'path' || prov === 'manifest' || prov === 'ai-reviewed') return { ok: true, confidence: prov === 'ai-reviewed' ? 0.95 : 1, prov };
+  if (prov === 'sidecar' || prov === 'path' || prov === 'manifest' || prov === 'ai-reviewed' || prov === 'review-rule') return { ok: true, confidence: prov === 'ai-reviewed' ? 0.95 : 1, prov };
   if (prov === 'ai') {
     const c = (attr.ai || {})[f];
     return { ok: typeof c === 'number' && c >= AI_EXPORT_MIN, confidence: typeof c === 'number' ? c : 0, prov };
@@ -94,7 +94,7 @@ function genreMap(db, { since, metaSummary } = {}) {
   for (const m of cards(db, since)) {
     if (!m.character || !m.franchise) continue;
     const t = trust(m, 'franchise');
-    if (!t.ok || !['user', 'ai-reviewed', 'ai'].includes(t.prov)) continue;
+    if (!t.ok || !['user', 'ai-reviewed', 'review-rule', 'ai'].includes(t.prov)) continue;
     const k = key(m.character);
     if (!k || known.has(k) || seen.has(k)) continue;
     seen.add(k);

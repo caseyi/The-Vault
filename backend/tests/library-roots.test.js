@@ -150,3 +150,38 @@ describe('libraryFolderNames', () => {
     expect(libs.libraryFolderNames(['Wicked', 'Loot Studios', 'Zez'], labels)).toEqual([]);
   });
 });
+
+// Casey, Nov 2026: an app mark "creator" on /library/STL Archive credited 1,300+ cards to
+// "STL Archive" and fed the Review queue cross-library "merges". A library folder ignores the
+// creator / model / category roles, and the routes and Enrich refuse to set one.
+describe('a creator mark on a library folder', () => {
+  let tmp, p, logs;
+  beforeAll(() => {
+    tmp = makeLib([...WICKED, ...CREATORS].map(f => `STL Archive/${f}`).concat(['Endor/CA 3D/Medusa/medusa.stl']));
+    const tree = works.walkTree(tmp.lib, {});
+    logs = [];
+    const overrides = new Map([[path.join(tmp.lib, 'STL Archive'), 'creator']]);
+    p = works.planWorks({ libraryPath: tmp.lib, tree, meta: null, overrides, log: (lvl, msg) => logs.push(`${lvl} ${msg}`) });
+  });
+  afterAll(() => fs.rmSync(tmp.root, { recursive: true, force: true }));
+
+  test('is ignored: no card is credited to the library, its folders are the creators', () => {
+    expect(byCreator(p, 'STL Archive')).toHaveLength(0);
+    expect(byCreator(p, 'Loot Studios').length).toBeGreaterThan(0);
+    expect(byCreator(p, 'CA 3D').length).toBeGreaterThan(0);
+    expect(p.works.some(w => /krampus/i.test(w.name))).toBe(true);
+  });
+
+  test('is reported in the scan log', () => {
+    expect(logs.some(l => /^warn Ignoring the "creator" mark on library folder "STL Archive"/.test(l))).toBe(true);
+  });
+
+  test('refusedRole names the library folders and leaves other folders alone', () => {
+    const fr = require('../lib/folder-roles');
+    const L = [{ name: 'STL Archive', path: path.join(tmp.lib, 'STL Archive') }, { name: 'Endor', path: path.join(tmp.lib, 'Endor') }];
+    expect(fr.refusedRole(L[0].path, 'creator', tmp.lib, L)).toMatch(/library folder/);
+    expect(fr.refusedRole(tmp.lib, 'model', tmp.lib, L)).toMatch(/library folder/);
+    expect(fr.refusedRole(L[1].path, 'ignore', tmp.lib, L)).toBeNull();
+    expect(fr.refusedRole(path.join(L[0].path, 'Loot Studios'), 'creator', tmp.lib, L)).toBeNull();
+  });
+});

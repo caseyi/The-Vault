@@ -77,7 +77,7 @@ describe('API and scan', () => {
     expect(r.status).toBe(200);
     const by = new Map(r.body.roles.map(e => [e.rel, e]));
     expect(by.get('Misc/Terrain')).toEqual({ path: path.join(ARCH, 'Misc/Terrain'), library: 'Dagobah', rel: 'Misc/Terrain', role: 'category',
-      genre: null, group: null, tags: ['terrain', 'scenery'], note: '', source: 'file', conflict: null });
+      genre: null, group: null, tags: ['terrain', 'scenery'], note: '', source: 'file', conflict: null, ignored: null });
     expect(by.get('Misc/Unicorn')).toMatchObject({ role: 'model', source: 'file', conflict: { role: 'ignore' }, note: 'one unicorn' });
     expect(r.body.files).toEqual([{ library: 'Dagobah', path: ROLES_CSV, rows: 3, errors: ['row 4: path not found: Misc/Gone'] }]);
   });
@@ -121,6 +121,22 @@ describe('API and scan', () => {
     await request(app).post('/api/folder-roles').send({ path: lamp, role: 'container' });
     expect(db.prepare('SELECT role FROM folder_overrides WHERE path = ?').get(lamp).role).toBe('passthrough');
     await request(app).post('/api/folder-roles').send({ path: lamp, role: null });
+  });
+
+  // Casey, Nov 2026: "STL Archive" marked Creator credited the whole library to one creator
+  test('POST /api/folder-roles: a library folder cannot be a creator, model or category; an old mark shows as ignored', async () => {
+    for (const role of ['creator', 'model', 'category']) {
+      const r = await request(app).post('/api/folder-roles').send({ path: ARCH, role });
+      expect(r.status).toBe(400);
+      expect(r.body.error).toMatch(/library folder/);
+    }
+    expect((await request(app).post('/api/folder-roles').send({ path: ARCH, role: 'ignore' })).status).toBe(200);
+    // a mark stored before this rule is listed, flagged as ignored, and can be cleared
+    db.prepare(`INSERT INTO folder_overrides (path, role) VALUES (?, 'creator') ON CONFLICT(path) DO UPDATE SET role = 'creator'`).run(ARCH);
+    const list = (await request(app).get('/api/folder-roles')).body.roles;
+    expect(list.find(e => e.path === ARCH)).toMatchObject({ role: 'creator', ignored: 'library-folder' });
+    expect((await request(app).post('/api/folder-roles').send({ path: ARCH, role: null })).status).toBe(200);
+    expect(db.prepare('SELECT * FROM folder_overrides WHERE path = ?').get(ARCH)).toBeUndefined();
   });
 
   test('the old /api/organize/folder-overrides routes read and write the same rows', async () => {

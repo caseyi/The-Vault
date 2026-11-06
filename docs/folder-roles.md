@@ -28,6 +28,12 @@ Casey's decisions (Oct 27 2026):
 
 No role = Auto (today's heuristics).
 
+A **library folder** (`/library/STL Archive`, `/library/Endor`, or the mount itself) is never a
+creator, a card or a category: Casey's app mark "STL Archive = Creator" credited 1,300+ cards to the
+library (Nov 2026). The scan ignores creator / model / category marks there (with a warning in the
+log), `POST /api/folder-roles` refuses to set them, Enrich does not propose them, and Folder Roles
+shows an old mark as "ignored" so it can be cleared. Container and Ignore still work there.
+
 ### Category values
 
 A category mark can carry `genre`, `group` and `tags` (pipe- or comma-separated). With none given:

@@ -10,10 +10,16 @@ import { formatTerm } from '../library';
 import { roleLabel, suggestionFolder } from '../folderRoles';
 import { useNotifyRescan } from './RoleMenu';
 import { relationLabel, setName, suggestionSetId, setSummaryLine } from '../relations';
+import { ValueEditor, AnswerGroups, NudgeBar, RulesPanel, clearValuesCache } from './ReviewExtras';
+import {
+  GROUPED_BY_DEFAULT, groupable, fieldOf, fieldWord, canRule, showValue, nudgeOptions, appliedMessage,
+} from '../reviewRules';
 
-// Organize → Review: AI suggestions waiting for Casey (docs/ai-enrichment.md §5).
-// Grouped by type, filterable by creator and confidence band, decided one by
-// one, by selection, or "all high-confidence in this group". j/k/a/r/x keys.
+// Organize → Review: AI suggestions waiting for Casey (docs/ai-enrichment.md §5, §11).
+// Grouped by type; field groups open "by answer" (Genre → Wildcard · 423 cards) so a few
+// decisions clear most of the list. Filter by creator and a minimum confidence; decide one by one,
+// by selection, a whole answer, or everything shown. Edit a proposal instead of rejecting it, and
+// turn a decision into a rule ("Teach the AI"). j/k/a/r/e/x keys.
 
 const PAGE = 50;
 
@@ -174,7 +180,9 @@ function ThemeProposal({ item, busy }) {
   );
 }
 
-function ReviewRow({ item, active, selected, onSelect, onDecide, busy, rowRef, onFocus }) {
+const EDITABLE = new Set(['field', 'rename']);
+
+function ReviewRow({ item, active, selected, onSelect, onDecide, busy, rowRef, onFocus, editing, onStartEdit, onCancelEdit }) {
   const isMerge = item.type === 'merge';
   const isRole = item.type === 'role';
   const isRelation = item.type === 'relation';
@@ -215,12 +223,20 @@ function ReviewRow({ item, active, selected, onSelect, onDecide, busy, rowRef, o
                 : isMember ? <span className="diff">Add to theme <ins className="diff-new">{setName(item)}</ins></span>
                   : <ValueDiff item={item} />}</div>
             <div className="review-meta"><ConfidenceChip value={item.confidence} /><SourceChip source={item.source} /><span className="review-reason">{item.reason}</span></div>
+            {editing && (
+              <ValueEditor field={item.type === 'rename' ? 'name' : item.field} initial={item.field === 'tags' ? addedValues(item.current, item.proposed) : item.proposed}
+                busy={busy} onCancel={onCancelEdit} onSubmit={(value) => onDecide([item.id], 'accept', [item], value)} />
+            )}
           </div>
         </div>
       )}
       <div className="review-actions">
         <button className="org-btn org-btn-sm org-btn-success" disabled={busy} onClick={() => onDecide([item.id], 'accept', [item])}
           aria-label={`Accept ${label} for ${rowName}`}>✓ {isMerge ? 'Merge' : 'Accept'}</button>
+        {EDITABLE.has(item.type) && (
+          <button className="org-btn org-btn-sm" disabled={busy || editing} onClick={() => onStartEdit(item.id)}
+            aria-label={`Edit ${label} for ${rowName}`}>✎ Edit</button>
+        )}
         <button className="org-btn org-btn-sm" disabled={busy} onClick={() => onDecide([item.id], 'reject', [item])}
           aria-label={`Reject ${label} for ${rowName}`}>✕ Reject</button>
       </div>
@@ -372,6 +388,10 @@ export function RunsHistory({ refreshKey, onUndone }) {
   );
 }
 
+
+/** Toasts for a group / bulk decision plus what a remembered rule did. */
+const pctLabel = v => `${Math.round(v * 100)}%`;
+
 export default function ReviewTab({ onSummary }) {
   const notify = useNotify();
   const notifyRescan = useNotifyRescan();
@@ -379,8 +399,11 @@ export default function ReviewTab({ onSummary }) {
   const [summary, setSummary] = useState(null);
   const [group, setGroup] = useState(null);
   const [creator, setCreator] = useState('');
-  const [bandFilter, setBandFilter] = useState('');
+  const [minConf, setMinConf] = useState(0); // 0 = everything; the slider sets Casey's own floor
   const [creators, setCreators] = useState([]);
+  const [view, setView] = useState('list'); // 'answers' | 'list'
+  const [answer, setAnswer] = useState(null); // { proposed?, tag?, label }: one answer opened one by one
+  const [groupsSupported, setGroupsSupported] = useState(true);
   const [items, setItems] = useState([]);
   const [total, setTotal] = useState(0);
   const [page, setPage] = useState(1);
@@ -389,8 +412,12 @@ export default function ReviewTab({ onSummary }) {
   const [error, setError] = useState('');
   const [selected, setSelected] = useState(() => new Set());
   const [active, setActive] = useState(0);
+  const [editingId, setEditingId] = useState(null);
   const [busy, setBusy] = useState(false);
   const [runsKey, setRunsKey] = useState(0);
+  const [groupsKey, setGroupsKey] = useState(0);
+  const [rulesKey, setRulesKey] = useState(0);
+  const [nudge, setNudge] = useState(null);
   const rowRefs = useRef([]);
   const onSummaryRef = useRef(onSummary);
   onSummaryRef.current = onSummary;
@@ -413,9 +440,21 @@ export default function ReviewTab({ onSummary }) {
   }, [loadSummary]);
 
   const groupDef = REVIEW_GROUPS.find(g => g.id === group);
+  const field = fieldOf(groupDef);
+  const canGroup = groupable(groupDef) && groupsSupported;
+  const showAnswers = canGroup && view === 'answers' && !answer;
+
+  // a new group opens in its default view, with no answer picked
+  useEffect(() => {
+    if (!groupDef) return;
+    setView(GROUPED_BY_DEFAULT.has(groupDef.id) ? 'answers' : 'list');
+    setAnswer(null); setEditingId(null);
+  }, [groupDef]);
+
   const filter = useMemo(() => groupDef ? {
-    ...groupDef.filter, ...(creator && { creator }), ...(bandFilter && { band: bandFilter }),
-  } : null, [groupDef, creator, bandFilter]);
+    ...groupDef.filter, ...(creator && { creator }), ...(minConf > 0 && { minConfidence: minConf }),
+    ...(answer && answer.tag != null ? { tag: answer.tag } : {}), ...(answer && answer.proposed != null ? { proposed: answer.proposed } : {}),
+  } : null, [groupDef, creator, minConf, answer]);
 
   const load = useCallback(async (pageNum = 1) => {
     if (!filter) return;
@@ -433,38 +472,62 @@ export default function ReviewTab({ onSummary }) {
     setLoading(false);
   }, [filter]);
 
-  useEffect(() => { load(1); }, [load]);
+  useEffect(() => { if (!showAnswers) load(1); }, [load, showAnswers]);
 
   const [mergesKey, setMergesKey] = useState(0);
+  const refreshAll = useCallback(() => {
+    loadSummary(); setGroupsKey(k => k + 1); setRunsKey(k => k + 1); setRulesKey(k => k + 1);
+    if (!showAnswers) load(1);
+  }, [loadSummary, load, showAnswers]);
 
-  const runDecide = useCallback(async (ids, decision, rows = []) => {
+  /** After a single decision: offer a rule built from it. */
+  const offerNudge = useCallback((row, decision, value) => {
+    if (!row || !EDITABLE.has(row.type)) { setNudge(null); return; }
+    const f = row.type === 'rename' ? 'name' : row.field;
+    const proposed = f === 'tags' ? addedValues(row.current, row.proposed) : row.proposed;
+    const kind = value !== undefined ? 'edit' : decision;
+    const options = nudgeOptions({ decision: kind, field: f, proposed, value, card: row.model });
+    if (!options.length) { setNudge(null); return; }
+    const what = kind === 'reject' ? `Rejected “${showValue(proposed)}” as ${fieldWord(f)}`
+      : kind === 'edit' ? `Set ${fieldWord(f)} “${showValue(value)}” instead of “${showValue(proposed)}”`
+        : `Accepted ${fieldWord(f)} “${showValue(proposed)}”`;
+    setNudge({ text: `${what} for ${row.model?.name || 'this card'}.`, options });
+  }, []);
+
+  const runDecide = useCallback(async (ids, decision, rows = [], value) => {
     if (!ids.length) return;
     setBusy(true);
     try {
-      const r = await apiSend('/api/suggestions/decide', 'POST', { ids, decision });
+      const body = { ids, decision, ...(value !== undefined && decision === 'accept' ? { value } : {}) };
+      const r = await apiSend('/api/suggestions/decide', 'POST', body);
       // superseded ("changed since") rows are no longer pending: they leave the list too
       const failed = new Set(splitDecideErrors(r).failed.map(e => e.id));
       setItems(prev => prev.filter(x => !ids.includes(x.id) || failed.has(x.id)));
       setTotal(t => Math.max(0, t - (ids.length - failed.size)));
       setSelected(prev => { const n = new Set(prev); ids.forEach(id => n.delete(id)); return n; });
+      setEditingId(null);
       const merge = rows.length === 1 && rows[0].type === 'merge' && decision === 'accept' && r?.merged;
       const toasts = decideToasts(r);
       if (merge) {
-        notify(`Merged "${rows[0].model?.name}" into "${rows[0].target?.name}". Its tags, notes and collections moved with it; Unmerge is under Accepted merges.`, { type: 'success' });
+        notify(`Merged "${rows[0].model?.name}" into "${rows[0].target?.name}". Its tags, notes and collections moved with it; Unmerge is under History.`, { type: 'success' });
         toasts.filter(t => t.type !== 'success').forEach(t => notify(t.message, { type: t.type }));
       } else toasts.forEach(t => notify(t.message, { type: t.type }));
       if (r?.merged) { clearReviewCardCache(); setMergesKey(k => k + 1); }
       if (decision === 'accept' && r?.accepted && rows.some(x => x.type === 'role')) {
         notifyRescan('Folder roles saved. They apply on the next scan.');
       }
+      if (rows.length === 1 && ids.length === 1 && !failed.size) offerNudge(rows[0], decision, value);
+      else setNudge(null);
+      if (value !== undefined) clearValuesCache();
       loadSummary();
       setRunsKey(k => k + 1);
+      setGroupsKey(k => k + 1);
     } catch (e) { notify(`Couldn't ${decision} suggestions: ${errorMessage(e)}`); }
     setBusy(false);
-  }, [loadSummary, notify, notifyRescan]);
+  }, [loadSummary, notify, notifyRescan, offerNudge]);
 
   // Accepting more than one suggestion, or any merge, asks first (merges are only reversible by Unmerge)
-  const decide = useCallback(async (ids, decision, rows = []) => {
+  const decide = useCallback(async (ids, decision, rows = [], value) => {
     if (!ids.length) return;
     if (decision === 'accept') {
       const merges = rows.filter(r => r.type === 'merge');
@@ -476,7 +539,7 @@ export default function ReviewTab({ onSummary }) {
             <>
               {!single && <p>Accepts <b>{ids.length - merges.length}</b> field change{ids.length - merges.length !== 1 ? 's' : ''}{merges.length ? <> and <b>{merges.length}</b> merge{merges.length !== 1 ? 's' : ''}</> : null}.</p>}
               {merges.length > 0 && (
-                <p>{merges.length} merge{merges.length !== 1 ? 's' : ''} will fold cards (a DB snapshot is taken first). Tags, notes and collections move to the card that stays; the alias is remembered for future scans. You can Unmerge later from Accepted merges.</p>
+                <p>{merges.length} merge{merges.length !== 1 ? 's' : ''} will fold cards (a DB snapshot is taken first). Tags, notes and collections move to the card that stays; the alias is remembered for future scans. You can Unmerge later from History.</p>
               )}
             </>
           ),
@@ -485,26 +548,93 @@ export default function ReviewTab({ onSummary }) {
         if (!ok) return;
       }
     }
-    await runDecide(ids, decision, rows);
+    await runDecide(ids, decision, rows, value);
   }, [askConfirm, runDecide]);
 
-  const acceptHigh = async () => {
-    if (!filter) return;
-    const { band: _band, ...base } = filter; // eslint-disable-line no-unused-vars
-    let n = 0;
+  /** Save a rule quietly as part of another action; reports what it did. */
+  const saveRule = useCallback(async (rule) => {
     try {
-      const qs = new URLSearchParams({ status: 'pending', ...base, minConfidence: String(HIGH_MIN), limit: 1 });
-      n = (await apiGet(`/api/suggestions?${qs}`))?.total || 0;
-    } catch (e) { notify(errorMessage(e)); return; }
-    if (!n) { notify('No high-confidence suggestions in this group.', { type: 'info' }); return; }
-    const what = groupDef.label.toLowerCase();
-    const ok = await askConfirm({
-      title: `Accept ${n} high-confidence ${what}?`,
+      const r = await apiSend('/api/review-rules', 'POST', rule);
+      notify(appliedMessage(r && r.applied), { type: 'success', duration: 7000 });
+      return true;
+    } catch (e) {
+      notify(e && e.status === 404 ? 'Rules need a newer backend; the decision was saved without one.' : `Couldn't save the rule: ${errorMessage(e)}`);
+      return false;
+    }
+  }, [notify]);
+
+  /** A whole answer group: accept (maybe with another value), or reject (maybe never again). */
+  const decideGroup = useCallback(async (g, decision, { value, remember } = {}) => {
+    if (!groupDef) return;
+    const isTags = field === 'tags';
+    const label = isTags ? g.tag : showValue(g.proposed);
+    const word = fieldWord(field);
+    const n = g.count;
+    const never = { current: canRule('block', field) };
+    const ok = await askConfirm(decision === 'accept' ? {
+      title: value !== undefined ? `Use “${showValue(value)}” for ${n} card${n !== 1 ? 's' : ''}?` : `Accept “${label}” for ${n} card${n !== 1 ? 's' : ''}?`,
       message: (
         <>
-          <p>Accepts <b>{n}</b> pending suggestion{n !== 1 ? 's' : ''} in <b>{groupDef.label}</b> with confidence of {Math.round(HIGH_MIN * 100)}% or more{creator ? <> from <b>{creator}</b></> : ''}.</p>
+          <p>Sets the {word} {value !== undefined ? <>to <b>{showValue(value)}</b> (instead of “{label}”)</> : <><b>{label}</b></>} on <b>{n}</b> card{n !== 1 ? 's' : ''}{creator ? <> from <b>{creator}</b></> : null}{minConf > 0 ? <> at {pctLabel(minConf)} confidence or more</> : null}.</p>
+          {!isTags && g.fromEmpty < n && <p>{n - g.fromEmpty} of them replace an existing {word}.</p>}
+          {remember && <p>And remembers: use “{showValue(value)}” whenever the AI says “{label}”.</p>}
+        </>
+      ),
+      confirmLabel: `Accept ${n}`,
+    } : {
+      title: `Reject “${label}” for ${n} card${n !== 1 ? 's' : ''}?`,
+      message: (
+        <>
+          <p>Rejects {n} pending {word} suggestion{n !== 1 ? 's' : ''}{creator ? <> from <b>{creator}</b></> : null}. Rejected values are not proposed again for these cards.</p>
+          {canRule('block', field) && (
+            <label className="answer-remember">
+              <input type="checkbox" defaultChecked onChange={e => { never.current = e.target.checked; }} />
+              Never propose “{label}” as a {word} for any card (a rule)
+            </label>
+          )}
+        </>
+      ),
+      confirmLabel: `Reject ${n}`,
+      danger: true,
+    });
+    if (!ok) return;
+    setBusy(true);
+    try {
+      const f = {
+        ...groupDef.filter, ...(creator && { creator }), ...(minConf > 0 && { minConfidence: minConf }),
+        ...(isTags ? { tag: g.tag } : { proposed: g.key }),
+      };
+      const r = await apiSend('/api/suggestions/decide-filter', 'POST', { filter: f, decision, ...(value !== undefined ? { value } : {}) });
+      decideToasts(r).forEach(t => notify(t.message, { type: t.type }));
+      if (decision === 'reject' && never.current) await saveRule({ kind: 'block', field, match: label });
+      if (decision === 'accept' && remember && value !== undefined) {
+        const v = Array.isArray(value) ? value[0] : value;
+        if (v != null && String(v).toLowerCase() !== String(label).toLowerCase()) await saveRule({ kind: 'map', field, match: label, value: v });
+      }
+      if (value !== undefined) clearValuesCache();
+      setNudge(null);
+      refreshAll();
+    } catch (e) { notify(`Couldn't ${decision}: ${errorMessage(e)}`); }
+    setBusy(false);
+  }, [groupDef, field, creator, minConf, askConfirm, notify, saveRule, refreshAll]);
+
+  /** Everything the current filter shows (all creators / floor / answer applied). */
+  const acceptShown = async () => {
+    if (!filter) return;
+    let n = 0;
+    try {
+      const qs = new URLSearchParams({ status: 'pending', ...filter, limit: 1 });
+      n = (await apiGet(`/api/suggestions?${qs}`))?.total || 0;
+    } catch (e) { notify(errorMessage(e)); return; }
+    if (!n) { notify('Nothing to accept with these filters.', { type: 'info' }); return; }
+    const what = groupDef.label.toLowerCase();
+    const ok = await askConfirm({
+      title: `Accept ${n} ${what}${minConf > 0 ? ` at ${pctLabel(minConf)}+` : ''}?`,
+      message: (
+        <>
+          <p>Accepts <b>{n}</b> pending suggestion{n !== 1 ? 's' : ''} in <b>{groupDef.label}</b>{minConf > 0 ? <> with confidence of {pctLabel(minConf)} or more</> : null}{creator ? <> from <b>{creator}</b></> : ''}{answer ? <> answering <b>{answer.label}</b></> : null}.</p>
           {groupDef.id === 'merges' && <p>{n} merge{n !== 1 ? 's' : ''} will fold cards (a DB snapshot is taken first). Tags, notes and collections are kept and the alias is remembered for future scans; each can be undone with Unmerge.</p>}
-          <p>{total - n > 0 ? `${total - n} lower-confidence suggestion${total - n !== 1 ? 's stay' : ' stays'} in the list.` : 'Nothing else is pending in this group.'}</p>
+          {minConf > 0 && summary && <p>Lower-confidence suggestions stay in the list.</p>}
         </>
       ),
       confirmLabel: `Accept ${n}`,
@@ -512,13 +642,12 @@ export default function ReviewTab({ onSummary }) {
     if (!ok) return;
     setBusy(true);
     try {
-      const r = await apiSend('/api/suggestions/decide-filter', 'POST', { filter: { ...base, minConfidence: HIGH_MIN, status: 'pending' }, decision: 'accept' });
+      const r = await apiSend('/api/suggestions/decide-filter', 'POST', { filter: { ...filter, status: 'pending' }, decision: 'accept' });
       decideToasts(r).forEach(t => notify(t.message, { type: t.type }));
       if (r?.merged) { clearReviewCardCache(); setMergesKey(k => k + 1); }
       if (r?.accepted && groupDef.id === 'roles') notifyRescan('Folder roles saved. They apply on the next scan.');
-      await loadSummary();
-      load(1);
-      setRunsKey(k => k + 1);
+      setNudge(null);
+      refreshAll();
     } catch (e) { notify(`Couldn't accept: ${errorMessage(e)}`); }
     setBusy(false);
   };
@@ -546,6 +675,7 @@ export default function ReviewTab({ onSummary }) {
       case 'k': case 'ArrowUp': e.preventDefault(); focusRow(active - 1); break;
       case 'a': if (item) { e.preventDefault(); decide([item.id], 'accept', [item]); } break;
       case 'r': if (item) { e.preventDefault(); decide([item.id], 'reject', [item]); } break;
+      case 'e': if (item && EDITABLE.has(item.type)) { e.preventDefault(); setEditingId(item.id); } break;
       case 'x': if (item) { e.preventDefault(); toggleSelect(item.id); } break;
       default:
     }
@@ -556,15 +686,31 @@ export default function ReviewTab({ onSummary }) {
     if (active >= items.length && items.length) setActive(items.length - 1);
   }, [items.length, active]);
 
+  const onUnsupported = useCallback(() => { setGroupsSupported(false); setView('list'); }, []);
+  const openAnswer = useCallback((g) => {
+    setAnswer(field === 'tags' ? { tag: g.tag, label: `+ ${g.tag}` } : { proposed: g.key, label: showValue(g.proposed) });
+    setView('list');
+  }, [field]);
+  const backToAnswers = () => { setAnswer(null); setView('answers'); };
+
   const selectedIds = [...selected];
   const groups = REVIEW_GROUPS.filter(g => !g.optional || (g.count(summary) || 0) > 0);
+  const best = summary && Number.isFinite(Number(summary.maxConfidence)) ? Number(summary.maxConfidence) : null;
+
+  const history = (
+    <details className="review-history">
+      <summary>History <span className="attr-faint">accepted merges and Enrich runs</span></summary>
+      <AcceptedMerges refreshKey={mergesKey} onUnmerged={() => { loadSummary(); setRunsKey(k => k + 1); }} />
+      <RunsHistory refreshKey={runsKey} onUndone={() => { loadSummary(); if (!showAnswers) load(1); setGroupsKey(k => k + 1); }} />
+    </details>
+  );
 
   if (summary && summary.pending === 0) {
     return (
       <div className="org-tab-body review-tab">
         <div className="org-empty">Nothing to review. Run Enrich metadata (Scan Library → AI) to get suggestions.</div>
-        <AcceptedMerges refreshKey={mergesKey} onUnmerged={loadSummary} />
-        <RunsHistory refreshKey={runsKey} onUndone={loadSummary} />
+        <RulesPanel refreshKey={rulesKey} onChanged={refreshAll} />
+        {history}
       </div>
     );
   }
@@ -575,6 +721,7 @@ export default function ReviewTab({ onSummary }) {
       <p className="org-desc">
         AI suggestions that would change an existing value, merge cards, or were not confident enough to apply on their own.
         {summary ? <> <b>{summary.pending.toLocaleString()}</b> pending.</> : null}
+        {best != null && best > 0 && best < HIGH_MIN ? <> None is above {pctLabel(HIGH_MIN)} (the best is {pctLabel(best)}), so decide by answer, or set your own floor with the slider.</> : null}
       </p>
 
       <div className="org-health-sections" role="tablist" aria-label="Suggestion groups">
@@ -590,54 +737,79 @@ export default function ReviewTab({ onSummary }) {
       </div>
 
       <div className="review-toolbar">
+        {canGroup && (
+          <div className="seg" role="group" aria-label="Show suggestions">
+            <button type="button" className={`seg-btn ${view === 'answers' && !answer ? 'active' : ''}`} aria-pressed={view === 'answers' && !answer} onClick={backToAnswers}>By answer</button>
+            <button type="button" className={`seg-btn ${view === 'list' || answer ? 'active' : ''}`} aria-pressed={view === 'list' || !!answer} onClick={() => { setAnswer(null); setView('list'); }}>One by one</button>
+          </div>
+        )}
         <select className="gallery-select" value={creator} onChange={e => setCreator(e.target.value)} aria-label="Filter suggestions by creator">
           <option value="">All creators</option>
           {creators.map(c => <option key={c.id ?? c.name} value={c.name}>{c.name}</option>)}
         </select>
-        <select className="gallery-select" value={bandFilter} onChange={e => setBandFilter(e.target.value)} aria-label="Filter suggestions by confidence">
-          <option value="">Any confidence</option>
-          <option value="high">High (80%+)</option>
-          <option value="medium">Medium (65–79%)</option>
-          <option value="low">Low (&lt;65%)</option>
-        </select>
-        <span className="attr-faint">{total.toLocaleString()} in {groupDef?.label || ''}</span>
+        <label className="conf-slider">
+          <span>Min. confidence</span>
+          <input type="range" min="0" max="0.95" step="0.05" value={minConf} onChange={e => setMinConf(Number(e.target.value))}
+            aria-label="Minimum confidence" aria-valuetext={minConf > 0 ? pctLabel(minConf) : 'any'} />
+          <span className="num conf-slider-value">{minConf > 0 ? `${pctLabel(minConf)}+` : 'any'}</span>
+        </label>
+        {!showAnswers && <span className="attr-faint">{total.toLocaleString()} in {groupDef?.label || ''}</span>}
         <span className="review-toolbar-spacer" />
-        {selectedIds.length > 0 ? (
+        {selectedIds.length > 0 && !showAnswers ? (
           <>
             <button className="org-btn org-btn-sm org-btn-success" disabled={busy} onClick={() => decide(selectedIds, 'accept', items.filter(i => selected.has(i.id)))}>✓ Accept {selectedIds.length}</button>
             <button className="org-btn org-btn-sm" disabled={busy} onClick={() => decide(selectedIds, 'reject', items.filter(i => selected.has(i.id)))}>✕ Reject {selectedIds.length}</button>
             <button className="link-btn attr-faint" onClick={() => setSelected(new Set())}>clear</button>
           </>
         ) : (
-          <button className="org-btn org-btn-sm org-btn-accent" disabled={busy || !total || bandFilter === 'low' || bandFilter === 'medium'} onClick={acceptHigh}>
-            ✓ Accept all high-confidence in {groupDef?.label || 'group'}
+          <button className="org-btn org-btn-sm org-btn-accent" disabled={busy || (!showAnswers && !total)} onClick={acceptShown}>
+            ✓ Accept all{minConf > 0 ? ` ${pctLabel(minConf)}+` : ''} in {answer ? answer.label : groupDef?.label || 'group'}
           </button>
         )}
       </div>
-      <div className="review-help" id="review-help">Keys: <kbd>j</kbd>/<kbd>k</kbd> move · <kbd>a</kbd> accept · <kbd>r</kbd> reject · <kbd>x</kbd> select</div>
+
+      {answer && (
+        <div className="answer-filter" role="status">
+          Showing <ins className="diff-new">{answer.label}</ins> one by one.
+          <button className="link-btn" onClick={backToAnswers}>‹ Back to answers</button>
+        </div>
+      )}
+
+      <NudgeBar nudge={nudge} onDismiss={() => setNudge(null)} onSaved={() => refreshAll()} />
 
       {error && <div className="org-error">{error}</div>}
 
-      <div className="org-health-list review-list-wrap">
-        {items.length === 0 && !loading ? (
-          <div className="org-empty">Nothing pending in {groupDef?.label || 'this group'}{creator ? ` for ${creator}` : ''}.</div>
-        ) : (
-          <ul className="review-list" onKeyDown={onKeyDown} aria-describedby="review-help" aria-label={`${groupDef?.label || ''} suggestions`}>
-            {items.map((it, i) => (
-              <ReviewRow key={it.id} item={it} active={i === active} selected={selected.has(it.id)}
-                onSelect={toggleSelect} onDecide={decide} busy={busy}
-                rowRef={el => { rowRefs.current[i] = el; }} onFocus={() => setActive(i)} />
-            ))}
-          </ul>
-        )}
-        {loading && <div className="org-hint-inline" style={{ padding: 8 }}>Loading…</div>}
-        {!loading && page < pages && (
-          <button className="sec-more-btn" onClick={() => load(page + 1)}>▼ Load more ({(total - items.length).toLocaleString()} left)</button>
-        )}
-      </div>
+      {showAnswers ? (
+        <div className="org-health-list review-list-wrap">
+          <AnswerGroups type={groupDef.filter.type} field={field} creator={creator} minConfidence={minConf} refreshKey={groupsKey}
+            busy={busy} onDecide={decideGroup} onReviewOne={openAnswer} onUnsupported={onUnsupported} />
+        </div>
+      ) : (
+        <>
+          <div className="review-help" id="review-help">Keys: <kbd>j</kbd>/<kbd>k</kbd> move · <kbd>a</kbd> accept · <kbd>r</kbd> reject · <kbd>e</kbd> edit · <kbd>x</kbd> select</div>
+          <div className="org-health-list review-list-wrap">
+            {items.length === 0 && !loading ? (
+              <div className="org-empty">Nothing pending in {groupDef?.label || 'this group'}{creator ? ` for ${creator}` : ''}{minConf > 0 ? ` at ${pctLabel(minConf)}+` : ''}.</div>
+            ) : (
+              <ul className="review-list" onKeyDown={onKeyDown} aria-describedby="review-help" aria-label={`${groupDef?.label || ''} suggestions`}>
+                {items.map((it, i) => (
+                  <ReviewRow key={it.id} item={it} active={i === active} selected={selected.has(it.id)}
+                    onSelect={toggleSelect} onDecide={decide} busy={busy}
+                    editing={editingId === it.id} onStartEdit={setEditingId} onCancelEdit={() => setEditingId(null)}
+                    rowRef={el => { rowRefs.current[i] = el; }} onFocus={() => setActive(i)} />
+                ))}
+              </ul>
+            )}
+            {loading && <div className="org-hint-inline" style={{ padding: 8 }}>Loading…</div>}
+            {!loading && page < pages && (
+              <button className="sec-more-btn" onClick={() => load(page + 1)}>▼ Load more ({(total - items.length).toLocaleString()} left)</button>
+            )}
+          </div>
+        </>
+      )}
 
-      <AcceptedMerges refreshKey={mergesKey} onUnmerged={() => { loadSummary(); setRunsKey(k => k + 1); }} />
-      <RunsHistory refreshKey={runsKey} onUndone={() => { loadSummary(); load(1); }} />
+      <RulesPanel refreshKey={rulesKey} onChanged={refreshAll} />
+      {history}
     </div>
   );
 }

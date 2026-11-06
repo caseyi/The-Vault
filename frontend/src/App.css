@@ -2691,3 +2691,68 @@ button.set-chip:hover, button.set-chip:focus-visible { color: var(--text); borde
   .set-card.is-lead { width: 132px; }
   .rel-pending-actions { margin-left: 0; }
 }
+
+/* Folder roles: a mark the scan ignores (creator / model / category on a library folder) */
+.org-warn { border: 1px solid var(--yellow); border-radius: 6px; padding: 8px 10px; font-size: 12px; color: var(--text); background: rgba(212,170,76,0.08); display: flex; flex-direction: column; gap: 6px; }
+.org-warn .role-marked-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+
+/* ── Review rework (docs/ai-enrichment.md §5, §11) ───────────────────────────── */
+/* The list used to shrink to 2px: as a flex child with basis 0 inside the scrolling tab body, the
+   History panels below it took all the room. It keeps its own height and scrolls inside. */
+.organize-modal .org-tab-body > .review-list-wrap { flex: 0 0 auto; min-height: 220px; }
+
+.seg { display: inline-flex; border: 1px solid var(--border-bright); border-radius: var(--radius); overflow: hidden; flex-shrink: 0; }
+.seg-btn { background: transparent; border: 0; color: var(--text-muted); font-size: 11px; padding: 4px 10px; cursor: pointer; }
+.seg-btn + .seg-btn { border-left: 1px solid var(--border-bright); }
+.seg-btn.active { background: var(--accent-glow); color: var(--accent-text); }
+.seg-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+
+.conf-slider { display: inline-flex; align-items: center; gap: 6px; font-size: 11px; color: var(--text-muted); }
+.conf-slider input[type="range"] { width: 110px; accent-color: var(--accent); }
+.conf-slider-value { min-width: 34px; font-family: var(--font-mono); font-size: 11px; color: var(--text); }
+
+.answer-summary { font-size: 11px; padding: 8px 10px 0; }
+.answer-list { list-style: none; }
+.answer-group { display: flex; gap: 10px; align-items: flex-start; padding: 10px; border-bottom: 1px solid var(--border); }
+.answer-group:last-child { border-bottom: none; }
+.answer-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 6px; }
+.answer-title { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+.answer-value { font-size: 14px; text-decoration: none; }
+.answer-count { font-family: var(--font-mono); font-size: 12px; color: var(--text); }
+.answer-meta { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; font-size: 11px; color: var(--text-muted); }
+.answer-warn { color: var(--yellow-text); }
+.answer-samples { list-style: none; display: flex; flex-wrap: wrap; gap: 4px 6px; }
+.answer-sample { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; color: var(--text-muted); background: var(--bg3); border: 1px solid var(--border); border-radius: 4px; padding: 2px 6px 2px 2px; max-width: 220px; }
+.answer-sample.attr-faint { padding: 2px 6px; background: transparent; }
+.answer-sample-thumb { width: 22px; height: 22px; border-radius: 3px; object-fit: cover; background: var(--bg4); flex-shrink: 0; }
+.answer-sample-thumb.ph { display: inline-flex; align-items: center; justify-content: center; font-size: 11px; }
+.answer-sample-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.answer-one-by-one { font-size: 11px; text-align: left; }
+.answer-remember { display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--text-muted); margin-top: 4px; }
+.answer-remember input { accent-color: var(--accent); }
+.answer-filter { font-size: 12px; color: var(--text-muted); display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+
+.value-editor { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 4px; }
+.value-editor .answer-remember { flex-basis: 100%; margin-top: 0; }
+.value-editor-input { flex: 1 1 200px; min-width: 0; max-width: 360px; background: var(--bg3); border: 1px solid var(--border-bright); border-radius: 4px; color: var(--text); font-size: 12px; padding: 4px 8px; }
+.value-editor-input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+
+.nudge-bar { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; padding: 7px 10px; border: 1px dashed rgba(193,127,58,0.55); border-radius: var(--radius); background: var(--accent-glow); font-size: 12px; }
+.nudge-text { color: var(--text); margin-right: 4px; }
+
+.review-rules, .review-history { border: 1px solid var(--border); border-radius: var(--radius); padding: 6px 10px; }
+.review-rules > summary, .review-history > summary { cursor: pointer; font-size: 12px; color: var(--text); padding: 2px 0; }
+.review-history .review-runs:first-of-type { margin-top: 6px; }
+.rules-list { list-style: none; margin-top: 6px; }
+.rules-row { display: flex; align-items: center; gap: 8px; }
+.rules-label { flex: 1; min-width: 0; font-size: 12px; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rule-kind { font-family: var(--font-mono); font-size: 9px; letter-spacing: 0.5px; text-transform: uppercase; padding: 1px 6px; border-radius: 3px; border: 1px solid var(--border-bright); color: var(--text-muted); flex-shrink: 0; }
+.rule-kind.rule-block { color: var(--text-faint); }
+.rule-kind.rule-map { color: var(--accent-text); border-color: rgba(193,127,58,0.5); }
+.rule-kind.rule-set { color: var(--green-text); border-color: rgba(76,175,125,0.45); }
+
+@media (max-width: 640px) {
+  .answer-group { flex-wrap: wrap; }
+  .answer-group .review-actions { flex-direction: row; flex-wrap: wrap; flex-basis: 100%; }
+  .conf-slider input[type="range"] { width: 90px; }
+}

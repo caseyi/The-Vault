@@ -67,6 +67,25 @@ Accepting a field writes it (provenance `ai-reviewed`); accepting a merge folds 
 the target with the regroup fold logic and stores an alias. Bulk accept/reject by type, field,
 confidence band, creator.
 
+Review tab (Nov 2026 rework, after a run left 1,683 pending, none above 80%, most of them two genres):
+
+- **By answer.** Genres, Groups, Editions and Tags open grouped by proposed value
+  (`GET /api/suggestions/groups`): "Wildcard · 423 cards", how many fill an empty field, the
+  confidence range, the top creators and sample cards. Accept, reject or use a different value for the
+  whole answer, or open it one by one. Tags group per tag; deciding a tag splits each proposal (the
+  decided tag becomes its own accepted/rejected row, the rest stays pending).
+- **Minimum confidence slider** instead of the fixed bands; "Accept all" uses the current filter.
+- **Edit instead of reject.** Any field or name proposal can be accepted with a typed value
+  (autocomplete from `GET /api/suggestions/values`); it is written as the user's own value
+  (provenance `user`).
+- **Teach the AI.** After a single reject, edit or accept, a bar offers to turn it into a rule (§11).
+  Rejecting a whole answer offers "never propose it again"; a different value for a whole answer
+  offers "use this whenever the AI says that".
+- Accepted merges and the Enrich runs table sit in a collapsed **History**. (The list used to collapse
+  to 2 px under them: it was a flex child with basis 0 inside the scrolling tab body.)
+- The summary counts only proposals whose card still exists (as the list does) and reports
+  `maxConfidence` and the number of rules.
+
 ## 6. Aliases
 
 `aliases` table: creator, kind, from_key, to_key, source (merge|rename|rules). `works.js` applies them
@@ -95,8 +114,12 @@ them to `/Volumes/STL Archive-1/...` or `/Volumes/3dPrint/...`.
   (applied, suggested, merges, unchanged, errors, run_id). One AI job at a time, stops on disconnect.
 - `GET /api/ai/enrich/runs`, `POST /api/ai/enrich/runs/:id/undo`.
 - `GET /api/suggestions?status&type&field&creator&minConfidence&page` and `GET /api/suggestions/summary`.
-- `POST /api/suggestions/decide` `{ids:[...], decision:"accept"|"reject"}` and
-  `POST /api/suggestions/decide-filter` `{filter, decision}`.
+- `GET /api/suggestions/groups?type&field&creator&minConfidence&page` -> answer groups (§5).
+  `GET /api/suggestions/values?field` -> values already on cards, most used first.
+- `POST /api/suggestions/decide` `{ids:[...], decision:"accept"|"reject", value?}` and
+  `POST /api/suggestions/decide-filter` `{filter, decision, value?}`. `value` accepts with a typed
+  value. Filters add `proposed` (a group key) and `tag` (one tag of tags proposals).
+- `GET|POST /api/review-rules`, `DELETE /api/review-rules/:id?revert=1`, `POST /api/review-rules/apply` (§11).
 - `/api/ai/generate-tags` stays as an alias that runs Enrich with tags only, for old clients.
 
 ## 9. Releases (same character, different releases)
@@ -126,3 +149,29 @@ ones are e.g. a Sandman "v2" folder that may be the same release).
 answers with realistic canned results for the rebuilt-library cards, so the whole loop can be run
 and screenshotted. On the rebuild: estimate $2.18 (all, Haiku) / $1.68 (unattributed); one run applied
 4,212 fields (mostly additive tags) and queued 320 field suggestions + 256 merge proposals.
+
+## 11. Review rules ("Teach the AI")
+
+`review_rules` table (migration 10, `lib/review-rules.js`): kind, field, match, value, creator,
+path, note, applied. Casey's choice (Nov 2026): rules work both ways, deterministically and as AI
+instructions.
+
+| Kind | Fields | Effect |
+|---|---|---|
+| `block` | character, genre, group, tags, name | Never propose `match` for the field. |
+| `map` | character, genre, group, tags | Use `value` whenever the AI proposes `match`. |
+| `set` | genre, group, tags | Every card in scope gets `value` (needs a creator and/or a folder). |
+
+A rule can be scoped to a creator (case-insensitive) and/or a folder and everything below it.
+
+- **At once:** pending proposals are rejected (block), rewritten (map) or cleared when the card in
+  scope already has the value; set rules write the value with provenance `review-rule`, never over
+  model.json / path / manifest / Drive / role values or the user's own or accepted values.
+- **Later runs:** every validated Enrich answer goes through `transformAnswer` before the apply
+  policy. Set rules own their field for cards in scope (the AI's answer is dropped). Rules are also
+  applied at the start of each Enrich run and after each scan, so new cards get set values.
+- **Prompt:** every rule is listed in the system prompt as "The owner's rules (always follow them)".
+- `review-rule` values are protected like `ai-reviewed`: kept across rescans (model.json still wins),
+  never overwritten or re-proposed by the AI, exported to the organizer like reviewed values.
+- Deleting a set rule with `revert=1` clears the values it wrote that nobody changed since.
+
